@@ -520,9 +520,29 @@ end
         other => panic!("expected new_record? guard; got {other:?}"),
     }
 
-    // `if:`-conditioned callbacks must NOT lower (running them
-    // unconditionally is worse than dropping them with a warning).
-    assert!(!names.contains(&"after_save"), "{names:?}");
+    // `after_save :log_hat_use, if: :hat_selected?` lowers with the
+    // predicate as a guard (it used to be dropped entirely — running it
+    // unconditionally would have been worse, but dropping it is wrong
+    // too).
+    let asv = lc
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "after_save")
+        .expect("after_save");
+    match &*body_stmts(asv)[0].node {
+        roundhouse::ExprNode::If { cond, then_branch, .. } => {
+            assert_eq!(self_call_name(cond), "hat_selected?");
+            let then_stmts = match &*then_branch.node {
+                roundhouse::ExprNode::Seq { exprs } => exprs.clone(),
+                _ => vec![then_branch.clone()],
+            };
+            assert_eq!(
+                then_stmts.iter().map(self_call_name).collect::<Vec<_>>(),
+                vec!["log_hat_use"]
+            );
+        }
+        other => panic!("expected hat_selected? guard; got {other:?}"),
+    }
 }
 
 #[test]

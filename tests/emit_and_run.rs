@@ -3687,3 +3687,115 @@ end
         .run_test("test/models/article_summary_test.rb")
         .assert_passes();
 }
+
+/// `if:` / `unless:` guards a callback. Ingest used to reject the
+/// declaration outright, so the callback was silently dropped and ran in
+/// no circumstance. A zero-arity lambda body (`if: -> { color.blank? }`)
+/// is spliced as the guard; a Symbol (`unless: :loud?`) is the predicate
+/// call, negated. This runs the emitted program to prove the callback
+/// fires exactly when Rails would.
+#[test]
+fn a_conditional_callback_runs_only_when_its_condition_holds() {
+    let run = emit_and_run::empty_app()
+        .write(
+            "config/application.rb",
+            "module TestApp\n  class Application < Rails::Application\n  end\nend\n",
+        )
+        .write(
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        )
+        .write(
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n",
+        )
+        .write(
+            "app/models/widget.rb",
+            r#"class Widget < ApplicationRecord
+  before_validation :assign_color, on: :create, if: -> { color.blank? }
+  before_save :shout, unless: :loud?
+
+  private
+    def assign_color
+      self.color = "default"
+    end
+
+    def loud?
+      self.name == "LOUD"
+    end
+
+    def shout
+      self.name = self.name.to_s.upcase
+    end
+end
+"#,
+        )
+        .write(
+            "db/schema.rb",
+            "ActiveRecord::Schema[8.1].define(version: 2026_01_01_000000) do\n  create_table \"widgets\", force: :cascade do |t|\n    t.string \"color\"\n    t.string \"name\"\n  end\nend\n",
+        )
+        .run_ruby(
+            r#"quiet = Widget.create!(name: "quiet")
+raise "if: true must run the callback: #{quiet.color.inspect}" unless quiet.color == "default"
+raise "unless: true (not loud?) must run the callback: #{quiet.name.inspect}" unless quiet.name == "QUIET"
+loud = Widget.create!(name: "LOUD", color: "red")
+raise "if: false must skip the callback: #{loud.color.inspect}" unless loud.color == "red"
+raise "unless: false (loud?) must skip the callback: #{loud.name.inspect}" unless loud.name == "LOUD"
+"#,
+        );
+    run.assert_passes();
+}
+
+/// Both `if:` and `unless:` on one callback: Rails runs it only when the
+/// `if:` holds AND the `unless:` does not, so the two guards compose as
+/// `if` and `!unless`. The emitted program must honour all four
+/// combinations.
+#[test]
+fn a_callback_with_both_if_and_unless_requires_both() {
+    let run = emit_and_run::empty_app()
+        .write(
+            "config/application.rb",
+            "module TestApp\n  class Application < Rails::Application\n  end\nend\n",
+        )
+        .write(
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        )
+        .write(
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n",
+        )
+        .write(
+            "app/models/widget.rb",
+            r#"class Widget < ApplicationRecord
+  before_save :stamp, if: :ready?, unless: :blocked?
+
+  def ready?
+    self.color.present?
+  end
+
+  def blocked?
+    self.name == "blocked"
+  end
+
+  def stamp
+    self.name = "STAMPED"
+  end
+end
+"#,
+        )
+        .write(
+            "db/schema.rb",
+            "ActiveRecord::Schema[8.1].define(version: 2026_01_01_000000) do\n  create_table \"widgets\", force: :cascade do |t|\n    t.string \"color\"\n    t.string \"name\"\n  end\nend\n",
+        )
+        .run_ruby(
+            r#"not_ready = Widget.create!(name: "x")
+raise "if: false must skip: #{not_ready.name.inspect}" unless not_ready.name == "x"
+blocked = Widget.create!(color: "red", name: "blocked")
+raise "unless: true must skip: #{blocked.name.inspect}" unless blocked.name == "blocked"
+runs = Widget.create!(color: "red", name: "x")
+raise "if: true and unless: false must run: #{runs.name.inspect}" unless runs.name == "STAMPED"
+"#,
+        );
+    run.assert_passes();
+}
