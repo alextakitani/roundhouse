@@ -1408,6 +1408,26 @@ pub(crate) fn insert_framework_stubs(
     // directly).
     insert_db_stub(classes);
 
+    // ActiveRecord — the module functions a lowered app body calls
+    // (runtime/ruby/active_record/base.rb). `lower_bound` is the run
+    // lookup in the `includes(:assoc)` distribute the Arel visitor
+    // emits; the controller body is re-typed after that rewrite, and an
+    // unresolved call there would erase the run bounds' Integer to
+    // untyped — which the strict targets then index wrongly.
+    if !classes.contains_key(&ClassId(Symbol::from("ActiveRecord"))) {
+        use crate::lower::typing::fn_sig;
+        let int_array = || crate::ty::Ty::Array { elem: Box::new(crate::ty::Ty::Int) };
+        let mut ar = crate::analyze::ClassInfo::default();
+        ar.class_methods.insert(
+            Symbol::from("lower_bound"),
+            fn_sig(
+                vec![(Symbol::from("sorted"), int_array()), (Symbol::from("value"), crate::ty::Ty::Int)],
+                crate::ty::Ty::Int,
+            ),
+        );
+        classes.insert(ClassId(Symbol::from("ActiveRecord")), ar);
+    }
+
     // Params — narrowing accessors over the recursive request-params
     // tree (runtime/ruby/params.rb). The synthesized `<Resource>Params.
     // from_raw` calls these instead of open-coding `is_a?` narrowing at

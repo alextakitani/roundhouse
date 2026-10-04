@@ -807,7 +807,7 @@ pub fn apply_post_analyze_lowerings(
     ran!("sum_symbol");
     values_at_splat::apply_values_at_splat_lowering(app);
     ran!("values_at_splat");
-    diags.extend(tag_builder::apply_tag_builder_lowering(app));
+    diags.extend(tag_builder::apply_tag_builder_lowering(app, registry));
     ran!("tag_builder");
     request_index::apply_request_index_lowering(app);
     ran!("request_index");
@@ -1102,6 +1102,19 @@ pub(crate) fn for_each_hook_body(
     app: &mut crate::app::App,
     f: &mut impl FnMut(&mut crate::expr::Expr),
 ) {
+    for_each_owned_hook_body(app, &mut |_, body| f(body))
+}
+
+/// [`for_each_hook_body`] with each body's OWNER: the class (model,
+/// library class, `config/application.rb`, controller) whose method it
+/// is, so a receiver-less send can be read against what that class
+/// defines. `None` for the seeds, which belong to no class. One walk
+/// with the owner threaded through, so the two cannot disagree about
+/// the set of bodies.
+pub(crate) fn for_each_owned_hook_body(
+    app: &mut crate::app::App,
+    f: &mut impl FnMut(Option<&crate::ident::ClassId>, &mut crate::expr::Expr),
+) {
     fn visit_param_defaults(
         params: &mut [crate::dialect::Param],
         f: &mut impl FnMut(&mut crate::expr::Expr),
@@ -1113,7 +1126,9 @@ pub(crate) fn for_each_hook_body(
         }
     }
     for model in &mut app.models {
-        for item in &mut model.body {
+        let crate::dialect::Model { name, body, .. } = model;
+        let f = &mut |e: &mut crate::expr::Expr| f(Some(&*name), e);
+        for item in body {
             match item {
                 crate::dialect::ModelBodyItem::Method { method, .. } => {
                     visit_param_defaults(&mut method.params, f);
@@ -1152,14 +1167,16 @@ pub(crate) fn for_each_hook_body(
         }
     }
     for lc in &mut app.library_classes {
-        for method in &mut lc.methods {
+        let crate::dialect::LibraryClass { name, methods, constants, unknown_calls, .. } = lc;
+        let f = &mut |e: &mut crate::expr::Expr| f(Some(&*name), e);
+        for method in methods.iter_mut() {
             visit_param_defaults(&mut method.params, f);
             f(&mut method.body);
         }
-        for (_name, value) in &mut lc.constants {
+        for (_name, value) in constants.iter_mut() {
             f(value);
         }
-        for call in &mut lc.unknown_calls {
+        for call in unknown_calls.iter_mut() {
             f(call);
         }
     }
@@ -1171,19 +1188,23 @@ pub(crate) fn for_each_hook_body(
     // compiled to `undefined method 'presence' for an instance of
     // String`: a body that ships has to be walked.
     if let Some(lc) = &mut app.rails_application {
-        for method in &mut lc.methods {
+        let crate::dialect::LibraryClass { name, methods, constants, unknown_calls, .. } = lc;
+        let f = &mut |e: &mut crate::expr::Expr| f(Some(&*name), e);
+        for method in methods.iter_mut() {
             visit_param_defaults(&mut method.params, f);
             f(&mut method.body);
         }
-        for (_name, value) in &mut lc.constants {
+        for (_name, value) in constants.iter_mut() {
             f(value);
         }
-        for call in &mut lc.unknown_calls {
+        for call in unknown_calls.iter_mut() {
             f(call);
         }
     }
     for controller in &mut app.controllers {
-        for item in &mut controller.body {
+        let crate::dialect::Controller { name, body, .. } = controller;
+        let f = &mut |e: &mut crate::expr::Expr| f(Some(&*name), e);
+        for item in body {
             match item {
                 crate::dialect::ControllerBodyItem::Action { action, .. } => {
                     for (_name, default) in &mut action.opt_params {
@@ -1211,7 +1232,7 @@ pub(crate) fn for_each_hook_body(
         }
     }
     if let Some(seeds) = &mut app.seeds {
-        f(seeds);
+        f(None, seeds);
     }
 }
 

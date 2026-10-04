@@ -65,6 +65,32 @@ class Routing(unittest.TestCase):
         plan = ci.select(["src/analyze/call.rs", "src/lower/rails.rs"])
         self.assertEqual(plan["jobs"], ci.BASE)
         self.assertEqual(plan["archives"], [])
+        self.assertNotIn("compare", plan["jobs"])
+        self.assertNotIn("browser-smoke-typescript", plan["jobs"])
+        self.assertNotIn("compare-extra", plan["jobs"])
+
+    def test_ruby_floor_omits_rust_typescript_until_those_owners_change(self):
+        self.assertEqual(
+            ci.BASE,
+            [
+                "generate-fixture",
+                "unit",
+                "build-roundhouse",
+                "store-check",
+                "compare-ruby",
+                "campfire-conformance",
+                "campfire-compare",
+            ],
+        )
+        rust = ci.select(["src/emit/rust.rs"])
+        self.assertIn("compare", rust["jobs"])
+        self.assertNotIn("browser-smoke-typescript", rust["jobs"])
+        typescript = ci.select(["src/emit/typescript.rs"])
+        self.assertIn("compare", typescript["jobs"])
+        self.assertIn("browser-smoke-typescript", typescript["jobs"])
+        wasm = ci.select(["wasm/lib/driver.mjs"])
+        self.assertIn("browser-smoke-typescript", wasm["jobs"])
+        self.assertNotIn("compare", wasm["jobs"])
 
     def test_shared_emitters_select_cross_target_full_coverage(self):
         for path in [
@@ -135,6 +161,29 @@ class Routing(unittest.TestCase):
         self.assertIn("build-roundhouse", plan["required"])
         self.assertIn("archive-results", plan["required"])
         self.assertNotIn("assemble-site", plan["jobs"])
+
+    def test_canonical_main_push_selects_full_without_a_label(self):
+        with tempfile.TemporaryDirectory() as directory:
+            event = Path(directory) / "event.json"
+            event.write_text(json.dumps({"before": "0" * 40}))
+            env = {
+                "GITHUB_EVENT_PATH": str(event),
+                "GITHUB_EVENT_NAME": "push",
+                "GITHUB_SHA": "1" * 40,
+                "GITHUB_REF": "refs/heads/main",
+                "CI_SPINEL_REVISION": "2" * 40,
+            }
+            with (
+                patch.dict(os.environ, env, clear=True),
+                patch("sys.argv", ["ci-plan.py", "plan"]),
+                patch.object(ci, "changed_inputs", return_value=(["README.md"], None)),
+                patch.object(ci, "write_outputs") as output,
+            ):
+                self.assertEqual(ci.main(), 0)
+            plan = output.call_args.args[0]["plan"]
+            self.assertEqual(plan["smoke"], ci.TARGETS)
+            self.assertTrue(set(ci.SPINEL11).issubset(plan["jobs"]))
+            self.assertNotIn("assemble-site", plan["jobs"])
 
     def test_draft_label_events_reach_full_selection_and_unlabel_returns_to_floor(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -334,7 +383,6 @@ class Routing(unittest.TestCase):
                     self.assertEqual(plan["archives"], ["ruby", "jruby"])
         for paths, options in [
             (["src/project.rs"], {"full": True}),
-            (["src/project.rs", "src/bin/roundhouse.rs"], {}),
             (["src/project.rs", "src/emit/shared/ops.rs"], {}),
         ]:
             self.assertEqual(
@@ -345,6 +393,16 @@ class Routing(unittest.TestCase):
             ci.select(["src/project.rs"], project_scope="unknown")["smoke"],
             ci.TARGETS,
         )
+
+    def test_cli_binary_does_not_expand_to_full(self):
+        plan = ci.select(["src/bin/roundhouse.rs"])
+        self.assertEqual(plan["jobs"], ci.BASE)
+        self.assertEqual(plan["extra_compare"], [])
+        interpreted = ci.select(
+            ["src/project.rs", "src/bin/roundhouse.rs"],
+            project_scope="interpreted",
+        )
+        self.assertEqual(interpreted["smoke"], ["ruby", "jruby"])
 
     def test_full_manual_and_publication_are_distinct(self):
         plan = ci.select([], full=True)
@@ -497,9 +555,23 @@ class Results(unittest.TestCase):
         plan = ci.select([])
         needs = self.needs(plan)
         needs["build-wasm"] = {"result": "skipped"}
+        needs["compare"] = {"result": "skipped"}
+        needs["browser-smoke-typescript"] = {"result": "skipped"}
         self.assertEqual(ci.check_results(plan, needs), ([], True))
+        self.assertEqual(ci.check_results(plan, needs, compact=True), ([], True))
         needs["plan"]["result"] = "failure"
         self.assertTrue(ci.check_results(plan, needs)[0])
+
+    def test_compact_gate_ignores_unselected_publication_lanes(self):
+        plan = ci.select(["src/analyze/call.rs"])
+        needs = self.needs(plan)
+        needs["compare"] = {"result": "skipped"}
+        needs["browser-smoke-typescript"] = {"result": "skipped"}
+        self.assertEqual(ci.check_results(plan, needs, compact=True), ([], True))
+        owned = ci.select(["src/emit/rust.rs"])
+        needs = self.needs(owned)
+        needs["compare"]["result"] = "failure"
+        self.assertTrue(ci.check_results(owned, needs, compact=True)[0])
 
 
 class MergeTree(unittest.TestCase):
@@ -585,11 +657,53 @@ class MergeTree(unittest.TestCase):
             self.assertEqual(ci.select(paths)["extra_compare"], ["swift", "go"])
             with self.assertRaises(ValueError):
                 ci.changed_inputs(event, "pull_request", head)
-            with (
-                patch.dict(event["pull_request"]["base"], sha=head),
-                self.assertRaises(ValueError),
-            ):
-                ci.changed_inputs(event, "pull_request", sha)
+
+    def test_pr_head_checkout_diffs_against_the_event_base(self):
+        with git_repository() as (root, git):
+            (root / "src/emit").mkdir(parents=True)
+            (root / "src/emit/go.rs").write_text("old owner\n")
+            git("add", ".")
+            git("commit", "-m", "base")
+            base = git("rev-parse", "HEAD")
+            git("switch", "-c", "feature")
+            (root / "src/emit/go.rs").write_text("new owner\n")
+            git("add", ".")
+            git("commit", "-m", "feature")
+            head = git("rev-parse", "HEAD")
+            git("checkout", "--detach", head)
+            event = {"pull_request": {"base": {"sha": base}, "head": {"sha": head}}}
+            paths, scope = ci.changed_inputs(event, "pull_request", head)
+            self.assertIsNone(scope)
+            self.assertEqual(paths, ["src/emit/go.rs"])
+
+    def test_merge_tree_survives_a_newer_main_than_the_event_base(self):
+        with git_repository() as (root, git):
+            (root / "src/analyze").mkdir(parents=True)
+            (root / "src/analyze/call.rs").write_text("old\n")
+            git("add", ".")
+            git("commit", "-m", "base")
+            event_base = git("rev-parse", "HEAD")
+            git("switch", "-c", "feature")
+            (root / "src/analyze/call.rs").write_text("feature\n")
+            git("add", ".")
+            git("commit", "-m", "feature")
+            head = git("rev-parse", "HEAD")
+            git("switch", "-")
+            (root / "README.md").write_text("main moved\n")
+            git("add", ".")
+            git("commit", "-m", "main advanced")
+            git("merge", "--no-ff", "feature", "-m", "merge")
+            sha = git("rev-parse", "HEAD")
+            event = {
+                "pull_request": {"base": {"sha": event_base}, "head": {"sha": head}}
+            }
+            paths, scope = ci.changed_inputs(event, "pull_request", sha)
+            self.assertIsNone(scope)
+            self.assertEqual(paths, ["src/analyze/call.rs"])
+            self.assertEqual(ci.select(paths)["jobs"], ci.BASE)
+            stale = {"pull_request": {"base": {"sha": head}, "head": {"sha": head}}}
+            paths, scope = ci.changed_inputs(stale, "pull_request", sha)
+            self.assertEqual(paths, ["src/analyze/call.rs"])
 
 
 class ProjectScope(unittest.TestCase):

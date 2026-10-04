@@ -18,7 +18,7 @@ use crate::Symbol;
 use crate::dialect::{LibraryClass, MethodReceiver, TestModule};
 use crate::vfs::{FsVfs, MapVfs, Vfs};
 
-use super::controller::ingest_controller;
+use super::controller::ingest_controller_with_nesting;
 use super::expr::ingest_ruby_program;
 use super::fixture::ingest_fixture_file;
 use super::jbuilder::ingest_jbuilder;
@@ -1112,6 +1112,10 @@ end
         }
     }
 
+    // Each controller's lexical nesting, for resolving its superclass
+    // once every controller is known (see
+    // `qualify_relative_controller_superclasses`).
+    let mut controller_nesting = std::collections::HashMap::new();
     for root in &roots {
         let controllers_dir = dir.join(root).join("controllers");
         if !vfs.is_dir(&controllers_dir) {
@@ -1121,9 +1125,10 @@ end
             let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
             let path_str = entry.display().to_string();
             if let Some(maybe_controller) =
-                unwrap_or_record(ingest_controller(&source, &path_str))?
+                unwrap_or_record(ingest_controller_with_nesting(&source, &path_str))?
             {
-                if let Some(controller) = maybe_controller {
+                if let Some((controller, nesting)) = maybe_controller {
+                    controller_nesting.insert(controller.name.clone(), nesting);
                     // `helper_method :x` exposes controller methods to
                     // templates. The ARG-PURE ones (no ivar reads)
                     // register like app-helper functions — the bare
@@ -1219,6 +1224,7 @@ end
                     app.controllers.push(synthesize_redirect_controller(&routes.redirects));
                 }
                 app.routes = routes;
+                synthesize_rails_health_controller(&mut app);
             }
         }
     }
@@ -1619,6 +1625,14 @@ end
     // joins `dir`); map-VFS trees pass `""` and register app-relative.
     app.root = dir.display().to_string().trim_end_matches('/').to_string();
 
+    // A module-nested controller's relative superclass
+    // (`module Ns; class XController < BaseController`) names
+    // `Ns::BaseController` under Ruby's lexical lookup. Left bare, the
+    // parent matched no controller, the ancestry walk came back empty,
+    // and the whole filter chain (its own base's before_action AND
+    // ApplicationController's) vanished from the synthesized dispatcher.
+    qualify_relative_controller_superclasses(&mut app, &controller_nesting);
+
     // `app/models/post/summary.rb` often reopens `class Post` only to
     // hold `Post::Summary`. That reopen is a namespace, not a class of
     // its own: kept as a library class, it owns the file
@@ -1650,8 +1664,11 @@ end
     super::thread_mattr::lower_thread_mattr(&mut app);
     // Alba declarations become ordinary property-reading methods before
     // inference; validate complete original resource bodies, not just IR.
-    // Rejected declarations still fail ingest, but survey must ledger them.
-    super::alba::lower_alba_resources(&mut app, &sources).inspect_err(survey::record)?;
+    // A recorded refusal is not support. Strict mode still fails here.
+    // Survey mode keeps the ledger entry and continues analysis.
+    if let Err(err) = super::alba::lower_alba_resources(&mut app, &sources) {
+        survey::continue_or_fail(err)?;
+    }
     // After it, not before: `Current`'s own `delegate` reads an
     // ATTRIBUTE's ivar, which that pass has the declarations for. What
     // reaches here is the general shape, whose target is a method.
@@ -2800,6 +2817,11 @@ fn report_unrecognized_controller_macros(app: &App) {
                 });
                 continue;
             }
+            if survey::recorded().iter().any(|gap| {
+                gap.contains("class configuration") && gap.contains(method.as_str())
+            }) {
+                continue;
+            }
             survey::record(&IngestError::Unsupported {
                 file,
                 message: format!(
@@ -2899,6 +2921,42 @@ fn expand_class_body_macros(app: &mut App) {
                 expanded.push(item);
                 continue;
             };
+            // A reader beside the writer is the normal shape
+            // (`def options; @options || {}; end`). The writer still
+            // only stores the keyword rest, so the call is consumed.
+            // An attached block never reaches this arm.
+            // A refused concern is not executed. A method whose body is
+            // only the keyword-rest store is still consumed: the other
+            // statements stay unexpanded.
+            let another_unreadable = controller.body.iter().any(|other| {
+                let ControllerBodyItem::Unknown { expr: other_expr, .. } = other else {
+                    return false;
+                };
+                let ExprNode::Send { recv: None, method: other_method, args, block: None, .. } =
+                    &*other_expr.node
+                else {
+                    return false;
+                };
+                other_method == method && stored_options_init(other_expr, &macro_def).is_none() && !args.is_empty()
+            });
+            if method_stores_keyword_rest(&macro_def) && !another_unreadable {
+                if let Some(init) = stored_options_init(expr, &macro_def) {
+                    survey::record(&IngestError::Unsupported {
+                        file: controller.name.0.as_str().to_string(),
+                        message: format!(
+                            "class configuration call stored: `{}`",
+                            method.as_str()
+                        ),
+                    });
+                    expanded.push(ControllerBodyItem::ClassIvarInit {
+                        expr: init,
+                        carrier: module,
+                        leading_comments: leading_comments.clone(),
+                        leading_blank_line: *leading_blank_line,
+                    });
+                    continue;
+                }
+            }
             let body = substitute_params(&macro_def, args);
             match filters_from_macro_body(&body, &module) {
                 Some(filters) => {
@@ -2953,6 +3011,67 @@ fn expand_class_body_macros(app: &mut App) {
 /// The empty Hash is what makes the bare call mean what Ruby means:
 /// `skip_before_action :require_authentication, **{}` is an UNSCOPED
 /// skip, so the filter comes off every action rather than none.
+fn stored_options_init(
+    expr: &crate::expr::Expr,
+    method: &crate::dialect::MethodDef,
+) -> Option<crate::expr::Expr> {
+    use crate::expr::{Expr, ExprNode, LValue, Literal};
+    let body = match &*method.body.node {
+        ExprNode::Seq { exprs } if exprs.len() == 1 => &*exprs[0].node,
+        other => other,
+    };
+    let ExprNode::Assign { target: LValue::Ivar { name }, .. } = body else {
+        return None;
+    };
+    let ExprNode::Send { args, .. } = &*expr.node else { return None };
+    let value = match args.as_slice() {
+        [] => Expr::new(expr.span, ExprNode::Hash { entries: vec![], kwargs: false }),
+        [hash] => {
+            let readable = match &*hash.node {
+                ExprNode::Hash { entries, .. } => entries.iter().all(|(key, value)| {
+                    matches!(&*key.node, ExprNode::Lit { value: Literal::Sym { .. } })
+                        && matches!(
+                            &*value.node,
+                            ExprNode::Lit { .. } | ExprNode::Lambda { .. } | ExprNode::Array { .. }
+                        )
+                }),
+                ExprNode::KeywordSplat { value } => matches!(&*value.node, ExprNode::Hash { .. }),
+                _ => false,
+            };
+            if !readable {
+                return None;
+            }
+            let mut value = hash.clone();
+            if let ExprNode::KeywordSplat { value: inner } = &*value.node {
+                value = inner.clone();
+            }
+            value
+        }
+        _ => return None,
+    };
+    Some(Expr::new(
+        expr.span,
+        ExprNode::Assign {
+            target: LValue::Ivar { name: name.clone() },
+            value,
+        },
+    ))
+}
+
+fn method_stores_keyword_rest(method: &crate::dialect::MethodDef) -> bool {
+    use crate::expr::{ExprNode, LValue};
+    let [param] = method.params.as_slice() else { return false };
+    if method.block_param.is_some() || method.has_anonymous_block {
+        return false;
+    }
+    let body = match &*method.body.node {
+        ExprNode::Seq { exprs } if exprs.len() == 1 => &*exprs[0].node,
+        other => other,
+    };
+    matches!(body, ExprNode::Assign { target: LValue::Ivar { .. }, value }
+        if matches!(&*value.node, ExprNode::Var { name, .. } if name == &param.name))
+}
+
 fn substitute_params(
     macro_def: &crate::dialect::MethodDef,
     args: &[crate::expr::Expr],
@@ -3225,6 +3344,47 @@ fn map_enum_labels(app: &mut App) {
         }
     }
     crate::lower::for_each_hook_body(app, &mut |expr| map_const_receiver_sites(expr, &tables));
+}
+
+/// Resolve a controller's relative superclass against Ruby's lexical
+/// scope. The superclass expression is evaluated in the nesting around
+/// the `class` keyword, so `module Ns; class XController <
+/// BaseController` tries `Ns::BaseController` before a top-level
+/// `BaseController`, while a top-level `class Ns::XController <
+/// BaseController` has only the top level in scope: the `Ns::` prefix
+/// names the class without opening `Ns`. Hence `nesting` (recorded at
+/// ingest, innermost first), never the segments of the class's name.
+///
+/// Rewrites only when a candidate names an ingested controller, so
+/// `ApplicationController` inside `module Ns` stays top-level. A
+/// superclass written qualified (`Admin::BaseController`) or rooted
+/// (`::BaseController`, recorded with an empty nesting) is left alone.
+fn qualify_relative_controller_superclasses(
+    app: &mut App,
+    nesting: &std::collections::HashMap<crate::ident::ClassId, Vec<String>>,
+) {
+    let known: std::collections::HashSet<crate::ident::ClassId> =
+        app.controllers.iter().map(|c| c.name.clone()).collect();
+    for controller in &mut app.controllers {
+        let Some(parent) = controller.parent.clone() else { continue };
+        let raw = parent.0.as_str();
+        if raw.contains("::") {
+            continue;
+        }
+        for scope in nesting.get(&controller.name).into_iter().flatten() {
+            let id = crate::ident::ClassId(crate::ident::Symbol::from(format!("{scope}::{raw}")));
+            // `module Admin; class NotesController < NotesController`
+            // names the top-level one: a class is never its own
+            // superclass.
+            if id == controller.name {
+                continue;
+            }
+            if known.contains(&id) {
+                controller.parent = Some(id);
+                break;
+            }
+        }
+    }
 }
 
 /// Resolve a model's `include <Const>` against Ruby's lexical scope:
@@ -4511,6 +4671,30 @@ fn extract_autoload_path_roots(source: &[u8]) -> Vec<String> {
     roots
 }
 
+/// `get "up" => "rails/health#show"` — every `rails new` app's health
+/// check (what a Kamal proxy probes) — names Rails' OWN
+/// `Rails::HealthController`, which no app tree holds: the route
+/// dispatched to nothing and `/up` answered 404. Written here as the
+/// controller Rails ships (8.1: `render html:` of the green page; the
+/// `rescue_from` → red 500 half needs a boot failure, which a one-shot
+/// process reports by not answering at all). Synthesized only when a
+/// route targets it and the app doesn't define its own. A namespaced
+/// class, so only the targets that emit one receive it
+/// (`project::target_files` drops it, with a warning, for the rest).
+fn synthesize_rails_health_controller(app: &mut crate::App) {
+    use super::routes::RAILS_HEALTH_CONTROLLER;
+    let routed = crate::lower::routes::flatten_routes(app)
+        .iter()
+        .any(|r| r.controller.0.as_str() == RAILS_HEALTH_CONTROLLER);
+    if !routed || app.controllers.iter().any(|c| c.name.0.as_str() == RAILS_HEALTH_CONTROLLER) {
+        return;
+    }
+    let src = "class Rails::HealthController < ActionController::Base\n  def show\n    render html: \"<!DOCTYPE html><html><body style=\\\"background-color: green\\\"></body></html>\".html_safe\n  end\nend\n";
+    if let Ok(Some(controller)) = super::controller::ingest_controller(src.as_bytes(), "<rails/health>") {
+        app.controllers.push(controller);
+    }
+}
+
 /// The controller the `to: redirect(...)` routes dispatch to: one
 /// action per redirect, each answering the location Rails' routing
 /// redirect would.
@@ -4532,11 +4716,41 @@ fn synthesize_redirect_controller(
         .map(|redirect| {
             // Built from Ruby source so the action body is ingested the
             // way a hand-written `redirect_to` would be.
-            let src = format!(
-                "def __redirect\n  redirect_to({}, status: :{})\nend\n",
-                redirect_location_source(&redirect.location),
-                redirect_status_symbol(redirect.status),
-            );
+            let location = if let Some(expression) = redirect.location.strip_prefix('\u{0}') {
+                expression.to_string()
+            } else if redirect.location_is_expression {
+                redirect.location.clone()
+            } else {
+                redirect_location_source(&redirect.location)
+            };
+            let (location, multiline) = if redirect.keep_query {
+                // Rails' options form keeps the request query. The
+                // dispatcher stores it on the request object. An empty
+                // query leaves the path unchanged; a path that already
+                // has `?` is joined with `&`. A fragment stays after the
+                // query: `/login#step` plus `x=1` is `/login?x=1#step`,
+                // not `/login#step?x=1`.
+                (
+                    format!(
+                        "q = ActionController::Current.request.query_string.to_s\n    parts = {location}.split(\"#\", 2)\n    base = parts[0]\n    joined = q == \"\" ? base : base + (base.include?(\"?\") ? \"&\" : \"?\") + q\n    parts.length == 1 ? joined : joined + \"#\" + parts[1]"
+                    ),
+                    true,
+                )
+            } else {
+                (location, false)
+            };
+            let src = if multiline || location.contains('\n') || location.contains(';') {
+                format!(
+                    "def __redirect\n  location = begin\n    {location}\n  end\n  redirect_to(location, status: :{})\nend\n",
+                    redirect_status_symbol(redirect.status),
+                )
+            } else {
+                format!(
+                    "def __redirect\n  redirect_to({}, status: :{})\nend\n",
+                    location,
+                    redirect_status_symbol(redirect.status),
+                )
+            };
             let body = crate::runtime_src::parse_methods(&src)
                 .ok()
                 .and_then(|m| m.into_iter().next())

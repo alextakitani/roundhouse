@@ -2541,6 +2541,14 @@ impl Analyzer {
             }
             let model_name = model.name.clone();
             for method in model.methods_mut() {
+                // A default is part of the parameter's type. Typed before
+                // seeding so `value = nil` is `Nil` when no call site has
+                // said otherwise, and a later site can union with it.
+                for param in &mut method.params {
+                    if let Some(default) = &mut param.default {
+                        self.body_typer().analyze_expr(default, &class_ctx);
+                    }
+                }
                 let mctx = self.seed_method_params(&class_ctx, &model_name, method);
                 self.body_typer().analyze_expr(&mut method.body, &mctx);
             }

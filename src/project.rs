@@ -872,6 +872,42 @@ fn reject_unsupported_forwarded_procs(app: &App, target: BuildTarget) -> Result<
     Ok(())
 }
 
+/// Targets whose emitters name, file and dispatch a module-qualified
+/// controller (`Admin::StatsController`) correctly. The others write
+/// the `::` into identifiers and paths (TypeScript, Crystal, C#,
+/// Kotlin, Swift), or derive a module/constructor/dispatch key that
+/// disagrees with the route table's (Rust, Go, Python) — true of an
+/// app's own namespaced controllers as well. Elixir and the Roda
+/// conversion have no run proving one either way.
+fn emits_namespaced_controllers(target: BuildTarget) -> bool {
+    matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel)
+}
+
+/// The app without `Rails::HealthController`, for a target that cannot
+/// emit a namespaced controller: ingest synthesizes it for the `/up`
+/// route, and emitting it there breaks the build or misroutes it,
+/// which the route alone did not (it left `/up` unserved). Matched by name,
+/// so an app's own `Rails::HealthController` is dropped there too; it
+/// hit the same gap. `None` when there is nothing to drop. The warning
+/// keeps the 404 on the ledger.
+fn without_rails_health_controller(app: &App, target: BuildTarget) -> Option<App> {
+    let health = crate::ingest::routes::RAILS_HEALTH_CONTROLLER;
+    if emits_namespaced_controllers(target) || !app.controllers.iter().any(|c| c.name.0.as_str() == health) {
+        return None;
+    }
+    let mut d = crate::diagnostic::Diagnostic::unsupported(
+        crate::span::Span::synthetic(),
+        Some(crate::ident::Symbol::from(target.as_str())),
+        "namespaced_controller",
+        format!("{health} is not emitted: this target does not emit namespaced controllers yet, so `rails/health#show` is not served"),
+    );
+    d.severity = crate::diagnostic::Severity::Warning;
+    emit::diagnostics::push(d);
+    let mut app = app.clone();
+    app.controllers.retain(|c| c.name.0.as_str() != health);
+    Some(app)
+}
+
 /// A unique index whose `where:` SQLite can't be trusted to run as
 /// written — a Postgres dump's `((kind)::text = 'initial'::text)` or
 /// `= ANY (ARRAY[…])` — is unique over every row in the SQLite DDL, as
@@ -943,6 +979,14 @@ pub fn target_files(
     fixture: &Path,
     target: BuildTarget,
 ) -> Result<Vec<(String, String)>, String> {
+    let without_health;
+    let app = match without_rails_health_controller(app, target) {
+        Some(trimmed) => {
+            without_health = trimmed;
+            &without_health
+        }
+        None => app,
+    };
     reject_unsupported_pattern_matches(app, target)?;
     reject_unsupported_data_factories(app, target)?;
     reject_unsupported_dates(app, target)?;
@@ -972,6 +1016,17 @@ pub fn target_files(
             crate::emit::diagnostics::report_unsupported(method.name_span, target.as_str(), "parameter declaration", formal.description());
         }
         if !matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby) {
+            let named_keyword_rest = method.params.iter().any(|p| {
+                p.keyword && p.rest && !p.name.as_str().is_empty() && !p.forwarding
+            });
+            let anonymous_or_full = method.params.iter().any(|p| {
+                p.forwarding || (p.keyword && p.rest && p.name.as_str().is_empty())
+            });
+            // Spinel carries keyword parameters. A named `**details` is
+            // that parameter. Nameless `**` and `...` stay refused.
+            if matches!(target, BuildTarget::Spinel) && named_keyword_rest && !anonymous_or_full {
+                continue;
+            }
             let construct = if method.params.iter().any(|p| p.forwarding) {
                 "full argument forwarding"
             } else if method.params.iter().any(|p| p.keyword && p.rest) {
