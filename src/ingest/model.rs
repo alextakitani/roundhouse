@@ -1589,7 +1589,10 @@ fn callback_condition(value: &ruby_prism::Node<'_>, file: &str) -> Option<Expr> 
 ///   `it` are parameters too);
 /// * exactly one statement, with no `return`/`next`/`break`/`redo`/
 ///   `retry` — inside the hook a `return` exits the whole callback chain;
-/// * no local-variable writes — they would leak into the hook's scope.
+/// * no local writes — they would leak into the hook's scope. That
+///   includes a local bound through a target: a multi-write
+///   `(a, b = …)`, a `=> t` match-write, a `rescue => e`; and any
+///   multi-write declines, its targets being locals or not.
 ///
 /// Anything else declines (`None`), and the callback falls back to the
 /// unsupported-DSL warning, as it did before conditions were modelled.
@@ -1633,6 +1636,9 @@ fn simple_condition_body<'pr>(
             self.0 = true;
         }
         fn visit_local_variable_target_node(&mut self, _: &ruby_prism::LocalVariableTargetNode<'pr>) {
+            self.0 = true;
+        }
+        fn visit_multi_write_node(&mut self, _: &ruby_prism::MultiWriteNode<'pr>) {
             self.0 = true;
         }
     }

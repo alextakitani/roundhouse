@@ -93,20 +93,22 @@ const DECLINED: &str = r##"class Widget < ApplicationRecord
   before_save :a2, if: proc { |p| p.name.present? }
   before_save :a3, if: -> { return false if name.nil?; true }
   before_save :a4, if: -> { n = name; n.present? }
+  before_save :a6, if: -> { (a, b = name, 1) && a }
+  before_save :a7, if: -> { name in String => t }
+  before_save :a8, if: -> { begin; name.present?; rescue => e; false; end }
+  before_save :a9, if: -> { (@a, @b = name, 1) && @a }
   before_save :a5, if: -> { name.present? }
-  before_save :a6, if: -> { (a, b = title, 1) && a }
-  before_save :a7, if: -> { title in String => t }
-  before_save :a8, if: -> { begin; title.present?; rescue => e; false; end }
 
   private
     def a1; self.color = "1"; end
     def a2; self.color = "2"; end
     def a3; self.color = "3"; end
     def a4; self.color = "4"; end
-    def a5; self.color = "5"; end
     def a6; self.color = "6"; end
     def a7; self.color = "7"; end
     def a8; self.color = "8"; end
+    def a9; self.color = "9"; end
+    def a5; self.color = "5"; end
 end
 "##;
 
@@ -139,7 +141,7 @@ fn only_a_zero_parameter_single_expression_condition_is_spliced() {
     assert!(!src.contains("r.name") && !src.contains("p.name"), "unbound param spliced:\n{src}");
     // The declined callbacks are dropped (defined, never called from the hook).
     let hook = src.split("def before_save").nth(1).expect("before_save hook").split("\n  end").next().unwrap();
-    for m in ["a1", "a2", "a3", "a4", "a6", "a7", "a8"] {
+    for m in ["a1", "a2", "a3", "a4", "a6", "a7", "a8", "a9"] {
         assert!(!hook.contains(m), "{m} must decline, not run with a broken guard:\n{hook}");
     }
     // The zero-parameter, single-expression one is guarded.
