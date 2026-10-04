@@ -1632,6 +1632,9 @@ fn simple_condition_body<'pr>(
         fn visit_local_variable_and_write_node(&mut self, _: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
             self.0 = true;
         }
+        fn visit_local_variable_target_node(&mut self, _: &ruby_prism::LocalVariableTargetNode<'pr>) {
+            self.0 = true;
+        }
     }
     let mut v = Escapes(false);
     ruby_prism::Visit::visit(&mut v, &only);
