@@ -8,8 +8,8 @@ mod emit_and_run;
 /// shape `owner.<has_many>.new(...)` usually takes. `new` is
 /// CollectionProxy's alias for `build`, but the controller lowering
 /// only knew `build`, so the emitted action called `Array#new` on the
-/// reader's result. Ingest now normalizes the alias to `build`, and the
-/// POST saves the comment under the article.
+/// reader's result. The early lower pass normalizes the alias to
+/// `build`, and the POST saves the comment under the article.
 #[test]
 fn a_nested_create_with_association_new_saves_under_the_owner() {
     emit_and_run::real_blog()

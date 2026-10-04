@@ -19,6 +19,7 @@
 
 pub mod arel;
 pub mod associations;
+pub mod association_new;
 pub mod blank;
 pub mod broadcast_calls;
 pub mod module_mixins;
@@ -284,6 +285,7 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     // Deletes provably-dead `false && …` tails before any pass can
     // ledger residue for (or rewrite inside) code that cannot run.
     ("bool_fold", &[]),
+    ("association_new", &["bool_fold"]),
     // Preserve native full destinations; ordinary keyword producers
     // rejoin the legacy projection before any argument-rewriting pass.
     ("forwarding_keywords", &["bool_fold"]),
@@ -731,6 +733,8 @@ pub fn apply_post_analyze_lowerings(
     ran!("spliced_concern_bodies");
     bool_fold::apply_bool_fold_lowering(app);
     ran!("bool_fold");
+    association_new::apply_association_new_lowering(app);
+    ran!("association_new");
     diags.extend(forwarding::apply(app));
     ran!("forwarding_keywords");
     diags.extend(params_residue::apply_params_residue_ledger(app));

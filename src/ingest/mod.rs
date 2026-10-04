@@ -16,7 +16,6 @@
 //! cross-cutting Prism AST helpers live in [`util`].
 
 mod alba;
-mod association_new;
 mod class_configuration;
 pub mod allow_browser;
 pub mod app;
