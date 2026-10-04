@@ -7262,23 +7262,23 @@ fn boolean_cast_body(col: &Symbol) -> Expr {
 // campfire's `Message.with_attachment_details` costs the room page two
 // queries where it cost eighty.
 //
-// Known gaps, deliberate: has_one and scope-carrying through-assocs
-// (other than a plain `order("...")`) get no batch arm — the dispatch
+// Known gaps, deliberate: has_one, direct has_many with a scope or
+// polymorphic owner, and scope-carrying through-assocs (other than a
+// plain `order("...")`) get no batch arm — the dispatch
 // falls through and the lazy reader stays correct (just N+1, matching
 // Rails, which also lazy-loads what `includes` doesn't name). Assigning
 // a belongs_to (`c.story = s`) on a PRELOADED record does not refresh
 // the cache (fresh records never have the loaded flag set, so the
 // benchmark's build-then-render flows are unaffected).
+/// Synthesize runtime batch loaders when includes hints occur, leaving
+/// associations whose restrictions cannot be preserved to their lazy readers.
 pub(crate) fn apply_preload_lowering(lcs: &mut [LibraryClass], app: &App) {
     use crate::dialect::Association;
 
-    // Gate: runtime Relations only arise in scope-chain apps (scope-free
-    // apps resolve every chain on the static arel path), and synthesis
-    // only pays for itself when some `includes(...)` survives to
-    // runtime. real-blog (`includes` but no scopes) and tiny-blog
-    // (scopes but no `includes`) both stay byte-identical.
-    let scopes = crate::lower::scope_chain::build_scope_registry(&app.models);
-    if !crate::lower::scope_chain::any_scopes(&scopes) || !app_mentions_includes(app) {
+    // A dynamic query can reach Relation without any named scope (for
+    // example, a helper returning a where.not chain). Its includes hint
+    // needs the same batch loaders. Apps with no includes remain untouched.
+    if !app_mentions_includes(app) {
         return;
     }
 
@@ -7411,6 +7411,8 @@ enum PreloadKind {
     RichText { attr: String, owner: String },
 }
 
+/// Select association shapes whose batch queries preserve the reader's filters,
+/// resolving each against the app model registry and its table metadata.
 fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, PreloadKind)> {
     use crate::dialect::Association;
     use crate::naming::pluralize_snake;
@@ -7420,19 +7422,25 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
     for assoc in model.associations() {
         match assoc {
             Association::BelongsTo { name, target, foreign_key, .. } => {
-                if !model_exists(target) {
+                let Some(target_model) = app.models.iter().find(|m| &m.name == target) else {
                     continue;
-                }
+                };
                 out.push((
                     name.as_str().to_string(),
                     PreloadKind::BelongsTo {
                         fk: foreign_key.as_str().to_string(),
                         target: target.0.as_str().to_string(),
-                        table: pluralize_snake(target.0.as_str()),
+                        table: target_model.table.0.as_str().to_string(),
                     },
                 ));
             }
-            Association::HasMany { name, target, foreign_key, through: None, .. } => {
+            // This loader only applies the foreign-key predicate. A scope
+            // or polymorphic owner-type restriction must stay on the lazy
+            // reader until the batch query can preserve it as well.
+            Association::HasMany {
+                name, target, foreign_key, through: None,
+                scope: None, as_interface: None, ..
+            } => {
                 if !model_exists(target) {
                     continue;
                 }

@@ -71,6 +71,10 @@ pub enum IrHint {
     MutableStringLiteral,
 }
 
+/// A `Const` that is only the operand of `defined?(Foo)` or
+/// `defined?(A::B)`. It is not evaluated, resolved, or autoloaded.
+pub const DEFINED_CONSTANT: u64 = 1 << 3;
+
 /// The core typed λ-calculus. Ruby's ~80 AST node kinds collapse into ~15 here;
 /// everything else lives in the Rails dialect or is handled by normalization.
 ///
@@ -1354,8 +1358,11 @@ pub fn desugar_op_assign(
     span: crate::span::Span,
 ) -> Expr {
     // Build a read of the target as an Expr, so it can appear on both
-    // sides of the desugared form.
-    let target_read = match target {
+    // sides of the desugared form. The read and the combined value are
+    // new nodes, so they carry the type the analyzer gave the operand
+    // — an emitter that renders `+` by type (Rust's `String + &str`)
+    // reads it off them.
+    let mut target_read = match target {
         LValue::Var { id, name } => Expr::new(span, ExprNode::Var { id: *id, name: name.clone() }),
         LValue::Ivar { name } => Expr::new(span, ExprNode::Ivar { name: name.clone() }),
         LValue::Attr { recv, name } => Expr::new(
@@ -1380,6 +1387,7 @@ pub fn desugar_op_assign(
         ),
         LValue::Const { path } => Expr::new(span, ExprNode::Const { path: path.clone() }),
     };
+    target_read.ty = value.ty.clone();
     match op {
         OpAssignOp::OrOr | OpAssignOp::AndAnd => {
             // `target ||= value` → `target || (target = value)` — but
@@ -1415,7 +1423,7 @@ pub fn desugar_op_assign(
             let binop_name = op
                 .binary_op()
                 .expect("arithmetic OpAssignOp has a binary_op");
-            let combined = Expr::new(
+            let mut combined = Expr::new(
                 span,
                 ExprNode::Send {
                     recv: Some(target_read),
@@ -1425,6 +1433,7 @@ pub fn desugar_op_assign(
                     parenthesized: false,
                 },
             );
+            combined.ty = value.ty.clone();
             Expr::new(
                 span,
                 ExprNode::Assign { target: target.clone(), value: combined },

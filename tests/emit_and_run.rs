@@ -836,6 +836,125 @@ fn an_include_from_an_included_block_brings_its_own_included_items() {
         .assert_passes();
 }
 
+/// An action whose whole body is a call to a rendering helper defined
+/// on a PARENT controller. The default response appended to the action
+/// must be guarded by `performed?`, as it is for a helper on the
+/// action's own controller, or it overwrites what the helper rendered.
+#[test]
+fn an_action_responding_through_an_inherited_helper_keeps_its_response() {
+    emit_and_run::real_blog()
+        .write(
+            "app/controllers/base_reports_controller.rb",
+            "class BaseReportsController < ApplicationController\n  private\n\n  def render_title(article)\n    render json: {title: article.title}\n  end\nend\n",
+        )
+        .write(
+            "app/controllers/reports_controller.rb",
+            "class ReportsController < BaseReportsController\n  def show\n    render_title(Article.find(params[:id]))\n  end\nend\n",
+        )
+        .edit(
+            "config/routes.rb",
+            "  resources :articles do",
+            "  get \"/reports/:id\", to: \"reports#show\"\n  resources :articles do",
+        )
+        .write(
+            "test/controllers/reports_controller_test.rb",
+            "require \"test_helper\"\n\nclass ReportsControllerTest < ActionDispatch::IntegrationTest\n  test \"a subclass action responds through the base controller's helper\" do\n    article = Article.create!(title: \"Quarterly\", body: \"Body text here\")\n    get \"/reports/#{article.id}\"\n    assert_response :success\n    assert_equal \"Quarterly\", JSON.parse(response.body)[\"title\"]\n  end\nend\n",
+        )
+        .run_test("test/controllers/reports_controller_test.rb")
+        .assert_passes();
+}
+
+/// The same, one call further: the action calls an inherited helper
+/// that delegates to the inherited helper that renders.
+#[test]
+fn an_action_responding_through_a_delegating_inherited_helper_keeps_its_response() {
+    emit_and_run::real_blog()
+        .write(
+            "app/controllers/base_reports_controller.rb",
+            "class BaseReportsController < ApplicationController\n  private\n\n  def report(article)\n    render_title(article)\n  end\n\n  def render_title(article)\n    render json: {title: article.title}\n  end\nend\n",
+        )
+        .write(
+            "app/controllers/reports_controller.rb",
+            "class ReportsController < BaseReportsController\n  def show\n    report(Article.find(params[:id]))\n  end\nend\n",
+        )
+        .edit(
+            "config/routes.rb",
+            "  resources :articles do",
+            "  get \"/reports/:id\", to: \"reports#show\"\n  resources :articles do",
+        )
+        .write(
+            "test/controllers/reports_controller_test.rb",
+            "require \"test_helper\"\n\nclass ReportsControllerTest < ActionDispatch::IntegrationTest\n  test \"a subclass action responds through a delegating helper\" do\n    article = Article.create!(title: \"Quarterly\", body: \"Body text here\")\n    get \"/reports/#{article.id}\"\n    assert_response :success\n    assert_equal \"Quarterly\", JSON.parse(response.body)[\"title\"]\n  end\nend\n",
+        )
+        .run_test("test/controllers/reports_controller_test.rb")
+        .assert_passes();
+}
+
+/// The same when the nearest helper is an override that reaches the
+/// rendering one through `super`.
+#[test]
+fn an_action_responding_through_an_override_calling_super_keeps_its_response() {
+    emit_and_run::real_blog()
+        .write(
+            "app/controllers/base_reports_controller.rb",
+            "class BaseReportsController < ApplicationController\n  private\n\n  def render_title(article)\n    render json: {title: article.title}\n  end\nend\n",
+        )
+        .write(
+            "app/controllers/reports_controller.rb",
+            "class ReportsController < BaseReportsController\n  def show\n    render_title(Article.find(params[:id]))\n  end\n\n  private\n\n  def render_title(article)\n    super\n  end\nend\n",
+        )
+        .edit(
+            "config/routes.rb",
+            "  resources :articles do",
+            "  get \"/reports/:id\", to: \"reports#show\"\n  resources :articles do",
+        )
+        .write(
+            "test/controllers/reports_controller_test.rb",
+            "require \"test_helper\"\n\nclass ReportsControllerTest < ActionDispatch::IntegrationTest\n  test \"a subclass action responds through super\" do\n    article = Article.create!(title: \"Quarterly\", body: \"Body text here\")\n    get \"/reports/#{article.id}\"\n    assert_response :success\n    assert_equal \"Quarterly\", JSON.parse(response.body)[\"title\"]\n  end\nend\n",
+        )
+        .run_test("test/controllers/reports_controller_test.rb")
+        .assert_passes();
+}
+
+/// `render_code(size: 2, **opts)` into `def render_code(size:, color:
+/// "black")`: a keyword bundle splatted AFTER a literal keyword, in a
+/// receiverless call. Ingest desugars it to `{ size: 2 }.merge(opts)`;
+/// `kwsplat` recovers the keywords, with the literal as the default
+/// the bundle is read against — Ruby lets the later `**` win.
+#[test]
+fn a_keyword_bundle_after_a_literal_keyword_reaches_a_keyword_callee() {
+    emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            "class Article < ApplicationRecord\n  def code_svg(**opts)\n    render_code(size: 2, **opts)\n  end\n\n  def render_code(size:, color: \"black\")\n    \"#{title}:#{size}:#{color}\"\n  end\n",
+        )
+        .run_ruby(
+            "a = Article.create!(title: \"Hi\", body: \"Body text here\")\nraise a.code_svg(color: \"red\") unless a.code_svg(color: \"red\") == \"Hi:2:red\"\nraise a.code_svg unless a.code_svg == \"Hi:2:black\"\nraise a.code_svg(size: 9) unless a.code_svg(size: 9) == \"Hi:9:black\"",
+        )
+        .assert_passes();
+}
+
+/// The same call where the callee comes from an included concern: the
+/// receiverless send resolves through the model's includes.
+#[test]
+fn a_keyword_bundle_reaches_a_keyword_callee_from_an_included_concern() {
+    emit_and_run::real_blog()
+        .write(
+            "app/models/concerns/coded.rb",
+            "module Coded\n  extend ActiveSupport::Concern\n\n  def render_code(size:, color: \"black\")\n    \"#{size}:#{color}\"\n  end\nend\n",
+        )
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            "class Article < ApplicationRecord\n  include Coded\n\n  def code_svg(**opts)\n    render_code(size: 2, **opts)\n  end\n",
+        )
+        .run_ruby(
+            "a = Article.create!(title: \"Hi\", body: \"Body text here\")\nraise a.code_svg(color: \"red\") unless a.code_svg(color: \"red\") == \"2:red\"\nraise a.code_svg unless a.code_svg == \"2:black\"",
+        )
+        .assert_passes();
+}
+
 /// Integer serialization is not blindly String#to_i: nonnumeric labels
 /// must not alias an existing row zero. Invalid IDs still count toward the
 /// array finder's required cardinality, except when pagination excludes them.
@@ -1598,6 +1717,103 @@ end
 "#,
         )
         .run_test("test/models/article_as_hash_boolean_test.rb")
+        .assert_passes();
+}
+
+/// `Hash#to_query` is the scalar query string Rails builds: symbol or
+/// string keys, a nil value with no `=`, and insertion order. Nested
+/// hashes stay on the ruby-family reopen.
+#[test]
+fn a_hash_to_query_renders_symbol_and_string_keys() {
+    emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy",
+            r#"class Article < ApplicationRecord
+  has_many :comments, dependent: :destroy
+
+  def query_probe
+    [
+      { name: "Ada", role: nil }.to_query,
+      { "name" => "Ada", "role" => "editor" }.to_query,
+      {}.to_query
+    ].join("|")
+  end
+"#,
+        )
+        .write(
+            "test/models/article_hash_query_test.rb",
+            r#"require "test_helper"
+
+class ArticleHashQueryTest < ActiveSupport::TestCase
+  test "Hash#to_query renders symbol keys, string keys, and a nil value" do
+    assert_equal "name=Ada&role|name=Ada&role=editor|", Article.new.query_probe
+  end
+end
+"#,
+        )
+        .run_test("test/models/article_hash_query_test.rb")
+        .assert_passes();
+}
+
+/// `Array.wrap` is ActiveSupport's class method: nil is empty, an array
+/// stays an array, and a scalar becomes a one-element array.
+#[test]
+fn array_wrap_keeps_nil_an_array_and_a_scalar_distinct() {
+    emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy",
+            r#"class Article < ApplicationRecord
+  has_many :comments, dependent: :destroy
+
+  def wrapped_nil
+    Array.wrap(nil).map { |item| item.to_s }.join(",")
+  end
+
+  def wrapped_array
+    Array.wrap(%w[a b]).map { |item| item.to_s }.join(",")
+  end
+
+  def wrapped_string
+    Array.wrap("solo").map { |item| item.to_s }.join(",")
+  end
+
+  def wrapped_integer
+    Array.wrap(7).map { |item| item.to_s }.join(",")
+  end
+
+  # One caller passes an array, the default is nil, so the parameter
+  # is `Array | Nil`. Folding that to one shape would nest the array
+  # or wrap nil. The call stays and answers both.
+  def wrapped_either(value = nil)
+    Array.wrap(value).map { |item| item.to_s }.join(",")
+  end
+
+  def either_from_array
+    wrapped_either(%w[a b])
+  end
+"#,
+        )
+        .write(
+            "test/models/article_array_wrap_test.rb",
+            r#"require "test_helper"
+
+class ArticleArrayWrapTest < ActiveSupport::TestCase
+  test "Array.wrap keeps nil, an array, and a scalar distinct" do
+    article = Article.new
+    assert_equal "", article.wrapped_nil
+    assert_equal "a,b", article.wrapped_array
+    assert_equal "solo", article.wrapped_string
+    assert_equal "7", article.wrapped_integer
+    assert_equal "", article.wrapped_either
+    assert_equal "", article.wrapped_either(nil)
+    assert_equal "a,b", article.wrapped_either(%w[a b])
+  end
+end
+"#,
+        )
+        .run_test("test/models/article_array_wrap_test.rb")
         .assert_passes();
 }
 
@@ -3685,5 +3901,102 @@ end
 "##,
         )
         .run_test("test/models/article_summary_test.rb")
+        .assert_passes();
+}
+
+/// A predicate the app defines on `String` is that method, not an
+/// inquirer comparison against its own name.
+#[test]
+fn a_string_predicate_the_app_defines_is_not_folded_as_an_inquiry() {
+    emit_and_run::real_blog()
+        .write(
+            "lib/rails_ext/string.rb",
+            "class String\n  def shout?\n    self == upcase\n  end\n\n  def self.special?\n    true\n  end\nend\n",
+        )
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord",
+            "class Article < ApplicationRecord\n  def shouting?\n    title.to_s.shout?\n  end\n\n  def shouting_inquirer?\n    title.to_s.inquiry.shout?\n  end\n\n  def class_side_inquirer?\n    title.to_s.inquiry.special?\n  end",
+        )
+        .run_ruby(
+            r#"
+raise "folded to a comparison" unless Article.new(title: "LOUD", body: "b").shouting?
+raise "answers true for everything" if Article.new(title: "quiet", body: "b").shouting?
+raise "inquirer folded to a comparison" unless Article.new(title: "LOUD", body: "b").shouting_inquirer?
+raise "inquirer answers true for everything" if Article.new(title: "quiet", body: "b").shouting_inquirer?
+raise "class-side predicate blocked the fold" unless Article.new(title: "special", body: "b").class_side_inquirer?
+raise "class-side fold answers true for everything" if Article.new(title: "quiet", body: "b").class_side_inquirer?
+"#,
+        )
+        .assert_passes();
+}
+
+/// The same through a module the app includes into `String`.
+#[test]
+fn a_string_predicate_from_an_included_module_is_not_folded_as_an_inquiry() {
+    emit_and_run::real_blog()
+        .write(
+            "lib/rails_ext/string.rb",
+            "module Shouting\n  def shout?\n    self == upcase\n  end\nend\n\nclass String\n  include Shouting\nend\n",
+        )
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord",
+            "class Article < ApplicationRecord\n  def shouting?\n    title.to_s.shout?\n  end",
+        )
+        .run_ruby(
+            r#"
+raise "folded to a comparison" unless Article.new(title: "LOUD", body: "b").shouting?
+raise "answers true for everything" if Article.new(title: "quiet", body: "b").shouting?
+"#,
+        )
+        .assert_passes();
+}
+
+/// `includes(:comments)` distributes each parent's children by binary
+/// search over the children's foreign keys, sorted by the preload query
+/// (`ActiveRecord.lower_bound`), where it used to scan every child per
+/// parent — O(N * M), a million comparisons at 1,000 x 1,000, which put
+/// the emitted index behind Rails' keyed preloader
+/// (koduki/example-rails-aot). The comment-byte gates are blind to
+/// grouping, so this renders each article's preloaded comments by body:
+/// inserts interleaved across articles, a parent with no children, and
+/// a run at the end of the sorted list all have to land, in insertion
+/// order within each article.
+#[test]
+fn includes_distributes_each_parents_children_in_order() {
+    emit_and_run::real_blog()
+        .edit(
+            "app/views/articles/_article.html.erb",
+            "(<%= pluralize(article.comments.size, \"comment\") %>)",
+            "(<%= pluralize(article.comments.size, \"comment\") %>)<i class=\"pc\"><%= article.title %>=<%= article.comments.map(&:body).join(\",\") %></i>",
+        )
+        .write(
+            "test/controllers/articles_preload_controller_test.rb",
+            r#"require "test_helper"
+
+class ArticlesPreloadControllerTest < ActionDispatch::IntegrationTest
+  test "includes distributes each article's comments" do
+    a = Article.create!(title: "Alpha", body: "A sufficiently long body for validation.")
+    b = Article.create!(title: "Beta", body: "A sufficiently long body for validation.")
+    c = Article.create!(title: "Gamma", body: "A sufficiently long body for validation.")
+    Article.create!(title: "Delta", body: "A sufficiently long body for validation.")
+    Comment.create!(article_id: c.id, commenter: "x", body: "c1")
+    Comment.create!(article_id: a.id, commenter: "x", body: "a1")
+    Comment.create!(article_id: c.id, commenter: "x", body: "c2")
+    Comment.create!(article_id: b.id, commenter: "x", body: "b1")
+    Comment.create!(article_id: a.id, commenter: "x", body: "a2")
+    Comment.create!(article_id: c.id, commenter: "x", body: "c3")
+    get articles_url
+    assert_response :success
+    assert_match(/<i class="pc">Alpha=a1,a2<\/i>/, response.body)
+    assert_match(/<i class="pc">Beta=b1<\/i>/, response.body)
+    assert_match(/<i class="pc">Gamma=c1,c2,c3<\/i>/, response.body)
+    assert_match(/<i class="pc">Delta=<\/i>/, response.body)
+  end
+end
+"#,
+        )
+        .run_test("test/controllers/articles_preload_controller_test.rb")
         .assert_passes();
 }

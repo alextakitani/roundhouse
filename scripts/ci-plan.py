@@ -22,16 +22,20 @@ TARGETS = [
     "jruby",
 ]
 DRAFT_FLOOR = ["generate-fixture", "unit"]
+# Ready-PR floor: the Ruby shape plus Campfire. Extra languages, Rust/TS
+# compare, WASM, and Spinel are not in this list.
 BASE = [
     *DRAFT_FLOOR,
     "build-roundhouse",
     "store-check",
-    "compare",
     "compare-ruby",
-    "browser-smoke-typescript",
     "campfire-conformance",
     "campfire-compare",
 ]
+# Compact publication additionally waits on Rust/TS when those jobs were
+# selected (full/main, or a change that owns them). Unselected skips must
+# not fail the Ruby PR floor.
+PUBLICATION = [*BASE, "compare", "browser-smoke-typescript"]
 CORE = ["build-spinel", "toolchain-spinel", "compare-spinel"]
 SPINEL_TESTS = [
     "framework_tests_spinel",
@@ -198,7 +202,6 @@ def select(paths, *, draft=False, full=False, publish=False, project_scope=None)
             "scripts/ci-reuse.py",
             "scripts/ci-archive-evidence.py",
             "src/project.rs",
-            "src/bin/roundhouse.rs",
             "Cargo.toml",
             "Cargo.lock",
             "build.rs",
@@ -307,10 +310,14 @@ def select(paths, *, draft=False, full=False, publish=False, project_scope=None)
         for t in TARGETS
         if t in targets and t not in {"rust", "typescript", "ruby", "jruby"}
     ]
+    if "rust" in targets or "typescript" in targets:
+        jobs.append("compare")
     if extra:
         jobs.append("compare-extra")
     if "jruby" in targets:
         jobs.append("compare-jruby")
+    if wasm or "typescript" in targets:
+        jobs.append("browser-smoke-typescript")
     if wasm:
         jobs.extend(["build-wasm", "browser-smoke-ide"])
     if smoke or site:
@@ -370,6 +377,15 @@ def finish(
 
 def git(*args):
     return subprocess.check_output(["git", *args])
+
+
+def ensure_commit(sha):
+    """Fetch a commit by SHA when the plan checkout is too shallow to see it."""
+    try:
+        git("cat-file", "-e", f"{sha}^{{commit}}")
+    except subprocess.CalledProcessError:
+        git("fetch", "--no-tags", "--depth=1", "origin", sha)
+        git("cat-file", "-e", f"{sha}^{{commit}}")
 
 
 def project_change_scope(before, after):
@@ -438,18 +454,24 @@ def changed_inputs(event, event_name, sha):
         raise ValueError("checkout is not the event SHA")
     if event_name == "pull_request":
         pr = event["pull_request"]
+        base, head = pr["base"]["sha"], pr["head"]["sha"]
+        if not SHA.fullmatch(base) or not SHA.fullmatch(head):
+            raise ValueError("PR event is missing base/head SHAs")
         parents = git("show", "-s", "--format=%P", "HEAD").decode().split()
-        if parents != [pr["base"]["sha"], pr["head"]["sha"]]:
-            raise ValueError("checkout is not the event's PR merge tree")
-        base = parents[0]
+        # Prefer the merge commit's first parent when this is the PR merge
+        # tree: GitHub's merge ref can land on a newer main than the event's
+        # base.sha. Do not fetch the fork head from origin; it is already a
+        # parent of the merge commit, or HEAD itself.
+        if len(parents) == 2 and parents[1] == head:
+            base = parents[0]
+        elif sha != head:
+            raise ValueError("checkout is not the event's PR merge tree or head")
+        ensure_commit(base)
     elif event_name == "push":
         base = event["before"]
         if not SHA.fullmatch(base) or base == "0" * 40:
             raise ValueError("no previous main tree")
-        try:
-            git("cat-file", "-e", base)
-        except subprocess.CalledProcessError:
-            git("fetch", "--no-tags", "--depth=1", "origin", base)
+        ensure_commit(base)
     else:
         return [], None
     # Renames become a deletion and addition; both ownership sets are selected.
@@ -474,9 +496,12 @@ def changed_inputs(event, event_name, sha):
 
 
 def check_results(plan, needs, *, compact=False):
-    required = (
-        DRAFT_FLOOR if plan["jobs"] == DRAFT_FLOOR else BASE if compact else plan["required"]
-    )
+    if plan["jobs"] == DRAFT_FLOOR:
+        required = DRAFT_FLOOR
+    elif compact:
+        required = [job for job in PUBLICATION if job in plan["jobs"]]
+    else:
+        required = plan["required"]
     failures = [
         f"{j}: {needs.get(j, {}).get('result', 'missing')}"
         for j in required
@@ -538,6 +563,12 @@ def main():
     full = os.environ.get("CI_FULL") == "true" or any(
         label["name"] == "ci:full" for label in pr.get("labels", [])
     )
+    if (
+        event_name == "push"
+        and os.environ.get("GITHUB_REF") == "refs/heads/main"
+        and not pr
+    ):
+        full = True
     reason = None
     try:
         paths, project_scope = changed_inputs(
