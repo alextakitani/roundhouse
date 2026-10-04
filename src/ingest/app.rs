@@ -1718,6 +1718,8 @@ end
     // Last: needs every model's complete `enums` table, including the
     // columns an included concern declared.
     map_enum_labels(&mut app);
+    // Needs every model's `has_many` names, concern-declared ones included.
+    super::association_new::normalize_association_new(&mut app);
     // Last of all: `has_rich_text` can arrive through a concern's
     // `included do`, so the declaration scan has to run after the
     // splices — and `ActionText::RichText` has to be in `app.models`
