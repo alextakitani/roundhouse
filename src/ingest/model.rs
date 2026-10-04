@@ -1523,7 +1523,7 @@ fn parse_callback(
 /// conditions) is unmodeled and declines.
 fn callback_condition(value: &ruby_prism::Node<'_>, file: &str) -> Option<Expr> {
     if let Some(lambda) = value.as_lambda_node() {
-        let body = lambda.body()?;
+        let body = simple_condition_body(lambda.parameters(), lambda.body())?;
         return ingest_expr(&body, file).ok();
     }
     if let Some(call) = value.as_call_node() {
@@ -1531,7 +1531,7 @@ fn callback_condition(value: &ruby_prism::Node<'_>, file: &str) -> Option<Expr> 
             let name = constant_id_str(&call.name());
             if name == "proc" || name == "lambda" {
                 let block = call.block()?.as_block_node()?;
-                let body = block.body()?;
+                let body = simple_condition_body(block.parameters(), block.body())?;
                 return ingest_expr(&body, file).ok();
             }
         }
@@ -1547,6 +1547,65 @@ fn callback_condition(value: &ruby_prism::Node<'_>, file: &str) -> Option<Expr> 
             parenthesized: false,
         },
     ))
+}
+
+/// The one expression a lambda/proc callback condition may splice into the
+/// hook as its guard. The guard runs inline in the callback, with `self`
+/// as the record and no frame of its own, so only a body that is the same
+/// expression there is accepted:
+///
+/// * no parameters (`-> {}`, `->() {}`, `proc { }`, `proc { || }`) — a
+///   `->(r) { r.title… }` would splice `r` unbound (numbered params and
+///   `it` are parameters too);
+/// * exactly one statement, with no `return`/`next`/`break`/`redo`/
+///   `retry` — inside the hook a `return` exits the whole callback chain;
+/// * no local-variable writes — they would leak into the hook's scope.
+///
+/// Anything else declines (`None`), and the callback falls back to the
+/// unsupported-DSL warning, as it did before conditions were modelled.
+fn simple_condition_body<'pr>(
+    params: Option<ruby_prism::Node<'pr>>,
+    body: Option<ruby_prism::Node<'pr>>,
+) -> Option<ruby_prism::Node<'pr>> {
+    if let Some(p) = params {
+        let bp = p.as_block_parameters_node()?;
+        if bp.parameters().is_some() || bp.locals().iter().next().is_some() {
+            return None;
+        }
+    }
+    let stmts = body?.as_statements_node()?;
+    let mut it = stmts.body().iter();
+    let only = it.next()?;
+    if it.next().is_some() {
+        return None;
+    }
+
+    struct Escapes(bool);
+    impl<'pr> ruby_prism::Visit<'pr> for Escapes {
+        fn visit_return_node(&mut self, _: &ruby_prism::ReturnNode<'pr>) { self.0 = true; }
+        fn visit_next_node(&mut self, _: &ruby_prism::NextNode<'pr>) { self.0 = true; }
+        fn visit_break_node(&mut self, _: &ruby_prism::BreakNode<'pr>) { self.0 = true; }
+        fn visit_redo_node(&mut self, _: &ruby_prism::RedoNode<'pr>) { self.0 = true; }
+        fn visit_retry_node(&mut self, _: &ruby_prism::RetryNode<'pr>) { self.0 = true; }
+        fn visit_local_variable_write_node(&mut self, _: &ruby_prism::LocalVariableWriteNode<'pr>) {
+            self.0 = true;
+        }
+        fn visit_local_variable_operator_write_node(
+            &mut self,
+            _: &ruby_prism::LocalVariableOperatorWriteNode<'pr>,
+        ) {
+            self.0 = true;
+        }
+        fn visit_local_variable_or_write_node(&mut self, _: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
+            self.0 = true;
+        }
+        fn visit_local_variable_and_write_node(&mut self, _: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
+            self.0 = true;
+        }
+    }
+    let mut v = Escapes(false);
+    ruby_prism::Visit::visit(&mut v, &only);
+    if v.0 { None } else { Some(only) }
 }
 
 fn negate_condition(cond: Expr) -> Expr {

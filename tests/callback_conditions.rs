@@ -75,12 +75,67 @@ fn a_lambda_if_condition_guards_the_callback() {
 #[test]
 fn a_symbol_unless_condition_negates_the_predicate() {
     let src = emitted();
-    // `before_save :shout, unless: :loud?` → `unless self.loud?`.
-    assert!(
-        src.contains("shout") && src.contains("loud?"),
-        "the unless callback and its predicate must survive:\n{src}"
-    );
-    // `before_destroy :noop, if: :frozen?` — the method exists and is
-    // guarded by the predicate.
-    assert!(src.contains("frozen?"), "{src}");
+    // `before_save :shout, unless: :loud?` → a negated guard around the
+    // call (the method names alone appear as definitions on main too).
+    assert!(src.contains("if !(loud?)"), "the unless guard must negate the predicate:\n{src}");
+    // `before_destroy :noop, if: :frozen?` → guarded by the predicate.
+    assert!(src.contains("if frozen?"), "{src}");
+}
+
+/// A lambda/proc condition with parameters, several statements, a
+/// control-flow escape or a local write is NOT spliced: inline in the
+/// hook it would read an unbound `r`/`p`, `return` out of the whole
+/// callback chain, or leak a local. Those decline to the
+/// unsupported-DSL warning, as before conditions were modelled — the
+/// callback is dropped, never emitted with a broken guard.
+const DECLINED: &str = r##"class Widget < ApplicationRecord
+  before_save :a1, if: ->(r) { r.name.present? }
+  before_save :a2, if: proc { |p| p.name.present? }
+  before_save :a3, if: -> { return false if name.nil?; true }
+  before_save :a4, if: -> { n = name; n.present? }
+  before_save :a5, if: -> { name.present? }
+
+  private
+    def a1; self.color = "1"; end
+    def a2; self.color = "2"; end
+    def a3; self.color = "3"; end
+    def a4; self.color = "4"; end
+    def a5; self.color = "5"; end
+end
+"##;
+
+fn emitted_from(widget: &str) -> String {
+    let tree: HashMap<PathBuf, Vec<u8>> = [
+        ("db/schema.rb", SCHEMA),
+        (
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n",
+        ),
+        ("app/models/widget.rb", widget),
+    ]
+    .into_iter()
+    .map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec()))
+    .collect();
+    let mut app = ingest_app_from_tree(tree).expect("ingest");
+    roundhouse::session::analyze_and_lower(&mut app);
+    roundhouse::emit::ruby::emit_lowered_models(&app)
+        .into_iter()
+        .find(|f| f.path.ends_with("widget.rb"))
+        .expect("widget.rb emitted")
+        .content
+        .clone()
+}
+
+#[test]
+fn only_a_zero_parameter_single_expression_condition_is_spliced() {
+    let src = emitted_from(DECLINED);
+    // Never an unbound parameter in a guard.
+    assert!(!src.contains("r.name") && !src.contains("p.name"), "unbound param spliced:\n{src}");
+    // The declined callbacks are dropped (defined, never called from the hook).
+    let hook = src.split("def before_save").nth(1).expect("before_save hook").split("\n  end").next().unwrap();
+    for m in ["a1", "a2", "a3", "a4"] {
+        assert!(!hook.contains(m), "{m} must decline, not run with a broken guard:\n{hook}");
+    }
+    // The zero-parameter, single-expression one is guarded.
+    assert!(hook.contains("if ActiveSupport.present?(self.name)") && hook.contains("a5"), "{hook}");
 }
