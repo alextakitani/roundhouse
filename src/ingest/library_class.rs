@@ -236,7 +236,7 @@ pub(super) fn library_class_and_struct_base(
         None => parent,
     };
 
-    let DeclBody { mut includes, mut methods, mut constants, mut unknown_calls, class_initializers } =
+    let DeclBody { mut includes, mut methods, mut constants, mut unknown_calls, mut class_initializers } =
         walk_decl_body(class.body(), &owner, file, false)?;
 
     // A `T::Struct` is a class GENERATOR, not an annotation: `const
@@ -297,6 +297,7 @@ pub(super) fn library_class_and_struct_base(
     let base = struct_members
         .as_ref()
         .map(|members| struct_base_class(&owner, members));
+    class_initializers.extend(take_class_ivar_initializers(&mut unknown_calls));
     Ok((
         LibraryClass {
             name: owner,
@@ -1071,8 +1072,9 @@ pub(super) fn library_class_from_module_node_with_scope(
     let owner = ClassId(Symbol::from(full_path.join("::")));
 
     let visibility = Visibility::resolve(module.body().as_ref(), file, Some(&owner))?;
-    let DeclBody { includes, methods, constants, unknown_calls, class_initializers } =
+    let DeclBody { includes, methods, constants, mut unknown_calls, mut class_initializers } =
         walk_decl_body_with_visibility(module.body(), &owner, file, false, &visibility)?;
+    class_initializers.extend(take_class_ivar_initializers(&mut unknown_calls));
     Ok(LibraryClass {
         name: owner,
         is_module: true,
@@ -1086,6 +1088,12 @@ pub(super) fn library_class_from_module_node_with_scope(
         unknown_calls,
         class_ivar_initializers: class_initializers,
     })
+}
+
+fn take_class_ivar_initializers(calls: &mut Vec<Expr>) -> Vec<Expr> {
+    calls.extract_if(.., |expr| matches!(&*expr.node,
+        ExprNode::Assign { target: LValue::Ivar { .. }, .. }
+    )).collect()
 }
 
 /// Walk a class or module body, collecting `include` directives and
@@ -1530,6 +1538,12 @@ fn walk_decl_body_with_visibility<'pr>(
             out.constants.push((name, value));
             continue;
         }
+        // A direct assignment initializes this class/module object. Inside
+        // `class << self` the receiver is its singleton class instead.
+        if !force_class_receiver && stmt.as_instance_variable_write_node().is_some() {
+            out.unknown_calls.push(ingest_expr(&stmt, file)?);
+            continue;
+        }
         // Retain native nil initialization in source order. Only a declared
         // cattr/mattr storage approximation may drop it, after the whole body
         // has been walked. Non-nil initializers remain outside this slice.
@@ -1784,11 +1798,19 @@ fn walk_decl_body_with_visibility<'pr>(
                         } else {
                             MethodReceiver::Instance
                         };
+                        // Keep generated accessors at their source declaration when
+                        // initializers and methods are emitted in body order.
+                        let name_span = Span {
+                            file: super::sources::file_id(file),
+                            start: call.location().start_offset() as u32,
+                            end: call.location().end_offset() as u32,
+                        };
                         for name in &names {
                             let want_reader = kw.ends_with("_reader") || kw.ends_with("_accessor");
                             let want_writer = kw.ends_with("_writer") || kw.ends_with("_accessor");
                             if want_reader {
                                 let mut method = synth_attr_reader(owner, name, recv);
+                                method.name_span = name_span;
                                 visibility.apply(&statement, &mut method);
                                 // Skip when a `def` of this name already
                                 // walked (unusual order); a later `def`
@@ -1801,6 +1823,7 @@ fn walk_decl_body_with_visibility<'pr>(
                             }
                             if want_writer {
                                 let mut method = synth_attr_writer(owner, name, recv);
+                                method.name_span = name_span;
                                 visibility.apply(&statement, &mut method);
                                 if !out.methods.iter().any(|e| {
                                     e.name == method.name && e.receiver == method.receiver
