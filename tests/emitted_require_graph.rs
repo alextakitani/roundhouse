@@ -365,6 +365,8 @@ fn spinel_json_generator_rescue_does_not_hide_class_values_in_its_branches() {
       JSON.generate(value)
     rescue JSON::GeneratorError
       JSON::GeneratorError
+    rescue ::JSON::GeneratorError
+      ::JSON::GeneratorError
     else
       JSON::GeneratorError
     ensure
@@ -386,7 +388,7 @@ end
             roundhouse::diagnostic::DiagnosticKind::Unsupported { construct, .. }
                 if construct.as_str() == "bundled_constant"
         )).collect();
-        assert_eq!(gaps.len(), if target == BuildTarget::Spinel { 3 } else { 0 }, "{target:?}: {gaps:?}");
+        assert_eq!(gaps.len(), if target == BuildTarget::Spinel { 4 } else { 0 }, "{target:?}: {gaps:?}");
         for gap in gaps {
             assert!(gap.message.contains("JSON::GeneratorError"));
             assert_eq!(gap.severity, roundhouse::diagnostic::Severity::Error);

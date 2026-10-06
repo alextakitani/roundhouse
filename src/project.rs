@@ -4092,14 +4092,15 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
     fn visit(expr: &crate::expr::Expr, app: &App, target: &str) {
         // Spinel matches this exception by its rescue name, but does not
         // expose its class as a constant. Keep the value guard below while
-        // permitting the supported literal rescue clause.
+        // permitting the supported literal rescue clause, including ::JSON.
         if target == "spinel" {
             if let crate::expr::ExprNode::BeginRescue { rescues, .. } = &*expr.node {
                 expr.node.for_each_child(&mut |child| {
                     let named_rescue = rescues.iter().any(|rescue| rescue.classes.iter().any(|class| {
                         std::ptr::eq(child, class)
                             && matches!(&*class.node, crate::expr::ExprNode::Const { path }
-                                if path.len() == 2 && path[0].as_str() == "JSON" && path[1].as_str() == "GeneratorError")
+                                if path.iter().map(|part| part.as_str()).filter(|part| !part.is_empty())
+                                    .eq(["JSON", "GeneratorError"]))
                     }));
                     if !named_rescue {
                         visit(child, app, target);

@@ -158,6 +158,8 @@ end
 
 const QUEUE_ERRORS_SCRIPT: &str = r#"
 raise "Queue error constants lost" unless QueueErrorProbe.error_classes == [ThreadError, ClosedQueueError]
+raise "ThreadError hierarchy changed" unless QueueErrorProbe.error_classes[0].superclass == StandardError
+raise "ClosedQueueError hierarchy changed" unless QueueErrorProbe.error_classes[1].superclass == StopIteration
 queue = Queue.new
 raise "ThreadError rescue lost" unless QueueErrorProbe.pop_empty(queue) == "empty"
 queue.close
@@ -185,12 +187,19 @@ class GeneratorErrorProbe
   rescue JSON::GeneratorError
     "generation failed"
   end
+  def self.generate_rooted(value)
+    JSON.generate(value)
+  rescue ::JSON::GeneratorError
+    "generation failed"
+  end
 end
 "#;
 
 const GENERATOR_ERROR_SCRIPT: &str = r#"
 raise "valid JSON changed" unless GeneratorErrorProbe.generate({ "ok" => true }) == '{"ok":true}'
 raise "JSON generation rescue lost" unless GeneratorErrorProbe.generate(Float::NAN) == "generation failed"
+raise "rooted valid JSON changed" unless GeneratorErrorProbe.generate_rooted({ "ok" => true }) == '{"ok":true}'
+raise "rooted JSON generation rescue lost" unless GeneratorErrorProbe.generate_rooted(Float::NAN) == "generation failed"
 puts "JSON::GeneratorError execution passed"
 "#;
 
@@ -198,7 +207,11 @@ puts "JSON::GeneratorError execution passed"
 fn json_generator_error_constants_execute_after_emission() {
     stdlib_app().write("app/services/generator_error_probe.rb", GENERATOR_ERROR_SOURCE)
         .write("app/services/generator_error_class_probe.rb", "class GeneratorErrorClassProbe\n  def self.error_class\n    JSON::GeneratorError\n  end\nend\n")
-        .run_ruby(&format!("raise \"GeneratorError constant lost\" unless GeneratorErrorClassProbe.error_class == JSON::GeneratorError\n{GENERATOR_ERROR_SCRIPT}"))
+        .run_ruby(&format!(r#"
+raise "GeneratorError constant lost" unless GeneratorErrorClassProbe.error_class == JSON::GeneratorError
+raise "GeneratorError hierarchy changed" unless GeneratorErrorClassProbe.error_class.superclass == JSON::JSONError
+{GENERATOR_ERROR_SCRIPT}
+"#))
         .assert_passes();
 }
 
@@ -228,6 +241,7 @@ end
 
 const COMPARABLE_SCRIPT: &str = r#"
 raise "Comparable constant lost" unless ComparableProbe.comparison_module == Comparable
+raise "Comparable is not a module" unless ComparableProbe.comparison_module.class == Module
 low = ComparableProbe.new(3)
 equal = ComparableProbe.new(3)
 high = ComparableProbe.new(8)
@@ -263,6 +277,7 @@ end
 
 const ENUMERABLE_SCRIPT: &str = r#"
 raise "Enumerable constant lost" unless EnumerableProbe.enumeration_module == Enumerable
+raise "Enumerable is not a module" unless EnumerableProbe.enumeration_module.class == Module
 values = EnumerableProbe.new.map { |value| value * 3 }
 raise "Enumerable mixin lost" unless values == [6, 15]
 puts "Enumerable execution passed"
