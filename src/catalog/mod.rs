@@ -153,6 +153,9 @@ pub enum ReturnKind {
     SelfOrNil,
     /// Returns `Int`. Example: `Model.count`.
     Int,
+    /// Returns `Int | Nil`. Example: `relation.next_page`,
+    /// nil on the last page.
+    IntOrNil,
     /// Returns `Bool`. Example: `Model.exists?`, `#save`,
     /// `#valid?`, `#persisted?`.
     Bool,
@@ -312,12 +315,12 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         chain: ChainKind::NotApplicable,
         return_kind: Some(ReturnKind::SelfType),
     },
-    // Kaminari's pagination entry point (`Model.page(n)`). Not core AR,
-    // but it shares the relation-builder shape and is called on every
-    // model class, so the AR catalog is its mechanical home (the
-    // gem catalog keys on concrete class names and can't say "every
-    // model"). The Array<Model> receiver form lives in `array_method`'s
-    // relation branch alongside `per`/`padding`/`without_count`.
+    // Pagination entry point (`Model.page(n)`). Not core AR, but it
+    // shares the relation-builder shape and is called on every model
+    // class, so the AR catalog is its mechanical home (the gem catalog
+    // keys on concrete class names and can't say "every model"). The
+    // Array<Model> receiver form lives in `array_method`'s relation
+    // branch alongside `per`/`padding`/`without_count`.
     CatalogedMethod {
         name: "page",
         receiver: ReceiverContext::Class,
@@ -325,9 +328,9 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         chain: ChainKind::Builder,
         return_kind: Some(ReturnKind::RelationOfSelf),
     },
-    // will_paginate's entry point, `Model.paginate(page: n)` — kaminari's
-    // `page` under another gem's name, same builder shape, same
-    // reasoning for living here.
+    // `Model.paginate` — `page` under another spelling. Accepts a
+    // positional page number or `page:` / `per_page:` keywords (the
+    // LIMIT/OFFSET window under the kwargs form).
     CatalogedMethod {
         name: "paginate",
         receiver: ReceiverContext::Class,
@@ -1115,6 +1118,20 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         return_kind: Some(ReturnKind::RelationOfSelf),
     },
     CatalogedMethod {
+        name: "skip_preloading!",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "preload_associations",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::ArrayOfSelf),
+    },
+    CatalogedMethod {
         name: "rewhere",
         receiver: ReceiverContext::Relation,
         effect: EffectClass::DbRead,
@@ -1210,8 +1227,7 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         chain: ChainKind::Builder,
         return_kind: Some(ReturnKind::RelationOfSelf),
     },
-    // will_paginate's `paginate(page:)` on a relation — same builder
-    // shape as kaminari's `page` below.
+    // `paginate` on a relation — same LIMIT/OFFSET builder as `page`.
     CatalogedMethod {
         name: "paginate",
         receiver: ReceiverContext::Relation,
@@ -1226,7 +1242,7 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         chain: ChainKind::Terminal,
         return_kind: Some(ReturnKind::SelfOrNil),
     },
-    // Kaminari's pagination chain — same builder shape.
+    // Pagination chain — same builder shape.
     CatalogedMethod {
         name: "page",
         receiver: ReceiverContext::Relation,
@@ -1254,6 +1270,80 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         effect: EffectClass::DbRead,
         chain: ChainKind::Builder,
         return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    // Paginator readers on a paged relation
+    // (runtime/ruby/active_record/relation.rb). The page arithmetic is
+    // LIMIT/OFFSET; the readers that need the total run COUNT without
+    // that window.
+    CatalogedMethod {
+        name: "limit_value",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::Pure,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::IntOrNil),
+    },
+    CatalogedMethod {
+        name: "offset_value",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::Pure,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::IntOrNil),
+    },
+    CatalogedMethod {
+        name: "current_page",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::Pure,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::Int),
+    },
+    CatalogedMethod {
+        name: "total_count",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::Int),
+    },
+    CatalogedMethod {
+        name: "total_pages",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::Int),
+    },
+    CatalogedMethod {
+        name: "first_page?",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::Pure,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::Bool),
+    },
+    CatalogedMethod {
+        name: "last_page?",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::Bool),
+    },
+    CatalogedMethod {
+        name: "out_of_range?",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::Bool),
+    },
+    CatalogedMethod {
+        name: "next_page",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::IntOrNil),
+    },
+    CatalogedMethod {
+        name: "prev_page",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::IntOrNil),
     },
     // Terminals — execute the query; result types are exactly what
     // the `array_method` arms produce today.
@@ -1403,6 +1493,17 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
     },
     CatalogedMethod {
         name: "exists?",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::Bool),
+    },
+    // Rails AssociationProxy `#loaded?` is rewritten by `assoc_loaded`
+    // onto `<assoc>_loaded?`. Do NOT catalog Relation `#loaded?` as
+    // Bool: that would silence residual sites with no runtime method
+    // (invariant 6). Unrewritten `.loaded?` stays a dispatch failure.
+    CatalogedMethod {
+        name: "more_than?",
         receiver: ReceiverContext::Relation,
         effect: EffectClass::DbRead,
         chain: ChainKind::Terminal,
@@ -1841,6 +1942,7 @@ mod tests {
             ("find_by", ReturnKind::SelfOrNil),
             ("count", ReturnKind::Int),
             ("exists?", ReturnKind::Bool),
+            ("more_than?", ReturnKind::Bool),
             ("pluck", ReturnKind::ArrayOfUntyped),
             ("pick", ReturnKind::Untyped),
             ("ids", ReturnKind::ArrayOfInt),

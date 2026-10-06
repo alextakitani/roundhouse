@@ -1,4 +1,8 @@
 module ActiveSupport
+  module JSON
+    def self.encode: (Hash[untyped, untyped] value) -> String
+    def self.encode_scalar: (untyped item) -> String
+  end
   def self.blank?: (untyped value) -> bool
 
   def self.present?: (untyped value) -> bool

@@ -347,6 +347,24 @@ module Db
     Fiber[:rh_qcache] = nil
   end
 
+  # The request read snapshot and background checkpoints are
+  # implemented in the CRuby and Spinel shims (db_cruby.rb, db.rb), not
+  # yet in this one. Here they
+  # are accepted and do nothing, so the shared dispatcher and test
+  # harness call them unconditionally; this lane still reads in
+  # autocommit and checkpoints inside COMMIT.
+  def self.read_snapshot_begin
+    nil
+  end
+
+  def self.read_snapshot_end
+    nil
+  end
+
+  def self.checkpoint_in_background!
+    nil
+  end
+
   def self.column_text(stmt, i)
     if stmt.replay
       v = stmt.row[i]

@@ -15,6 +15,48 @@ use super::{
     ty_of_column, var_ref, with_ty,
 };
 
+/// Emit `def self.<name>; [<filtered column symbols>]; end`.
+fn push_schema_symbol_list(
+    methods: &mut Vec<MethodDef>,
+    owner: &ClassId,
+    name: &str,
+    table: &Table,
+    keep: impl Fn(&Column) -> bool,
+) {
+    let body = with_ty(
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Array {
+                elements: table
+                    .columns
+                    .iter()
+                    .filter(|c| keep(c))
+                    .map(|c| lit_sym(c.name.clone()))
+                    .collect(),
+                style: ArrayStyle::Brackets,
+            },
+        ),
+        Ty::Array { elem: Box::new(Ty::Sym) },
+    );
+    methods.push(MethodDef {
+        visibility: crate::dialect::MethodVisibility::Public,
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        name_span: Span::synthetic(),
+        name: Symbol::from(name),
+        receiver: MethodReceiver::Class,
+        params: Vec::new(),
+        body,
+        signature: Some(fn_sig(vec![], Ty::Array { elem: Box::new(Ty::Sym) })),
+        effects: EffectSet::default(),
+        enclosing_class: Some(owner.0.clone()),
+        kind: AccessorKind::Method,
+        is_async: false,
+        mutates_self: false,
+        block_param: None,
+    });
+}
+
 pub(super) fn push_schema_methods(
     methods: &mut Vec<MethodDef>,
     model: &Model,
@@ -46,6 +88,12 @@ pub(super) fn push_schema_methods(
     // public `<col>=` writer normalizes through the column's selected
     // format intrinsic; hydration writes stored text via `<col>_raw=`
     // directly. Date seams are native-Ruby-only for now.
+    // `normalizes` — the class method the column writers below call.
+    crate::lower::normalizes::push_normalize_methods(
+        methods,
+        model,
+        &table.columns.iter().map(|c| (c.name.clone(), super::ty_of_column_slot(c))).collect(),
+    );
     let mut demanded: Option<std::collections::HashSet<Symbol>> = None;
     for col in &table.columns {
         methods.push(synth_attr_reader(owner, col, model));
@@ -66,7 +114,15 @@ pub(super) fn push_schema_methods(
             }
         }
         methods.push(synth_attr_writer(owner, col, model));
-        methods.push(synth_column_predicate(owner, col));
+        // An enum label can share its column's name. Rails' enum predicate
+        // overrides the generic attribute query in that case; otherwise
+        // push_user_methods would discard the value comparison as a duplicate.
+        let predicate = Symbol::from(format!("{}?", col.name.as_str()));
+        if !model.enums.contains_key(&col.name)
+            || !super::associations::model_defines_instance_method(model, &predicate)
+        {
+            methods.push(synth_column_predicate(owner, col));
+        }
         // `<col>_previously_changed?` and `saved_change_to_<col>?`
         // (ActiveModel::Dirty subset) — both read the runtime Base's
         // `saved_changes` diff of the last save, and Rails documents
@@ -289,76 +345,14 @@ pub(super) fn push_schema_methods(
         });
     }
 
-    // def self.schema_columns
-    let column_array = with_ty(
-        Expr::new(
-            Span::synthetic(),
-            ExprNode::Array {
-                elements: table
-                    .columns
-                    .iter()
-                    .map(|c| lit_sym(c.name.clone()))
-                    .collect(),
-                style: ArrayStyle::Brackets,
-            },
-        ),
-        Ty::Array { elem: Box::new(Ty::Sym) },
-    );
-    methods.push(MethodDef {
-        visibility: crate::dialect::MethodVisibility::Public,
-        unsupported_formals: None,
-        has_anonymous_block: false,
-        name_span: crate::span::Span::synthetic(),
-        name: Symbol::from("schema_columns"),
-        receiver: MethodReceiver::Class,
-        params: Vec::new(),
-        body: column_array,
-        signature: Some(fn_sig(vec![], Ty::Array { elem: Box::new(Ty::Sym) })),
-        effects: EffectSet::default(),
-        enclosing_class: Some(owner.0.clone()),
-        kind: AccessorKind::Method,
-        is_async: false,
-            mutates_self: false,
-            block_param: None,
+    // Schema column-name lists. Time vs date stay separate so JSON can
+    // apply ISO8601-with-offset vs calendar-only without sniffing values.
+    push_schema_symbol_list(methods, owner, "schema_columns", table, |_| true);
+    push_schema_symbol_list(methods, owner, "schema_time_columns", table, |c| {
+        matches!(c.col_type, crate::schema::ColumnType::DateTime | crate::schema::ColumnType::Time)
     });
-
-    // def self.schema_time_columns — the timestamp subset of the above.
-    // JSON serialization is the consumer: Rails renders a timestamp
-    // attribute as ISO8601-with-offset while every other column renders
-    // as its raw value, and the `[]` indexer hands back the STORED text
-    // for both. Only the schema knows which is which, so the fact is
-    // emitted rather than sniffed from the value at runtime.
-    let time_column_array = with_ty(
-        Expr::new(
-            Span::synthetic(),
-            ExprNode::Array {
-                elements: table
-                    .columns
-                    .iter()
-                    .filter(|c| matches!(c.col_type, crate::schema::ColumnType::DateTime | crate::schema::ColumnType::Time))
-                    .map(|c| lit_sym(c.name.clone()))
-                    .collect(),
-                style: ArrayStyle::Brackets,
-            },
-        ),
-        Ty::Array { elem: Box::new(Ty::Sym) },
-    );
-    methods.push(MethodDef {
-        visibility: crate::dialect::MethodVisibility::Public,
-        unsupported_formals: None,
-        has_anonymous_block: false,
-        name_span: crate::span::Span::synthetic(),
-        name: Symbol::from("schema_time_columns"),
-        receiver: MethodReceiver::Class,
-        params: Vec::new(),
-        body: time_column_array,
-        signature: Some(fn_sig(vec![], Ty::Array { elem: Box::new(Ty::Sym) })),
-        effects: EffectSet::default(),
-        enclosing_class: Some(owner.0.clone()),
-        kind: AccessorKind::Method,
-        is_async: false,
-        mutates_self: false,
-        block_param: None,
+    push_schema_symbol_list(methods, owner, "schema_date_columns", table, |c| {
+        matches!(c.col_type, crate::schema::ColumnType::Date)
     });
 
     // def self.instantiate(row); instance = from_row(<Model>Row.from_raw(row)); instance.mark_persisted!; instance; end
@@ -508,11 +502,17 @@ pub(super) fn push_schema_methods(
 /// against the same column set, so the list can't drift from the
 /// synthesis. Measured (blog + lobsters emits): these families are
 /// where every synthesized-but-dead model method lives.
-pub fn shakeable_synthesized_names(table: &Table) -> Vec<Symbol> {
+pub fn shakeable_synthesized_names(table: &Table, model: &Model) -> Vec<Symbol> {
     let mut names: Vec<Symbol> = Vec::new();
     for col in &table.columns {
-        // Mirrors `synth_column_predicate` (pushed for every column).
-        names.push(Symbol::from(format!("{}?", col.name.as_str())));
+        // Mirror push_schema_methods: an enum's user-defined predicate
+        // was not synthesized and must never be a shake candidate.
+        let predicate = Symbol::from(format!("{}?", col.name.as_str()));
+        if !model.enums.contains_key(&col.name)
+            || !super::associations::model_defines_instance_method(model, &predicate)
+        {
+            names.push(predicate);
+        }
         // Mirrors the two `synth_column_dirty_pred` spellings (both
         // skipped for `id`, which Base answers from its own flag).
         // Shares the synthesizers' own name helpers, so a rename can't
@@ -1299,6 +1299,8 @@ fn synth_attr_writer(owner: &ClassId, col: &Column, model: &Model) -> MethodDef 
     let rhs = if is_generic_json_col(col, model) {
         json_dump_value(col, value)
     } else {
+        let value = crate::lower::normalizes::normalized_write(model, &col.name, value.clone())
+            .unwrap_or(value);
         enum_setter_value(model, col, value.clone()).unwrap_or(value)
     };
     // Assign expression evaluates to the RHS in Ruby; same in TS.

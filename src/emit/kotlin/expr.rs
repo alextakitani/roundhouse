@@ -794,7 +794,11 @@ fn children(e: &Expr) -> Vec<&Expr> {
     v
 }
 
+/// Render a Kotlin value expression after shared primitive and string-builder selection.
 pub fn emit_expr(e: &Expr) -> String {
+    if let Some(s) = crate::emit::shared::string_bytes::emit(e, crate::emit::shared::string_bytes::Target::Kotlin, emit_expr) {
+        return s;
+    }
     if let Some(s) = try_string_builder(e) {
         return s;
     }
@@ -1005,8 +1009,20 @@ fn escape_str(s: &str) -> String {
 
 fn emit_hash(entries: &[(Expr, Expr)], e: &Expr) -> String {
     if entries.is_empty() {
+        // Untyped/var empty `{}` would be MutableMap<Any?, Any?> and
+        // fail Kotlin invariance against String-keyed helper params.
         if let Some(crate::ty::Ty::Hash { key, value }) = e.ty.as_ref() {
-            return format!("mutableMapOf<{}, {}>()", kotlin_ty(key), kotlin_ty(value));
+            let k = match key.as_ref() {
+                crate::ty::Ty::Untyped | crate::ty::Ty::Var { .. } | crate::ty::Ty::Sym => {
+                    "String".to_string()
+                }
+                _ => kotlin_ty(key),
+            };
+            let v = match value.as_ref() {
+                crate::ty::Ty::Untyped | crate::ty::Ty::Var { .. } => "Any?".to_string(),
+                _ => kotlin_ty(value),
+            };
+            return format!("mutableMapOf<{k}, {v}>()");
         }
         return "mutableMapOf<String, Any?>()".to_string();
     }

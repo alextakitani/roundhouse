@@ -133,13 +133,14 @@ fn article_lowers_with_schema_methods() {
     );
 
     // The non-attr scaffold: table_name, schema_columns,
-    // schema_time_columns, instantiate, initialize, attributes, [], []=,
-    // update.
+    // schema_time_columns, schema_date_columns, instantiate, initialize,
+    // attributes, [], []=, update.
     for expected in [
         "table_name",
         "_table_sql",
         "schema_columns",
         "schema_time_columns",
+        "schema_date_columns",
         "instantiate",
         "initialize",
         "attributes",
@@ -161,6 +162,7 @@ fn article_lowers_with_schema_methods() {
         "_table_sql",
         "schema_columns",
         "schema_time_columns",
+        "schema_date_columns",
         "instantiate",
         "from_row",
         "from_stmt",
@@ -168,6 +170,7 @@ fn article_lowers_with_schema_methods() {
         "_adapter_all",
         "_adapter_last",
         "_adapter_count",
+        "_adapter_any?",
         "_adapter_exists_by_id?",
         "_adapter_truncate",
         "delete_all",
@@ -190,6 +193,21 @@ fn article_lowers_with_schema_methods() {
             );
         }
     }
+
+    let any = lc
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "_adapter_any?")
+        .expect("_adapter_any? synthesized");
+    let any_body = format!("{:?}", any.body);
+    assert!(
+        any_body.contains("SELECT 1 FROM") && any_body.contains("LIMIT 1"),
+        "_adapter_any? must probe existence, not COUNT(*): {any_body}"
+    );
+    assert!(
+        !any_body.contains("COUNT(*)"),
+        "_adapter_any? must not COUNT: {any_body}"
+    );
 }
 
 #[test]
@@ -435,6 +453,63 @@ fn article_lowers_dependent_destroy_to_before_destroy() {
     assert!(block_present, "each call should carry a block");
 }
 
+/// `has_one …, dependent: :destroy` cascades the single child, not
+/// a collection `each`. Nil child is the else branch so destroy of an
+/// owner with no row does not raise.
+#[test]
+fn has_one_dependent_destroy_lowers_to_before_destroy() {
+    use roundhouse::ingest::{ingest_model, ingest_schema};
+
+    let schema = ingest_schema(
+        br#"
+ActiveRecord::Schema[7.1].define(version: 1) do
+  create_table "users", force: :cascade do |t|
+    t.string "name"
+  end
+  create_table "profiles", force: :cascade do |t|
+    t.integer "user_id"
+    t.string "bio"
+  end
+end
+"#,
+        "db/schema.rb",
+    )
+    .expect("ingest schema");
+    let model = ingest_model(
+        b"class User < ApplicationRecord\n  has_one :profile, dependent: :destroy\nend\n",
+        "app/models/user.rb",
+        &schema,
+        &Default::default(),
+    )
+    .expect("ingest")
+    .expect("model");
+    let lc = lower_model_to_library_class(&model, &schema);
+    let cb = lc
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "before_destroy")
+        .expect("before_destroy method present (has_one dependent: :destroy)");
+    assert!(matches!(cb.receiver, MethodReceiver::Instance));
+    let first = &body_stmts(cb)[0];
+    match &*first.node {
+        roundhouse::ExprNode::If { cond, then_branch, .. } => {
+            match &*cond.node {
+                roundhouse::ExprNode::Send { method, .. } => {
+                    assert_eq!(method.as_str(), "profile");
+                }
+                other => panic!("expected profile reader cond; got {other:?}"),
+            }
+            match &*then_branch.node {
+                roundhouse::ExprNode::Send { method, .. } => {
+                    assert_eq!(method.as_str(), "destroy");
+                }
+                other => panic!("expected destroy in then; got {other:?}"),
+            }
+        }
+        other => panic!("expected If cascade for has_one destroy; got {other:?}"),
+    }
+}
+
 /// Statements of a method body as a list (single stmt = one element).
 fn body_stmts(m: &roundhouse::dialect::MethodDef) -> Vec<roundhouse::Expr> {
     match &*m.body.node {
@@ -520,9 +595,29 @@ end
         other => panic!("expected new_record? guard; got {other:?}"),
     }
 
-    // `if:`-conditioned callbacks must NOT lower (running them
-    // unconditionally is worse than dropping them with a warning).
-    assert!(!names.contains(&"after_save"), "{names:?}");
+    // `after_save :log_hat_use, if: :hat_selected?` lowers with the
+    // predicate as a guard (it used to be dropped entirely — running it
+    // unconditionally would have been worse, but dropping it is wrong
+    // too).
+    let asv = lc
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "after_save")
+        .expect("after_save");
+    match &*body_stmts(asv)[0].node {
+        roundhouse::ExprNode::If { cond, then_branch, .. } => {
+            assert_eq!(self_call_name(cond), "hat_selected?");
+            let then_stmts = match &*then_branch.node {
+                roundhouse::ExprNode::Seq { exprs } => exprs.clone(),
+                _ => vec![then_branch.clone()],
+            };
+            assert_eq!(
+                then_stmts.iter().map(self_call_name).collect::<Vec<_>>(),
+                vec!["log_hat_use"]
+            );
+        }
+        other => panic!("expected hat_selected? guard; got {other:?}"),
+    }
 }
 
 #[test]
@@ -1057,6 +1152,8 @@ fn collect_untyped_lowered(
         | ExprNode::Retry
         | ExprNode::Redo
         | ExprNode::ForwardArgs
+        | ExprNode::ForwardKeywords
+        | ExprNode::Defined { .. }
         | ExprNode::SelfRef => {}
         ExprNode::If { cond, then_branch, else_branch } => {
             collect_untyped_lowered(cond, &format!("{path}/if.cond"), out);
@@ -1134,6 +1231,27 @@ fn collect_untyped_lowered(
                 }
                 collect_untyped_lowered(&arm.body, &format!("{path}/case.arm[{i}].body"), out);
             }
+        }
+        ExprNode::CaseMatch { scrutinee, arms, else_body } => {
+            collect_untyped_lowered(scrutinee, &format!("{path}/case_match.scrut"), out);
+            for (i, arm) in arms.iter().enumerate() {
+                arm.pattern.for_each_expr(&mut |e| {
+                    collect_untyped_lowered(e, &format!("{path}/case_match.arm[{i}].pattern"), out);
+                });
+                if let Some((_, g)) = &arm.guard {
+                    collect_untyped_lowered(g, &format!("{path}/case_match.arm[{i}].guard"), out);
+                }
+                collect_untyped_lowered(&arm.body, &format!("{path}/case_match.arm[{i}].body"), out);
+            }
+            if let Some(e) = else_body {
+                collect_untyped_lowered(e, &format!("{path}/case_match.else"), out);
+            }
+        }
+        ExprNode::MatchPredicate { value, pattern } | ExprNode::MatchRequired { value, pattern } => {
+            collect_untyped_lowered(value, &format!("{path}/match.value"), out);
+            pattern.for_each_expr(&mut |e| {
+                collect_untyped_lowered(e, &format!("{path}/match.pattern"), out);
+            });
         }
         ExprNode::Assign { value, .. } | ExprNode::OpAssign { value, .. } => {
             collect_untyped_lowered(value, &format!("{path}/assign.value"), out)

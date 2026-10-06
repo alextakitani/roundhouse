@@ -37,7 +37,11 @@ where
     r
 }
 
+/// Render a Crystal expression, recognizing whole-call primitives before node dispatch.
 pub fn emit_expr(e: &Expr) -> String {
+    if let Some(s) = crate::emit::shared::string_bytes::emit(e, crate::emit::shared::string_bytes::Target::Crystal, emit_expr) {
+        return s;
+    }
     // IrHint::StringBuilder* — lowerer-tagged accumulator triple
     // (`io = String.new; io << "..."; io`). Crystal's `String + String`
     // is O(n²) per append (immutable Strings reallocate); swap to
@@ -291,6 +295,12 @@ fn emit_node(n: &ExprNode) -> String {
             "crystal",
             n.kind_str(),
             "full argument forwarding has no carrier on this target",
+        ),
+        ExprNode::ForwardKeywords | ExprNode::Defined { .. } => crate::emit::diagnostics::report_unsupported(
+            crate::span::Span::synthetic(),
+            "crystal",
+            n.kind_str(),
+            "native Ruby syntax has no implementation on this target",
         ),
         ExprNode::KeywordSplat { .. } => crate::emit::diagnostics::report_unsupported(
             crate::span::Span::synthetic(),
@@ -582,6 +592,12 @@ fn emit_node(n: &ExprNode) -> String {
             }
             s.push_str("end");
             s
+        }
+        ExprNode::CaseMatch { .. } | ExprNode::MatchPredicate { .. } | ExprNode::MatchRequired { .. } => {
+            crate::emit::diagnostics::report_unsupported(
+                crate::span::Span::synthetic(), "crystal", n.kind_str(),
+                "structural pattern matching requires a native Ruby target",
+            )
         }
         ExprNode::Seq { exprs } => {
             let mut out = String::new();

@@ -34,6 +34,37 @@
 # Integer's `"0"` is not blank, a Symbol's `"sym"` is not blank, and a
 # String is itself.
 module ActiveSupport
+  # `ActiveSupport::JSON.encode(value)` — Rails' JSON coder, here for a
+  # flat Hash, which is what reaches it: campfire encodes the unread
+  # notice once (`ActiveSupport::JSON.encode(roomId: room.id)`) and
+  # broadcasts the text to every member with `coder: nil`
+  # (basecamp/once-campfire#292). A nested Hash or Array value raises
+  # rather than encode wrong.
+  module JSON
+    def self.encode(value)
+      out = "{"
+      first = true
+      value.each do |key, item|
+        out = out + "," unless first
+        first = false
+        out = out + ::JSON.generate(key.to_s) + ":" + ActiveSupport::JSON.encode_scalar(item)
+      end
+      out + "}"
+    end
+
+    # One `case` rather than a chain of tests: each read of the untyped
+    # value is a site the runtime typing gate counts.
+    def self.encode_scalar(item)
+      text = item.to_s
+      case item
+      when nil then "null"
+      when String, Symbol then ::JSON.generate(text)
+      when Hash, Array then raise ArgumentError, "ActiveSupport::JSON.encode: nested values are not supported yet"
+      else text
+      end
+    end
+  end
+
   def self.blank?(value)
     return true if value.nil?
     return true if value == false

@@ -108,13 +108,13 @@ fn skip_forgery_protection_removes_the_check() {
 }
 
 #[test]
-fn rails_implicit_default_is_not_applied_yet() {
+fn rails_implicit_default_is_not_applied() {
     // Rails puts `verify_authenticity_token` at the head of every chain
-    // rooted at ActionController::Base (`default_protect_from_forgery`).
-    // Gated off in `build_filter_preamble`: an app relying on it —
-    // real-blog — is emitted for the strict targets too, which have no
-    // such method. Pinned so turning it on is a decision with a test
-    // to update, not a side effect.
+    // rooted at ActionController::Base. Still gated off: bare
+    // `protect_from_forgery` is `:null_session` and must not become 422.
+    // Shared Base now defines the method for apps that write
+    // `with: :exception`. Pinned so turning the default on is a
+    // decision with a test to update.
     let files = emit(vec![
         (
             "app/controllers/application_controller.rb",

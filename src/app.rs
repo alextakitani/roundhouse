@@ -168,6 +168,12 @@ pub struct App {
     /// as it is in stock Rails.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachable_unsigned_models: Vec<Symbol>,
+    /// Modules `include`d inside `ActiveSupport.on_load(:active_record)`
+    /// that provide class-method macros. Mixin instance methods are not
+    /// installed. Expansion treats these as an explicit provider origin
+    /// (not a seeded `include` set on every model).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub load_hook_class_macros: Vec<ClassId>,
     /// Partial → local name → type, harvested by the analyzer from the
     /// RENDER SITES that pass each local (`render partial: "form",
     /// locals: { new_message: @new_message }` with `@new_message` typed
@@ -286,6 +292,15 @@ pub struct App {
     /// the app walk; empty for apps without concerns.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub concern_filters: HashMap<ClassId, Vec<Filter>>,
+    /// graphql-ruby object types (`ingest::graphql_ruby`), for the
+    /// analyzer only; their synthesized methods leave at lowering.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub graphql_types: Vec<crate::dialect::GraphqlObjectType>,
+    /// Signatures `ingest::graphql_ruby` declared in `rbs_signatures`
+    /// (field arguments, input object readers), removed with the
+    /// synthesized methods at lowering.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub graphql_signatures: Vec<(ClassId, Symbol)>,
     /// Provenance for concern METHODS spliced into a controller:
     /// controller → (method name → the module it was cut from).
     /// `splice_concerns_into_controllers` copies a concern's methods
@@ -671,6 +686,7 @@ impl App {
             view_visible_controller_methods: BTreeSet::new(),
             global_id_locate_models: BTreeSet::new(),
             attachable_unsigned_models: Vec::new(),
+            load_hook_class_macros: Vec::new(),
             partial_local_types: HashMap::new(),
             view_ivar_types: HashMap::new(),
             html_safe_methods: BTreeSet::new(),
@@ -680,6 +696,8 @@ impl App {
             sql_functions: Vec::new(),
             rails_application: None,
             concern_filters: HashMap::new(),
+            graphql_types: Vec::new(),
+            graphql_signatures: Vec::new(),
             concern_spliced_actions: HashMap::new(),
             concern_spliced_class_methods: HashMap::new(),
             concern_model_items: HashMap::new(),

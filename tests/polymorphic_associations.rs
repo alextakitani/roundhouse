@@ -62,6 +62,40 @@ fn polymorphic_targets_resolve_from_inverse_as_decls() {
     assert_eq!(names, vec!["Comment", "Message"], "targets from inverse as: decls");
 }
 
+/// An inverse `as:` declared in a concern's `included do` counts as an
+/// implementor.
+#[test]
+fn polymorphic_targets_see_an_inverse_declared_in_a_concern() {
+    let app = app_from(vec![
+        ("db/schema.rb", SCHEMA),
+        (
+            "app/models/notification.rb",
+            "class Notification < ApplicationRecord\n  belongs_to :notifiable, polymorphic: true\nend\n",
+        ),
+        (
+            "app/models/comment.rb",
+            "class Comment < ApplicationRecord\n  include Notifiable\nend\n",
+        ),
+        (
+            "app/models/concerns/notifiable.rb",
+            "module Notifiable\n  extend ActiveSupport::Concern\n\n  included do\n    has_many :notifications, as: :notifiable\n  end\nend\n",
+        ),
+    ]);
+    let notification = app.models.iter().find(|m| m.name.0.as_str() == "Notification").unwrap();
+    let Association::BelongsTo { polymorphic_targets, .. } =
+        notification.associations().next().expect("belongs_to")
+    else {
+        panic!("expected BelongsTo");
+    };
+    let names: Vec<&str> = polymorphic_targets.iter().map(|c| c.0.as_str()).collect();
+    assert_eq!(names, vec!["Comment"]);
+    let comment = app.models.iter().find(|m| m.name.0.as_str() == "Comment").unwrap();
+    let Association::HasMany { foreign_key, .. } = comment.associations().next().unwrap() else {
+        panic!("expected HasMany");
+    };
+    assert_eq!(foreign_key.as_str(), "notifiable_id", "an interface key is not owner-derived");
+}
+
 #[test]
 fn as_interface_defaults_foreign_key_to_interface_id() {
     let app = notification_app();
@@ -208,5 +242,71 @@ end
         names,
         vec!["Moderation", "ModNote"],
         "targets from SQL fragment + where-hash literals"
+    );
+}
+
+/// Unresolved polymorphic belongs_to (no inverse `as:`, no body
+/// literals) must not fall through to the monomorphic synthesizer.
+/// ActionText::Markdown / RichText declare `belongs_to :record,
+/// polymorphic: true` with phantom target `Record`; emitting
+/// `Record.find_by` is a NameError if the accessor is called, and the
+/// monomorphic writer drops `record_type`.
+#[test]
+fn unresolved_polymorphic_skips_monomorphic_synth() {
+    let app = app_from(vec![
+        (
+            "db/schema.rb",
+            "ActiveRecord::Schema.define(version: 1) do\n  create_table :action_text_markdowns do |t|\n    t.text :content\n    t.string :name, null: false\n    t.bigint :record_id, null: false\n    t.string :record_type, null: false\n  end\nend\n",
+        ),
+        (
+            "app/models/action_text/markdown.rb",
+            "module ActionText\n  class Markdown < ApplicationRecord\n    self.table_name = \"action_text_markdowns\"\n    belongs_to :record, polymorphic: true\n  end\nend\n",
+        ),
+    ]);
+    let md = app
+        .models
+        .iter()
+        .find(|m| m.name.0.as_str() == "ActionText::Markdown")
+        .expect("Markdown model");
+    let Association::BelongsTo {
+        polymorphic,
+        polymorphic_targets,
+        target,
+        ..
+    } = md.associations().next().expect("belongs_to")
+    else {
+        panic!("expected BelongsTo");
+    };
+    assert!(polymorphic);
+    assert!(
+        polymorphic_targets.is_empty(),
+        "no inverse as: → unresolved; got {polymorphic_targets:?}"
+    );
+    assert_eq!(target.0.as_str(), "Record", "Rails phantom target");
+
+    let (lcs, _registry) = lower_models_with_registry_and_params(
+        &app.models,
+        &app.schema,
+        vec![],
+        &Default::default(),
+    );
+    let lowered = lcs
+        .iter()
+        .find(|lc| lc.name.0.as_str() == "ActionText::Markdown")
+        .expect("lowered Markdown");
+    assert!(
+        !lowered.methods.iter().any(|m| {
+            m.name.as_str() == "record" && m.receiver == roundhouse::dialect::MethodReceiver::Instance
+        }),
+        "must not synth monomorphic `record` → Record.find_by; methods: {:?}",
+        lowered
+            .methods
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !lowered.methods.iter().any(|m| m.name.as_str() == "record="),
+        "must not synth monomorphic writer that drops record_type"
     );
 }

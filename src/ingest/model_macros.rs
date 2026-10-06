@@ -1,32 +1,61 @@
-//! Specialize concern macros that define instance methods from symbols.
+//! Specialize concern macros that define instance methods from symbols
+//! or from a statically interpolatable `class_eval` string/heredoc.
 //!
 //! Writebook's `positioned_within` closes over three symbol arguments in
 //! parameterless `define_method` blocks, then marks the helpers private.
-//! Turn that compile-time work into ordinary methods BEFORE inference,
-//! once for every target. This is deliberately not a Ruby evaluator:
-//! mutable captures, block parameters, nested blocks, control flow,
-//! side effects outside the definitions and redefinitions stay unexpanded.
+//! The same pass expands a class-body `class_eval <<-CODE` whose
+//! interpolations are those bound symbols — without executing Ruby.
+//! Dynamic `class_eval` (non-literal, unknown interpolations) stays
+//! unexpanded. This is deliberately not a Ruby evaluator: mutable
+//! captures, block parameters, nested blocks, control flow, side
+//! effects outside the definitions and redefinitions stay unexpanded.
 
 use std::collections::{HashMap, HashSet};
 
-use crate::App;
 use crate::dialect::{MethodDef, MethodReceiver, MethodVisibility, ModelBodyItem};
 use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::{ClassId, Symbol};
 use crate::span::SourceFile;
+use crate::App;
 
-pub(crate) fn expand_model_macros(app: &mut App, sources: &[SourceFile]) -> super::IngestResult<()> {
-    if app.concern_spliced_class_methods.is_empty() {
+mod class_eval;
+
+pub(crate) fn expand_model_macros(
+    app: &mut App,
+    sources: &[SourceFile],
+) -> super::IngestResult<()> {
+    if app.concern_spliced_class_methods.is_empty() && app.load_hook_class_macros.is_empty() {
         return Ok(());
     }
     let mut params_specs =
         crate::lower::controller_to_library::params::collect_specs(&app.controllers);
     params_specs.mark_file_fields(&app.models);
+    // Index once. Do not clone these defs onto every model, and do not
+    // pretend the hook mixin was `include`d — availability is an
+    // explicit load-hook origin check below.
+    let hook_macros: HashMap<Symbol, (ClassId, MethodDef)> = {
+        let mut map = HashMap::new();
+        for id in &app.load_hook_class_macros {
+            let Some(class) = app.library_classes.iter().find(|c| &c.name == id) else {
+                continue;
+            };
+            for m in &class.methods {
+                if m.receiver == MethodReceiver::Class && has_definition(&m.body) {
+                    map.entry(m.name.clone())
+                        .or_insert_with(|| (id.clone(), m.clone()));
+                }
+            }
+        }
+        map
+    };
+    let hook_origins: HashSet<ClassId> = app.load_hook_class_macros.iter().cloned().collect();
     for model_index in 0..app.models.len() {
         let model = &app.models[model_index];
-        let Some(origins) = app.concern_spliced_class_methods.get(&model.name) else {
-            continue;
-        };
+        let origins = app
+            .concern_spliced_class_methods
+            .get(&model.name)
+            .cloned()
+            .unwrap_or_default();
         let macros: HashMap<_, _> = model
             .methods()
             .filter(|m| {
@@ -36,6 +65,9 @@ pub(crate) fn expand_model_macros(app: &mut App, sources: &[SourceFile]) -> supe
             })
             .map(|m| (m.name.clone(), m.clone()))
             .collect();
+        if macros.is_empty() && hook_macros.is_empty() {
+            continue;
+        }
         let mut candidates = Vec::new();
         let mut calls = HashMap::<Symbol, usize>::new();
         let mut included = HashSet::new();
@@ -44,7 +76,7 @@ pub(crate) fn expand_model_macros(app: &mut App, sources: &[SourceFile]) -> supe
                 continue;
             };
             let mut occurrences = Vec::new();
-            macro_calls(expr, &macros, &mut occurrences);
+            macro_calls(expr, &macros, &hook_macros, &mut occurrences);
             for name in &occurrences {
                 *calls.entry(name.clone()).or_default() += 1;
             }
@@ -61,7 +93,7 @@ pub(crate) fn expand_model_macros(app: &mut App, sources: &[SourceFile]) -> supe
             };
             // Root calls are the only admitted placement. Calls nested
             // in conditionals/blocks must still poison partial expansion.
-            let root_macro = macros.contains_key(method)
+            let root_macro = (macros.contains_key(method) || hook_macros.contains_key(method))
                 && recv
                     .as_ref()
                     .is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef));
@@ -93,34 +125,40 @@ pub(crate) fn expand_model_macros(app: &mut App, sources: &[SourceFile]) -> supe
             {
                 continue;
             }
-            let Some(def) = macros.get(method) else {
+            let Some((origin, def)) = macro_provider(method, &macros, &origins, &hook_macros)
+            else {
                 continue;
             };
-            let origin = &origins[method];
             let providers = app
                 .library_classes
                 .iter()
-                .filter(|c| included.contains(&c.name))
+                .filter(|c| included.contains(&c.name) || hook_origins.contains(&c.name))
                 .flat_map(|c| &c.methods)
                 .filter(|m| m.receiver == MethodReceiver::Class && &m.name == method)
                 .count();
             let methods = (recv.is_none()
                 && block.is_none()
-                && included.contains(origin)
+                && (included.contains(origin) || hook_origins.contains(origin))
                 && providers == 1
-                && ["define_method", "private", "protected", "public"]
-                    .iter()
-                    .all(|name| {
-                        !crate::lower::scope_chain::app_method(
-                            app,
-                            &model.name,
-                            &Symbol::from(*name),
-                            MethodReceiver::Class,
-                        )
-                    })
+                && [
+                    "define_method",
+                    "private",
+                    "protected",
+                    "public",
+                    "class_eval",
+                ]
+                .iter()
+                .all(|name| {
+                    !crate::lower::scope_chain::app_method(
+                        app,
+                        &model.name,
+                        &Symbol::from(*name),
+                        MethodReceiver::Class,
+                    )
+                })
                 && supported_source_signature(def, sources)
                 && supported_source_call(expr, sources))
-            .then(|| expand(def, args, sources))
+            .then(|| expand(def, args, sources, &model.name))
             .flatten();
             candidates.push((index, method.clone(), methods));
         }
@@ -156,8 +194,8 @@ pub(crate) fn expand_model_macros(app: &mut App, sources: &[SourceFile]) -> supe
         // first one become a misleading partial expansion either.
         let mut names = HashMap::<Symbol, usize>::new();
         for (_, _, methods) in &candidates {
-            let Some(methods) = methods else { continue };
-            for m in methods {
+            let Some(expansion) = methods else { continue };
+            for m in &expansion.methods {
                 *names.entry(m.name.clone()).or_default() += 1;
             }
         }
@@ -166,10 +204,10 @@ pub(crate) fn expand_model_macros(app: &mut App, sources: &[SourceFile]) -> supe
         // invent a partial class when one candidate's effects are unknown.
         let opaque = candidates.iter().any(|(_, _, methods)| methods.is_none());
         for (index, name, methods) in candidates {
-            let methods = methods.filter(|methods| {
+            let methods = methods.filter(|expansion| {
                 !opaque
                     && calls[&name] == 1
-                    && methods.iter().all(|m| {
+                    && expansion.methods.iter().all(|m| {
                         names[&m.name] == 1
                             && !reserved.contains(&m.name)
                             && !crate::lower::scope_chain::app_method(
@@ -205,7 +243,7 @@ pub(crate) fn expand_model_macros(app: &mut App, sources: &[SourceFile]) -> supe
         let model = &mut app.models[model_index];
         let mut body = Vec::new();
         for (index, item) in std::mem::take(&mut model.body).into_iter().enumerate() {
-            let Some(methods) = expansions.remove(&index) else {
+            let Some(expansion) = expansions.remove(&index) else {
                 body.push(item);
                 continue;
             };
@@ -217,7 +255,7 @@ pub(crate) fn expand_model_macros(app: &mut App, sources: &[SourceFile]) -> supe
             else {
                 unreachable!()
             };
-            for mut method in methods {
+            for mut method in expansion.methods {
                 method.enclosing_class = Some(model.name.0.clone());
                 body.push(ModelBodyItem::Method {
                     method,
@@ -225,10 +263,23 @@ pub(crate) fn expand_model_macros(app: &mut App, sources: &[SourceFile]) -> supe
                     leading_blank_line: std::mem::take(&mut leading_blank_line),
                 });
             }
+            body.extend(expansion.items);
         }
         model.body = body;
     }
     Ok(())
+}
+
+fn macro_provider<'a>(
+    method: &Symbol,
+    macros: &'a HashMap<Symbol, MethodDef>,
+    origins: &'a HashMap<Symbol, ClassId>,
+    hook_macros: &'a HashMap<Symbol, (ClassId, MethodDef)>,
+) -> Option<(&'a ClassId, &'a MethodDef)> {
+    if let Some(def) = macros.get(method) {
+        return origins.get(method).map(|origin| (origin, def));
+    }
+    hook_macros.get(method).map(|(id, def)| (id, def))
 }
 
 fn include_closure(app: &App, id: ClassId, included: &mut HashSet<ClassId>) {
@@ -276,8 +327,7 @@ fn supported_source_signature(def: &MethodDef, sources: &[SourceFile]) -> bool {
                         .all(|p| p.as_required_parameter_node().is_some())
                     && params.keywords().iter().all(|p| {
                         p.as_required_keyword_parameter_node().is_some()
-                            || p.as_optional_keyword_parameter_node()
-                                .is_some_and(|p| p.value().as_symbol_node().is_some())
+                            || p.as_optional_keyword_parameter_node().is_some()
                     })
             });
         }
@@ -343,7 +393,9 @@ fn supported_source_call(expr: &Expr, sources: &[SourceFile]) -> bool {
 }
 
 fn has_definition(body: &Expr) -> bool {
-    if matches!(&*body.node, ExprNode::Send { method, .. } if method.as_str() == "define_method") {
+    if matches!(&*body.node, ExprNode::Send { method, .. }
+        if matches!(method.as_str(), "define_method" | "class_eval"))
+    {
         return true;
     }
     let mut found = false;
@@ -352,9 +404,14 @@ fn has_definition(body: &Expr) -> bool {
     found
 }
 
-fn macro_calls(expr: &Expr, macros: &HashMap<Symbol, MethodDef>, out: &mut Vec<Symbol>) {
+fn macro_calls(
+    expr: &Expr,
+    macros: &HashMap<Symbol, MethodDef>,
+    hook_macros: &HashMap<Symbol, (ClassId, MethodDef)>,
+    out: &mut Vec<Symbol>,
+) {
     if let ExprNode::Send { recv, method, .. } = &*expr.node {
-        if macros.contains_key(method)
+        if (macros.contains_key(method) || hook_macros.contains_key(method))
             && recv
                 .as_ref()
                 .is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
@@ -363,10 +420,10 @@ fn macro_calls(expr: &Expr, macros: &HashMap<Symbol, MethodDef>, out: &mut Vec<S
         }
     }
     expr.node
-        .for_each_child(&mut |child| macro_calls(child, macros, out));
+        .for_each_child(&mut |child| macro_calls(child, macros, hook_macros, out));
 }
 
-fn symbol(expr: &Expr) -> Option<&Symbol> {
+pub(super) fn symbol(expr: &Expr) -> Option<&Symbol> {
     match &*expr.node {
         ExprNode::Lit {
             value: Literal::Sym { value },
@@ -378,8 +435,11 @@ fn symbol(expr: &Expr) -> Option<&Symbol> {
 /// Required positionals plus required/optional keywords. Optional
 /// positionals, rest and forwarding need a fuller Ruby argument binder.
 /// Keywords retain their SOURCE kind even where library ingest flattened
-/// an optional keyword into a positional (`from_keyword`).
-fn bindings(def: &MethodDef, args: &[Expr]) -> Option<HashMap<Symbol, Expr>> {
+/// an optional keyword into a positional (`from_keyword`). A required
+/// keyword with no default fails closed (`None`); an optional keyword
+/// whose default is not a substitutable symbol is omitted so later
+/// statements that need it decline.
+pub(super) fn bindings(def: &MethodDef, args: &[Expr]) -> Option<HashMap<Symbol, Expr>> {
     if def.block_param.is_some()
         || def.params.iter().any(|p| {
             p.rest || p.from_kwrest || (!p.keyword && !p.from_keyword && p.default.is_some())
@@ -410,9 +470,21 @@ fn bindings(def: &MethodDef, args: &[Expr]) -> Option<HashMap<Symbol, Expr>> {
     let mut out = HashMap::new();
     for param in &def.params {
         let value = if param.keyword || param.from_keyword {
-            keywords
-                .remove(&param.name)
-                .or_else(|| param.default.clone())?
+            match keywords.remove(&param.name) {
+                Some(value) => {
+                    symbol(&value)?;
+                    value
+                }
+                None => match &param.default {
+                    Some(default) => {
+                        if symbol(default).is_none() {
+                            continue;
+                        }
+                        default.clone()
+                    }
+                    None => return None,
+                },
+            }
         } else {
             positional.next()?.clone()
         };
@@ -425,7 +497,31 @@ fn bindings(def: &MethodDef, args: &[Expr]) -> Option<HashMap<Symbol, Expr>> {
     (positional.next().is_none() && keywords.is_empty()).then_some(out)
 }
 
-fn expand(def: &MethodDef, args: &[Expr], sources: &[SourceFile]) -> Option<Vec<MethodDef>> {
+pub(super) struct Expansion {
+    pub(super) methods: Vec<MethodDef>,
+    pub(super) items: Vec<ModelBodyItem>,
+}
+
+fn expand(
+    def: &MethodDef,
+    args: &[Expr],
+    sources: &[SourceFile],
+    owner: &ClassId,
+) -> Option<Expansion> {
+    if let Some(methods) = expand_define_methods(def, args, sources) {
+        return Some(Expansion {
+            methods,
+            items: Vec::new(),
+        });
+    }
+    class_eval::expand(def, args, sources, owner)
+}
+
+fn expand_define_methods(
+    def: &MethodDef,
+    args: &[Expr],
+    sources: &[SourceFile],
+) -> Option<Vec<MethodDef>> {
     let bindings = bindings(def, args)?;
     let statements = match &*def.body.node {
         ExprNode::Seq { exprs } => exprs.as_slice(),

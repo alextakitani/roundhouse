@@ -88,6 +88,58 @@ module ActiveRecord
     found == -1 ? nil : labels[found]
   end
 
+  # The first index in `sorted` (ascending) whose value is >= `value`,
+  # or `sorted.length` when none is: a binary search. The
+  # `includes(:assoc)` distribute calls it twice per parent over the
+  # loaded children's foreign keys -- which the preload query returns
+  # `ORDER BY fk` -- to find that parent's run,
+  # `lower_bound(fks, id)...lower_bound(fks, id + 1)`, so the cost is
+  # O(N log M + M) where the nested scan this replaced was O(N * M): at
+  # 1,000 parents and 1,000 children that scan was a million
+  # comparisons per request, and the emitted index fell behind Rails'
+  # keyed preloader (koduki/example-rails-aot).
+  #
+  # Integers in, an integer out, counters bumped by `x = x + 1`: one
+  # typed body serves every target, and the lowered caller needs no
+  # Integer-keyed Hash, no index assignment, and no counter shared
+  # across its block's iterations. No division either -- Crystal,
+  # Python and TypeScript render Ruby's Integer `/` as true division --
+  # and no scratch Array, whose element type an empty literal leaves
+  # unknown: the search descends through powers of two, finding each
+  # next-smaller one by doubling from 1 (O(log^2 M) additions, a few
+  # hundred at M = 1,000). `lo` grows by each step whose last element
+  # is still below `value`, which leaves it at the count of such
+  # elements.
+  def self.lower_bound(sorted, value)
+    n = sorted.length
+    step = 1
+    while step + step <= n
+      step = step + step
+    end
+    lo = 0
+    # Declared before the loop: a local first assigned inside it is
+    # hoisted as a nullable on C#, and `step = half` then narrows it.
+    half = 0
+    while step > 0
+      # `.to_i`: an Array read types `Integer | nil`, and an ordering
+      # comparison on a nilable is Ruby's NoMethodError, which the
+      # strict targets refuse to emit. The index is in range here, so
+      # the read is an Integer and `to_i` is its identity.
+      if lo + step <= n && sorted[lo + step - 1].to_i < value
+        lo = lo + step
+      end
+      half = 0
+      if step > 1
+        half = 1
+        while half + half < step
+          half = half + half
+        end
+      end
+      step = half
+    end
+    lo
+  end
+
   # Base class for all models. Designed to contain *zero* metaprogramming:
   # subclasses provide their own `attributes`, `[]`, `[]=`, `update`, and
   # `initialize`-from-attrs methods (typically by writing them out per
@@ -255,6 +307,10 @@ module ActiveRecord
       []
     end
 
+    def self.schema_date_columns
+      []
+    end
+
     def self.instantiate(_row)
       raise NotImplementedError, "#{name}.instantiate must be overridden"
     end
@@ -363,6 +419,13 @@ module ActiveRecord
 
     def self._adapter_count
       ActiveRecord.adapter.count(table_name)
+    end
+
+    # Unscoped non-emptiness. Level-3 models override with SELECT 1 LIMIT 1;
+    # this default keeps hand-written / Base tests on the universal count
+    # adapter method (strict AdapterInterface has no select_rows).
+    def self._adapter_any?
+      count > 0
     end
 
     def self._adapter_exists_by_id?(id)
@@ -539,19 +602,15 @@ module ActiveRecord
       _adapter_exists_by_id?(id)
     end
 
-    # Rails delegates the Enumerable predicates from the class to `all`,
-    # so `User.none?` asks whether the table has any row at all —
-    # campfire's first-run check. Answered from COUNT rather than by
-    # materializing: `none?`/`any?` on the class carry no conditions, so
-    # there is nothing for the Relation to hold that the count doesn't.
-    # The scoped forms (`User.where(…).none?`) go through Relation#none?
-    # beside it.
+    # Unscoped class emptiness via `_adapter_any?` (Level-3: SELECT 1
+    # LIMIT 1; Base default: count > 0). Scoped forms go through Relation;
+    # ruby-family connection.rb still overrides with Relation.exists?.
     def self.none?
-      count == 0
+      !_adapter_any?
     end
 
     def self.any?
-      count > 0
+      _adapter_any?
     end
 
     # Bulk DELETE without instantiating records or running callbacks —

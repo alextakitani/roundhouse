@@ -282,7 +282,7 @@ const FATES: &[(&str, GemFate)] = &[
     ("faker", GemFate::Modeled),       // catalog/gems: Faker::*
     ("geared_pagination", GemFate::Modeled), // registry/controllers: set_page_and_extract_portion_from
     ("image_processing", GemFate::Modeled), // active_storage variants seam
-    ("kaminari", GemFate::Modeled),    // catalog: page / per / padding / without_count
+    ("kaminari", GemFate::Modeled),    // Relation#page / per / paginate
     ("mail", GemFate::Modeled),        // catalog/gems: Mail::Address; ActionMailer
     ("mocha", GemFate::Modeled),       // lower/mocha bridge
     ("nokogiri", GemFate::Modeled),    // catalog/gems: Nokogiri
@@ -494,6 +494,7 @@ pub fn namespace_of(gem: &str) -> String {
         ("cancancan", "CanCan"),
         ("combine_pdf", "CombinePDF"),
         ("fast_excel", "FastExcel"),
+        ("graphql", "GraphQL"),
         ("http", "HTTP"),
         ("i18n", "I18n"),
         ("jwt", "JWT"),
@@ -587,6 +588,12 @@ pub fn gems_owning_constant<'a>(census: &'a GemCensus, constant_path: &str) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graphql_owns_the_graphql_namespace() {
+        // Name-derived, it would be `Graphql`; graphql-ruby's is `GraphQL`.
+        assert_eq!(namespace_of("graphql"), "GraphQL");
+    }
 
     const LOCK: &str = "\
 GEM

@@ -29,6 +29,7 @@
 //!   `_adapter_update(id, instance)` — UPDATE WHERE id, returns void
 //!   `_adapter_delete(id)` — DELETE WHERE id, returns void
 //!   `_adapter_count` — SELECT COUNT(*), returns Integer
+//!   `_adapter_any?` — SELECT 1 LIMIT 1 (table non-empty), returns Bool
 //!   `_adapter_exists_by_id?(id)` — SELECT 1 LIMIT 1, returns Bool
 //!   `_adapter_truncate` — DELETE FROM table (test setup)
 //!   `_columns_sql` — the schema columns as a qualified SELECT list
@@ -48,6 +49,9 @@ use crate::ty::Ty;
 
 use super::{fn_sig, ty_of_column};
 
+mod exists;
+use exists::{synth_adapter_any, synth_adapter_exists_by_id};
+
 pub(super) fn push_adapter_methods(
     methods: &mut Vec<MethodDef>,
     owner: &ClassId,
@@ -61,6 +65,7 @@ pub(super) fn push_adapter_methods(
     methods.push(synth_adapter_update(owner, table, schema));
     methods.push(synth_adapter_delete(owner, table, schema));
     methods.push(synth_adapter_count(owner, table, schema));
+    methods.push(synth_adapter_any(owner, table, schema));
     methods.push(synth_adapter_exists_by_id(owner, table, schema));
     methods.push(synth_adapter_truncate(owner, table, schema));
     methods.push(synth_delete_all(owner, table));
@@ -405,40 +410,6 @@ fn synth_adapter_count(owner: &ClassId, table: &Table, schema: &Schema) -> Metho
     }
 }
 
-fn synth_adapter_exists_by_id(owner: &ClassId, table: &Table, schema: &Schema) -> MethodDef {
-    let id = Symbol::from("id");
-    let key_ty = key_ty(table);
-
-    let op = ArelOp::Select(Select {
-        single_record: false, // _adapter_exists_by_id — a Bool
-        table: TableRef(table.name.clone()),
-        columns: ColumnSpec::Exists,
-        conditions: Some(eq_id_param(table, &id)),
-        orders: vec![],
-        limit: Some(LimitSpec(1)),
-        joins: vec![],
-            preloads: vec![],
-    });
-
-    MethodDef {
-        visibility: crate::dialect::MethodVisibility::Public,
-        unsupported_formals: None,
-        has_anonymous_block: false,
-        name_span: crate::span::Span::synthetic(),
-        name: Symbol::from("_adapter_exists_by_id?"),
-        receiver: MethodReceiver::Class,
-        params: vec![Param::positional(id.clone())],
-        body: SqliteVisitor.visit(&op, schema, owner),
-        signature: Some(fn_sig(vec![(id, key_ty)], Ty::Bool)),
-        effects: EffectSet::default(),
-        enclosing_class: Some(owner.0.clone()),
-        kind: AccessorKind::Method,
-        is_async: false,
-            mutates_self: false,
-            block_param: None,
-    }
-}
-
 /// `def self.delete_all` — bulk DELETE with ActiveRecord semantics:
 /// rows go, the autoincrement counter stays (`_adapter_truncate` is
 /// the sequence-resetting sibling, for test setup). A PUBLIC name —
@@ -699,7 +670,15 @@ fn synth_adapter_reload(owner: &ClassId, table: &Table) -> MethodDef {
     }
 }
 
-/// `def self._columns_sql; "<table>.<col> AS <col>, …"; end`
+/// An identifier quoted the way Rails' SQLite adapter always quotes one
+/// (`"messages"."id"`). Apps' tests pick statements out by that text:
+/// campfire's query-plan tests filter on `start_with?(%(SELECT
+/// "messages"))` (basecamp/once-campfire#312).
+fn rails_quoted(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// `def self._columns_sql; "\"<table>\".\"<col>\" AS <col>, …"; end`
 ///
 /// The schema columns, table-qualified, in the order `from_stmt` reads
 /// them. `Relation#to_a` projects this instead of `<table>.*` so a
@@ -716,7 +695,14 @@ fn synth_columns_sql(owner: &ClassId, table: &Table) -> MethodDef {
     let cols_csv: String = table
         .columns
         .iter()
-        .map(|c| format!("{t}.{c} AS {c}", t = crate::naming::sql_ident(table.name.as_str()), c = crate::naming::sql_ident(c.name.as_str())))
+        .map(|c| {
+            format!(
+                "{t}.{q} AS {alias}",
+                t = rails_quoted(table.name.as_str()),
+                q = rails_quoted(c.name.as_str()),
+                alias = crate::naming::sql_ident(c.name.as_str())
+            )
+        })
         .collect::<Vec<_>>()
         .join(", ");
     MethodDef {
@@ -898,7 +884,7 @@ fn key_column_name(table: &Table) -> Symbol {
     key_column(table).map(|c| c.name.clone()).unwrap_or_else(|| Symbol::from("id"))
 }
 
-fn key_ty(table: &Table) -> Ty {
+pub(super) fn key_ty(table: &Table) -> Ty {
     key_column(table).map(|c| ty_of_column(&c.col_type)).unwrap_or(Ty::Int)
 }
 
@@ -908,7 +894,7 @@ fn key_value_type(table: &Table) -> ValueType {
 
 /// `Eq(<table>.<key>, Runtime(<id-param>, <key type>))` — find_by_id /
 /// exists_by_id? shape (id arrives as a method param).
-fn eq_id_param(table: &Table, id_param: &Symbol) -> Predicate {
+pub(super) fn eq_id_param(table: &Table, id_param: &Symbol) -> Predicate {
     Predicate::Eq(
         ColRef { table: TableRef(table.name.clone()), column: key_column_name(table) },
         Value::Runtime { expr: var_ref(id_param), ty: key_value_type(table) },

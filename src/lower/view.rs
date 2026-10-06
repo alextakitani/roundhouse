@@ -75,6 +75,9 @@ pub enum ViewHelperKind<'a> {
     TurboStreamFrom { streamables: &'a [Expr] },
     /// `<%= dom_id(record [, prefix]) %>`.
     DomId { record: &'a Expr, prefix: Option<&'a Expr> },
+    /// `render_attrs(hash)` — the attribute-hash helper the HAML and Slim
+    /// compilers emit for dynamic attributes (never written in ERB).
+    RenderAttrs { attrs: &'a Expr },
     /// `<%= pluralize(count, "word") %>`.
     Pluralize { count: &'a Expr, word: &'a Expr },
     /// `<%= truncate(text [, opts]) %>`.
@@ -512,6 +515,7 @@ pub fn classify_view_helper<'a>(
         ("turbo_stream_from", n) if n >= 1 => {
             Some(ViewHelperKind::TurboStreamFrom { streamables: args })
         }
+        ("render_attrs", 1) => Some(ViewHelperKind::RenderAttrs { attrs: &args[0] }),
         ("dom_id", 1) => Some(ViewHelperKind::DomId {
             record: &args[0],
             prefix: None,

@@ -281,6 +281,8 @@ module Main
     0
   end
 
+  # Serve static files or dispatch the complete request path through Router,
+  # preserving literal suffix routes while negotiating the response format.
   def self.dispatch(req, res)
     ActionView::ViewHelpers.reset_slots!
     Broadcasts.reset_log!
@@ -317,8 +319,9 @@ module Main
     request_path = req.path
     if request_path.end_with?(".json")
       request_format = :json
-      request_path = request_path[0...-5]
     end
+    # Router.match owns format-suffix matching and its literal-path fallback.
+    # Passing the full path also lets an explicit `/feed.json` route match.
     # Turbo Stream is negotiated by the Accept header, not by a path
     # suffix — a Turbo-driven form POST asks for
     # `text/vnd.turbo-stream.html`. Checked after the suffix so an
@@ -445,6 +448,9 @@ module Main
     # posts, and the Origin it compares with the Host.
     request_obj.env["HTTP_X_CSRF_TOKEN"] = req.req_headers.fetch("x-csrf-token", "")
     request_obj.env["HTTP_ORIGIN"] = req.req_headers.fetch("origin", "")
+    # The credentials the HTTP Token/Basic helpers parse
+    # (runtime/http_authentication.rb).
+    request_obj.env["HTTP_AUTHORIZATION"] = req.req_headers.fetch("authorization", "")
     # The body's declared type, for the one route that checks it
     # against what was promised: Active Storage's direct-upload PUT.
     request_obj.env["CONTENT_TYPE"] = req.req_headers.fetch("content-type", "")
@@ -537,8 +543,13 @@ module Main
     # value is a header the app UNSET (campfire's `X-Rev` is
     # `ENV["GIT_REVISION"]`, absent outside its own deploy) and is not
     # written: the wire has no spelling for it.
-    controller.headers.each do |k, v|
+    i = 0
+    n = controller.headers.size
+    while i < n
+      k = controller.headers.key_at(i)
+      v = controller.headers.val_at(i)
       res.headers[k] = v unless v.nil?
+      i += 1
     end
 
     # Outbound flash: persist messages set THIS request for the NEXT one.
@@ -548,13 +559,13 @@ module Main
     persisted = controller.flash.to_persisted
     pn = persisted.fetch("notice", "")
     if pn.length > 0
-      Main.set_flash_cookie(res, "flash_notice", ActionDispatch::SignedCookie.sign(pn, "flash_notice"))
+      Main.set_flash_cookie(res, "flash_notice", ActionDispatch::SignedCookie.sign(pn, "flash_notice"), request_obj.ssl?)
     elsif req.cookies.fetch("flash_notice", "").length > 0
       Main.clear_flash_cookie(res, "flash_notice")
     end
     pa = persisted.fetch("alert", "")
     if pa.length > 0
-      Main.set_flash_cookie(res, "flash_alert", ActionDispatch::SignedCookie.sign(pa, "flash_alert"))
+      Main.set_flash_cookie(res, "flash_alert", ActionDispatch::SignedCookie.sign(pa, "flash_alert"), request_obj.ssl?)
     elsif req.cookies.fetch("flash_alert", "").length > 0
       Main.clear_flash_cookie(res, "flash_alert")
     end
@@ -565,10 +576,19 @@ module Main
     out_cookies = controller.cookies.pending
     ock = out_cookies.keys
     ci = 0
+    jar = controller.cookies
     while ci < ock.length
       cname = ock[ci]
       copts = Tep.str_hash
       copts["Path"] = "/"
+      copts["HttpOnly"] = +"" if jar.flag_httponly?(cname)
+      ss = jar.flag_samesite(cname)
+      copts["SameSite"] = ss if ss.length > 0
+      # SameSite=None is ignored by browsers unless Secure is set.
+      copts["Secure"] = +"" if jar.flag_secure?(cname) || request_obj.ssl? || ss == "None"
+      # `cookies.permanent` — without it the cookie ends with the browser.
+      exp = jar.flag_expires(cname)
+      copts["Expires"] = exp if exp.length > 0
       res.set_cookie(cname, out_cookies[cname], copts)
       ci += 1
     end
@@ -588,7 +608,7 @@ module Main
         Main.clear_flash_cookie(res, session_cookie)
       else
         Main.set_flash_cookie(res, session_cookie,
-          ActionDispatch::Session.signed_cookie(session_out, session_cookie))
+          ActionDispatch::Session.signed_cookie(session_out, session_cookie), request_obj.ssl?)
       end
     end
   end
@@ -596,10 +616,12 @@ module Main
   # Flash cookies are HttpOnly + Path=/; the read side is server-only
   # (no JS access). A set carries the message to the next request; a
   # clear (empty value + Max-Age=0) expires a consumed one.
-  def self.set_flash_cookie(res, name, value)
+  def self.set_flash_cookie(res, name, value, secure)
     opts = Tep.str_hash
     opts["Path"] = "/"
     opts["HttpOnly"] = +""
+    opts["SameSite"] = "Lax"
+    opts["Secure"] = +"" if secure
     res.set_cookie(name, value, opts)
   end
 
@@ -682,6 +704,10 @@ if port <= 0 || port > 65535
   exit(1)
 end
 Main.configure_default_adapter!
+# Serving, so WAL checkpoints move off the request path: a background
+# thread runs them instead of some request's COMMIT
+# (Db.checkpoint_in_background!).
+Db.checkpoint_in_background!
 # Wire model after-commit Turbo Stream broadcasts to the live WebSocket
 # fan-out. Without this, broadcasts only land in the in-memory log.
 Broadcasts.set_transport(Cable::Transport.new)

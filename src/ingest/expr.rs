@@ -76,14 +76,6 @@ fn ingest_multi_write(
     span: Span,
     file: &str,
 ) -> IngestResult<ExprNode> {
-    // Post-rest targets (`*init, last = c`) need length-relative
-    // indexing off the tail; still out of scope.
-    if mw.rights().iter().next().is_some() {
-        return Err(IngestError::Unsupported {
-            file: file.into(),
-            message: "multi-write with post-rest targets not yet supported".into(),
-        });
-    }
     let mut targets: Vec<crate::expr::LValue> = Vec::new();
     for left in mw.lefts().iter() {
         targets.push(multi_write_target(&left, file)?);
@@ -95,6 +87,32 @@ fn ingest_multi_write(
         None => return Ok(ExprNode::MultiAssign { targets, value }),
         Some(rest) => rest,
     };
+    if !mw.rights().is_empty() {
+        // The desugar below indexes the RHS directly. Ruby instead calls
+        // to_ary (or wraps a scalar); collection dispatch alone does not
+        // prove those coercion semantics. Only literal arrays are verified.
+        if mw.value().as_array_node().is_none() {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: "post-rest multi-write requires an array literal RHS; to_ary coercion is not modeled".into(),
+            });
+        }
+        // Receiver/index expressions on an assignment LHS run BEFORE the
+        // RHS in Ruby. This desugar only preserves variable targets; do not
+        // accept the new post-rest shape with a different evaluation order.
+        for target in mw.lefts().iter().chain(mw.rights().iter())
+            .chain(rest.as_splat_node().and_then(|s| s.expression()))
+        {
+            if target.as_local_variable_target_node().is_none()
+                && target.as_instance_variable_target_node().is_none()
+            {
+                return Err(IngestError::Unsupported {
+                    file: file.into(),
+                    message: "post-rest multi-write with non-variable targets requires preserved LHS evaluation order".into(),
+                });
+            }
+        }
+    }
     // `a, *rest = expr` — trailing splat. The shared IR has no rest-aware
     // destructuring node, so desugar to a temp bind + positional `[]`
     // reads + `rest = temp.drop(n)`. Every resulting node (Assign / `[]`
@@ -103,15 +121,44 @@ fn ingest_multi_write(
     // rest flag through ~15 MultiAssign consumers. The Seq ends in the
     // temp read so the whole expression's value is the RHS array —
     // matching Ruby, where `(a, *b = arr)` evaluates to `arr`.
-    let tmp = Symbol::from(format!("__mw_{}", span.start).as_str());
+    let stem = format!("__mw_{}", span.start);
+    let mut name = stem.clone();
+    let mut suffix = 0;
+    while super::sources::generated_local_is_reserved(&mw.location(), &name) {
+        suffix += 1;
+        name = format!("{stem}_{suffix}");
+    }
+    let tmp = Symbol::from(name);
     let tmp_read = || {
         Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name: tmp.clone() })
     };
-    let int_lit = |v: usize| {
-        Expr::new(span, ExprNode::Lit { value: Literal::Int { value: v as i64 } })
+    let int_lit = |v: i64| {
+        Expr::new(span, ExprNode::Lit { value: Literal::Int { value: v } })
     };
+    let send = |recv: Expr, method: &str, args: Vec<Expr>| {
+        let parenthesized = !args.is_empty() && !matches!(method, "<" | "-");
+        Expr::new(
+            span,
+            ExprNode::Send {
+                recv: Some(recv),
+                method: Symbol::from(method),
+                args,
+                block: None,
+                parenthesized,
+            },
+        )
+    };
+    let index_read = |index: Expr| send(tmp_read(), "[]", vec![index]);
+    let rights: Vec<Node<'_>> = mw.rights().iter().collect();
     let n_lefts = targets.len();
-    let mut exprs: Vec<Expr> = Vec::with_capacity(n_lefts + 3);
+    let n_rights = rights.len();
+    // Leading bindings consume first. A short RHS supplies the remaining
+    // values to the right targets from left to right, then pads with nil;
+    // negative indexing alone would reuse values already claimed by the head.
+    let short_rhs = || send(
+        send(tmp_read(), "length", vec![]), "<", vec![int_lit((n_lefts + n_rights) as i64)],
+    );
+    let mut exprs: Vec<Expr> = Vec::with_capacity(n_lefts + n_rights + 3);
     exprs.push(Expr::new(
         span,
         ExprNode::Assign {
@@ -120,33 +167,37 @@ fn ingest_multi_write(
         },
     ));
     for (i, target) in targets.into_iter().enumerate() {
-        let read = Expr::new(
-            span,
-            ExprNode::Send {
-                recv: Some(tmp_read()),
-                method: Symbol::from("[]"),
-                args: vec![int_lit(i)],
-                block: None,
-                parenthesized: true,
-            },
-        );
+        let read = index_read(int_lit(i as i64));
         exprs.push(Expr::new(span, ExprNode::Assign { target, value: read }));
     }
-    // Anonymous splat (`a, * = c`) discards the rest — only a named
-    // target gets a binding.
+    // Anonymous splat (`a, * = c` / `a, *, c = x`) discards the rest —
+    // only a named target gets a binding.
     if let Some(rest_node) = rest.as_splat_node().and_then(|s| s.expression()) {
         let rest_target = multi_write_target(&rest_node, file)?;
-        let drop = Expr::new(
-            span,
-            ExprNode::Send {
-                recv: Some(tmp_read()),
-                method: Symbol::from("drop"),
-                args: vec![int_lit(n_lefts)],
-                block: None,
-                parenthesized: true,
-            },
-        );
-        exprs.push(Expr::new(span, ExprNode::Assign { target: rest_target, value: drop }));
+        let tail = send(tmp_read(), "drop", vec![int_lit(n_lefts as i64)]);
+        let rest_value = if n_rights == 0 {
+            tail
+        } else {
+            let count = Expr::new(
+                span,
+                ExprNode::If {
+                    cond: short_rhs(),
+                    then_branch: int_lit(0),
+                    else_branch: send(send(tmp_read(), "length", vec![]), "-", vec![int_lit((n_lefts + n_rights) as i64)]),
+                },
+            );
+            send(tail, "take", vec![count])
+        };
+        exprs.push(Expr::new(span, ExprNode::Assign { target: rest_target, value: rest_value }));
+    }
+    for (i, right_node) in rights.iter().enumerate() {
+        let target = multi_write_target(right_node, file)?;
+        let read = Expr::new(span, ExprNode::If {
+            cond: short_rhs(),
+            then_branch: index_read(int_lit((n_lefts + i) as i64)),
+            else_branch: index_read(int_lit(-((n_rights - i) as i64))),
+        });
+        exprs.push(Expr::new(span, ExprNode::Assign { target, value: read }));
     }
     exprs.push(tmp_read());
     Ok(ExprNode::Seq { exprs })
@@ -239,6 +290,41 @@ fn absurd_raise(span: Span, value: Expr) -> ExprNode {
         block: None,
         parenthesized: true,
     }
+}
+
+/// A defined? operand is syntax, not an expression to normalize. In
+/// particular, framework predicates and Sorbet assertions must stay calls.
+fn ingest_defined_operand(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
+    if let Some(call) = node.as_call_node() {
+        if call.arguments().is_some() || call.block().is_some() || call.is_safe_navigation() {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: "defined? calls with arguments, blocks or safe navigation are not modeled".into(),
+            });
+        }
+        let loc = node.location();
+        return Ok(Expr::new(
+            Span { file: super::sources::file_id(file), start: loc.start_offset() as u32, end: loc.end_offset() as u32 },
+            ExprNode::Send {
+                recv: call.receiver().map(|recv| ingest_defined_operand(&recv, file)).transpose()?,
+                method: Symbol::from(constant_id_str(&call.name())),
+                args: vec![],
+                block: None,
+                parenthesized: call.opening_loc().is_some(),
+            },
+        ));
+    }
+    if node.as_constant_read_node().is_some() || node.as_constant_path_node().is_some()
+        || node.as_forwarding_super_node().is_some() || node.as_local_variable_read_node().is_some()
+        || node.as_instance_variable_read_node().is_some() || node.as_class_variable_read_node().is_some()
+        || node.as_self_node().is_some()
+    {
+        return ingest_expr(node, file);
+    }
+    Err(IngestError::Unsupported {
+        file: file.into(),
+        message: format!("`defined?` does not support this target yet: {node:?}"),
+    })
 }
 
 fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
@@ -401,7 +487,7 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
                 && block.is_none()
                 && recv.is_some()
                 && args.len() == 1
-                && !matches!(&*args[0].node, ExprNode::ForwardArgs)
+                && !matches!(&*args[0].node, ExprNode::ForwardArgs | ExprNode::ForwardKeywords)
             {
                 let r = recv.unwrap();
                 let mut defaults = args.into_iter().next().unwrap();
@@ -598,86 +684,67 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         // Rails view partials to check whether an optional local was
         // passed: `<% if defined?(show_tree_lines) && show_tree_lines %>`.
         //
-        // Restrict to the bareword shape Prism produces for the
-        // partial-local idiom: either a no-arg CallNode (when the name
-        // isn't lexically bound, which is the partial-local case) or a
-        // LocalVariableReadNode (when it IS bound). Both lift to a
-        // `Var(name)` reference inside a marker Send. Other shapes
-        // (`defined?(@ivar)`, `defined?(Foo)`, `defined?(obj.method)`)
-        // have target-different semantics and surface as Unsupported
-        // for now — lobsters/real-blog don't use them.
-        //
-        // The view-lowerer picks up the inner Var as a partial
-        // parameter (collect_extra_params) then rewrites the marker
-        // Send to `!name.nil?` (rewrite_defined_to_nil_check).
+        // The bareword shape Prism produces for the partial-local idiom
+        // — either a no-arg CallNode (when the name isn't lexically
+        // bound, which is the partial-local case) or a
+        // LocalVariableReadNode (when it IS bound) — lifts to a
+        // `Var(name)` reference inside a marker Send; the view-lowerer
+        // picks up that inner Var as a partial parameter
+        // (collect_extra_params) then rewrites the marker Send to
+        // `!name.nil?` (rewrite_defined_to_nil_check). Richer native queries
+        // have a dedicated node so no ordinary-call pass rewrites them.
         n if n.as_defined_node().is_some() => {
             let d = n.as_defined_node().unwrap();
             let inner = d.value();
-            // `defined?(@ivar)` — the memoization-guard idiom
-            // (`return @x if defined?(@x)`), all over Mastodon's
-            // ApplicationController. Lift the ivar read into the same
-            // marker Send; the analyzer types `defined?` as `Str?` and
-            // the ivar's type comes from its assignments, so the guard
-            // costs nothing. (Class-body ivars aren't partial locals,
-            // so the view-lowerer's Var-based rewrite never sees this
-            // shape.)
-            if let Some(iv) = inner.as_instance_variable_read_node() {
-                let raw = constant_id_str(&iv.name());
-                let name = raw.strip_prefix('@').unwrap_or(raw);
-                let ivar = Expr::new(
-                    Span::synthetic(),
-                    ExprNode::Ivar { name: Symbol::from(name) },
-                );
-                return Ok(Expr::new(
-                    span,
-                    ExprNode::Send {
-                        recv: None,
-                        method: Symbol::from("defined?"),
-                        args: vec![ivar],
-                        block: None,
-                        parenthesized: true,
-                    },
-                ));
+            // These syntax-only answers are known without evaluating an
+            // operand or consulting native storage, on every target.
+            let descriptor = if inner.as_self_node().is_some() { Some("self") }
+                else if inner.as_nil_node().is_some() { Some("nil") }
+                else if inner.as_true_node().is_some() { Some("true") }
+                else if inner.as_false_node().is_some() { Some("false") }
+                else if inner.as_integer_node().is_some() { Some("expression") }
+                else { None };
+            if let Some(descriptor) = descriptor {
+                return Ok(Expr::new(span, ExprNode::Lit {
+                    value: Literal::Str { value: descriptor.into() },
+                }));
             }
-            let name: Option<String> = if let Some(c) = inner.as_call_node() {
-                let bareword = c.receiver().is_none()
-                    && c.arguments().is_none()
-                    && c.block().is_none();
-                if bareword {
-                    Some(constant_id_str(&c.name()).to_string())
-                } else {
-                    None
-                }
-            } else if let Some(lv) = inner.as_local_variable_read_node() {
-                Some(constant_id_str(&lv.name()).to_string())
+            // Only bareword partial locals need a special representation;
+            // native runtime operands use the syntax-only walker.
+            let bareword = inner.as_call_node().filter(|c| {
+                c.receiver().is_none() && c.arguments().is_none() && c.block().is_none()
+            });
+            let arg = if let Some(call) = bareword {
+                Expr::new(
+                    span,
+                    ExprNode::Var {
+                        id: crate::ident::VarId(0),
+                        name: Symbol::from(constant_id_str(&call.name())),
+                    },
+                )
+            } else if inner.as_local_variable_read_node().is_some()
+                || inner.as_instance_variable_read_node().is_some()
+            {
+                ingest_expr(&inner, file)?
+            } else if inner.as_call_node().is_some() || inner.as_constant_read_node().is_some()
+                || inner.as_constant_path_node().is_some() || inner.as_forwarding_super_node().is_some()
+                || inner.as_class_variable_read_node().is_some()
+            {
+                return Ok(Expr::new(span, ExprNode::Defined {
+                    operand: ingest_defined_operand(&inner, file)?,
+                }));
             } else {
-                None
+                return Err(IngestError::Unsupported {
+                    file: file.into(),
+                    message: format!("`defined?` does not support this target yet: {inner:?}"),
+                });
             };
-            match name {
-                Some(name) => {
-                    let var = Expr::new(
-                        Span::synthetic(),
-                        ExprNode::Var {
-                            id: crate::ident::VarId(0),
-                            name: Symbol::from(name),
-                        },
-                    );
-                    ExprNode::Send {
-                        recv: None,
-                        method: Symbol::from("defined?"),
-                        args: vec![var],
-                        block: None,
-                        parenthesized: true,
-                    }
-                }
-                None => {
-                    return Err(IngestError::Unsupported {
-                        file: file.into(),
-                        message: format!(
-                            "`defined?` only supports bareword targets today: {inner:?}"
-                        ),
-                    });
-                }
+            ExprNode::Send {
+                recv: None,
+                method: Symbol::from("defined?"),
+                args: vec![arg],
+                block: None,
+                parenthesized: true,
             }
         }
         n if n.as_symbol_node().is_some() => {
@@ -686,6 +753,28 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         n if n.as_true_node().is_some() => ExprNode::Lit { value: Literal::Bool { value: true } },
         n if n.as_false_node().is_some() => ExprNode::Lit { value: Literal::Bool { value: false } },
         n if n.as_nil_node().is_some() => ExprNode::Lit { value: Literal::Nil },
+        // `__FILE__` — Ruby's magic constant for the current source
+        // file. Every target needs SOME literal here (Spinel included),
+        // and the path is a static fact the ingest already knows (`file`
+        // is exactly this file's identity), so there's no reason to
+        // treat it as a runtime-only construct. Rendered relative to the
+        // app root rather than verbatim (`file` is often an absolute
+        // filesystem path built from wherever the app was ingested from)
+        // so the literal doesn't bake a local machine's path into the
+        // emitted program. A read of `__FILE__` types as `Str` like any
+        // other string literal, so `File.expand_path('..', __FILE__)`
+        // and friends type-check through it for free.
+        n if n.as_source_file_node().is_some() => {
+            ExprNode::Lit { value: Literal::Str { value: super::sources::relative_path(file) } }
+        }
+        // `__LINE__` uses this parse's bytes, not an older registration of
+        // the same filename. ERB later translates it to the template line.
+        n if n.as_source_line_node().is_some() => {
+            let location = n.location();
+            let line = super::sources::line_at_parse(&location)
+                .or_else(|| super::sources::line_at(file, location.start_offset())).unwrap_or(1);
+            ExprNode::Lit { value: Literal::Int { value: line as i64 } }
+        }
         n if n.as_statements_node().is_some() => {
             let stmts = n.as_statements_node().unwrap();
             // The StatementsNode's own location slice is the source for
@@ -820,28 +909,18 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         }
         n if n.as_lambda_node().is_some() => {
             let l = n.as_lambda_node().unwrap();
-            let params = l
-                .parameters()
-                .and_then(|p| {
-                    p.as_block_parameters_node().and_then(|bpn| bpn.parameters())
-                })
-                .map(|pn| {
-                    pn.requireds()
-                        .iter()
-                        .filter_map(|req| req.as_required_parameter_node())
-                        .map(|rp| Symbol::from(constant_id_str(&rp.name())))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+            let params = block_param_names(l.parameters());
+            let mut rest_param = block_rest_param(l.parameters());
             let body = match l.body() {
                 Some(b) => ingest_expr(&b, file)?,
                 None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
             };
+            let body = desugar_post_params(&mut rest_param, block_post_params(l.parameters()), body);
             // `->(x) { body }` literals always use brace form (Prism's
             // opening_loc is `{`); `->(x) do body end` exists but isn't
             // idiomatic and doesn't appear in any fixture yet.
             let block_style = block_style_from_opening(l.opening_loc().as_slice());
-            ExprNode::Lambda { rest_param: None, params, block_param: None, body, block_style }
+            ExprNode::Lambda { rest_param, params, block_param: None, body, block_style }
         }
         n if n.as_yield_node().is_some() => {
             let y = n.as_yield_node().unwrap();
@@ -918,6 +997,24 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
                 value,
             }
         }
+        // `@@x = y` in a method body (as opposed to the class-body
+        // initializer `library_class.rs` handles separately). Mirrors
+        // the local-variable-write arm just above rather than the ivar
+        // one: like `n.as_class_variable_read_node()` below, the
+        // `@@`-prefixed name rides straight into `LValue::Var` so the
+        // sigil round-trips on emit (`LValue::Var { name, .. } =>
+        // name.to_string()` in `emit/ruby/expr.rs`) without a dedicated
+        // class-variable target — we don't model class-variable storage
+        // any more richly than that.
+        n if n.as_class_variable_write_node().is_some() => {
+            let w = n.as_class_variable_write_node().unwrap();
+            let name = Symbol::from(constant_id_str(&w.name()));
+            let value = ingest_expr(&w.value(), file)?;
+            ExprNode::Assign {
+                target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name },
+                value,
+            }
+        }
         // `FOO = expr` — bare constant write. In a class body this is
         // a class-scoped constant; at top level it's a global constant.
         // Lowerers/emitters resolve the containing scope.
@@ -956,6 +1053,46 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             ExprNode::OpAssign {
                 target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name },
                 op: crate::expr::OpAssignOp::OrOr,
+                value,
+            }
+        }
+        // `@@x ||= y` — class var, short-circuit (the class-level
+        // memoization idiom, same shape as the local-var case above —
+        // see the plain `@@x = y` arm for why `LValue::Var` and not
+        // `LValue::Ivar` carries the `@@` sigil).
+        n if n.as_class_variable_or_write_node().is_some() => {
+            let w = n.as_class_variable_or_write_node().unwrap();
+            let name = Symbol::from(constant_id_str(&w.name()));
+            let value = ingest_expr(&w.value(), file)?;
+            ExprNode::OpAssign {
+                target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name },
+                op: crate::expr::OpAssignOp::OrOr,
+                value,
+            }
+        }
+        n if n.as_class_variable_and_write_node().is_some() => {
+            let w = n.as_class_variable_and_write_node().unwrap();
+            let name = Symbol::from(constant_id_str(&w.name()));
+            let value = ingest_expr(&w.value(), file)?;
+            ExprNode::OpAssign {
+                target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name },
+                op: crate::expr::OpAssignOp::AndAnd,
+                value,
+            }
+        }
+        n if n.as_class_variable_operator_write_node().is_some() => {
+            let w = n.as_class_variable_operator_write_node().unwrap();
+            let op = op_assign_op_from_binary(&constant_id_str(&w.binary_operator()))
+                .ok_or_else(|| IngestError::Unsupported {
+                    file: file.into(),
+                    message: format!("unsupported compound-assignment operator: {}", constant_id_str(&w.binary_operator())),
+                })?;
+            let value = ingest_expr(&w.value(), file)?;
+            ExprNode::OpAssign {
+                target: crate::expr::LValue::Var {
+                    id: crate::ident::VarId(0), name: Symbol::from(constant_id_str(&w.name())),
+                },
+                op,
                 value,
             }
         }
@@ -1789,6 +1926,62 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             }
             ExprNode::Case { scrutinee, arms }
         }
+        n if n.as_case_match_node().is_some() => {
+            // `case scrutinee; in pat [guard]; body; ... [else …] end`
+            // — Ruby 3's structural pattern matching. Each `InNode`
+            // contributes one `MatchArm`; `else` becomes `else_body`
+            // (not a synthetic wildcard arm — `CaseMatch` has real
+            // NoMatchingPatternError semantics when it's absent, so it
+            // needs to stay absent through the IR, not get folded into
+            // an arm the way `case/when`'s `else` does).
+            let case = n.as_case_match_node().unwrap();
+            let scrutinee = match case.predicate() {
+                Some(p) => ingest_expr(&p, file)?,
+                None => {
+                    return Err(IngestError::Unsupported {
+                        file: file.into(),
+                        message: "case/in with no scrutinee (predicate-less case)".to_string(),
+                    });
+                }
+            };
+            let mut arms: Vec<crate::expr::MatchArm> = Vec::new();
+            for cond in case.conditions().iter() {
+                let in_node = cond.as_in_node().ok_or_else(|| IngestError::Unsupported {
+                    file: file.into(),
+                    message: format!("unsupported case/in condition (expected in): {cond:?}"),
+                })?;
+                let body = match in_node.statements() {
+                    Some(s) => ingest_expr(&s.as_node(), file)?,
+                    None => Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
+                };
+                let (pattern, guard) = ingest_pattern_with_guard(&in_node.pattern(), file)?;
+                arms.push(crate::expr::MatchArm { pattern, guard, body });
+            }
+            let else_body = match case.else_clause() {
+                Some(else_clause) => Some(match else_clause.statements() {
+                    Some(s) => ingest_expr(&s.as_node(), file)?,
+                    None => Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
+                }),
+                None => None,
+            };
+            ExprNode::CaseMatch { scrutinee, arms, else_body }
+        }
+        // `value in pattern` — one-line pattern predicate, `true`/
+        // `false`, never raises.
+        n if n.as_match_predicate_node().is_some() => {
+            let m = n.as_match_predicate_node().unwrap();
+            let value = ingest_expr(&m.value(), file)?;
+            let pattern = ingest_pattern(&m.pattern(), file)?;
+            ExprNode::MatchPredicate { value, pattern }
+        }
+        // `value => pattern` — one-line pattern assertion: binds on
+        // match, raises `NoMatchingPatternError` otherwise.
+        n if n.as_match_required_node().is_some() => {
+            let m = n.as_match_required_node().unwrap();
+            let value = ingest_expr(&m.value(), file)?;
+            let pattern = ingest_pattern(&m.pattern(), file)?;
+            ExprNode::MatchRequired { value, pattern }
+        }
         // Ruby 3.1 hash/keyword value omission (`{short_id:}`,
         // `find_by!(short_id:)`) — prism wraps the implied value
         // (a local read or same-named method call, resolved at parse
@@ -1807,6 +2000,51 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         n if n.as_def_node().is_some() => {
             ExprNode::Lit { value: Literal::Nil }
         }
+        // Backticks / `%x{…}` — a shell-out (`Kernel#\``). Not a
+        // construct any target can run, and not worth pretending to
+        // model; ledgered by name so it stops reading as the generic
+        // "unsupported expression node" catch-all.
+        n if n.as_x_string_node().is_some() || n.as_interpolated_x_string_node().is_some() => {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: "shell command (backticks) is not modeled".into(),
+            });
+        }
+        // Prism's error-recovery node: the parser hit something it
+        // couldn't make sense of and inserted a placeholder to keep
+        // going. There is no real construct here to ingest — ledgered
+        // by name rather than falling through to the generic message,
+        // which would misleadingly imply a real Ruby node was rejected.
+        n if n.as_missing_node().is_some() => {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: "unparsed fragment (Prism recovery node)".into(),
+            });
+        }
+        // `$stdout = …` — a global-variable write. Reads of the same
+        // sigil already ingest (see `n.as_global_variable_read_node()`
+        // above); writing global state isn't modeled, and the specific
+        // message says exactly what's missing instead of the generic one.
+        n if n.as_global_variable_write_node().is_some() => {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: "global variable write".into(),
+            });
+        }
+        // `class`/`module` at expression position — e.g. inside a
+        // method or block body (`Class.new { class Foo; end }`,
+        // conditionally-defined classes). Unlike the class-BODY
+        // constructs `ingest::model`/`ingest::library_class` walk, a
+        // class or module built at runtime, mid-method, has no static
+        // home in the IR's class-table model — ledgered specifically
+        // rather than falling through to the generic message.
+        n if n.as_class_node().is_some() || n.as_module_node().is_some() => {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: "class/module defined inside a method or block (runtime class definition)"
+                    .into(),
+            });
+        }
         other => {
             return Err(IngestError::Unsupported {
                 file: file.into(),
@@ -1815,6 +2053,270 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         }
     };
     Ok(Expr::new(span, expr_node))
+}
+
+/// Ingest a `case/in` arm's pattern, unwrapping a guard first when the
+/// source wrote one. Prism has no dedicated guard field on `InNode` —
+/// `in pat if cond` / `in pat unless cond` are represented by wrapping
+/// the REAL pattern node inside an `IfNode`/`UnlessNode` whose
+/// `predicate` is the guard condition and whose single-statement
+/// `statements` holds the pattern. `MatchPredicateNode`/
+/// `MatchRequiredNode` never carry a guard, so they call
+/// [`ingest_pattern`] directly instead of this wrapper.
+fn ingest_pattern_with_guard(
+    node: &Node<'_>,
+    file: &str,
+) -> IngestResult<(crate::expr::MatchPattern, Option<(crate::expr::MatchGuardKind, Expr)>)> {
+    use crate::expr::MatchGuardKind;
+    fn unwrap_guarded_pattern<'pr>(
+        stmts: Option<ruby_prism::StatementsNode<'pr>>,
+        file: &str,
+    ) -> IngestResult<Node<'pr>> {
+        stmts
+            .and_then(|s| s.body().iter().next())
+            .ok_or_else(|| IngestError::Unsupported {
+                file: file.into(),
+                message: "case/in guard wraps no pattern statement".to_string(),
+            })
+    }
+    if let Some(if_node) = node.as_if_node() {
+        let guard_expr = ingest_expr(&if_node.predicate(), file)?;
+        let inner = unwrap_guarded_pattern(if_node.statements(), file)?;
+        let pattern = ingest_pattern(&inner, file)?;
+        return Ok((pattern, Some((MatchGuardKind::If, guard_expr))));
+    }
+    if let Some(unless_node) = node.as_unless_node() {
+        let guard_expr = ingest_expr(&unless_node.predicate(), file)?;
+        let inner = unwrap_guarded_pattern(unless_node.statements(), file)?;
+        let pattern = ingest_pattern(&inner, file)?;
+        return Ok((pattern, Some((MatchGuardKind::Unless, guard_expr))));
+    }
+    Ok((ingest_pattern(node, file)?, None))
+}
+
+/// Ingest one `case/in` pattern node — the guard-unwrapped `InNode`
+/// pattern, a nested sub-pattern inside `Array`/`Find`/`Hash`, or
+/// `MatchPredicateNode`/`MatchRequiredNode`'s bare `pattern`. Every
+/// Prism pattern node kind Ruby 3's grammar can produce is handled
+/// explicitly; anything left over falls through to plain
+/// [`ingest_expr`] and becomes a `Value` — safe because Ruby's pattern
+/// grammar already rejects an arbitrary expression here unless pinned
+/// (handled below), so whatever reaches the fallback is a literal,
+/// range, regex, or bare constant/class reference, exactly what
+/// `case/when`'s own `Pattern::Expr` escape hatch ingests the same way.
+/// A node `ingest_expr` itself doesn't know either surfaces as ITS OWN
+/// specifically-named `IngestError::Unsupported`, never a generic
+/// pattern-shaped one from here.
+fn ingest_pattern(node: &Node<'_>, file: &str) -> IngestResult<crate::expr::MatchPattern> {
+    use crate::expr::MatchPattern;
+
+    if let Some(p) = node.as_parentheses_node() {
+        let inner = p.body().ok_or_else(|| IngestError::Unsupported {
+            file: file.into(), message: "empty parenthesized pattern".into(),
+        })?;
+        return ingest_pattern(&inner, file);
+    }
+    if node.as_nil_node().is_some() {
+        return Ok(MatchPattern::Nil);
+    }
+    // Bare bind: `in name`. Ruby's pattern grammar never treats a
+    // plain identifier as a value test — that's what `^` is for — so
+    // this is unconditionally a Bind, never a Value.
+    if let Some(lvt) = node.as_local_variable_target_node() {
+        return Ok(MatchPattern::Bind { name: Symbol::from(constant_id_str(&lvt.name())) });
+    }
+    // `in ^name` (also covers `^@name`/`^$name`/`^@@name` — whichever
+    // of those `ingest_expr` resolves; only local/instance reads are
+    // modeled today, so a pinned global/class-var surfaces as ITS OWN
+    // unsupported-expression error from that call, not a pattern one).
+    if let Some(p) = node.as_pinned_variable_node() {
+        let expr = ingest_expr(&p.variable(), file)?;
+        return Ok(MatchPattern::Value { expr });
+    }
+    // `in ^(expr)`.
+    if let Some(p) = node.as_pinned_expression_node() {
+        let expr = ingest_expr(&p.expression(), file)?;
+        return Ok(MatchPattern::Value { expr });
+    }
+    // `in p1 | p2 | ... | pn` — Prism's left-associative binary tree
+    // flattens into one `Vec`; only `_`-prefixed bindings are legal.
+    if node.as_alternation_pattern_node().is_some() {
+        let mut alternatives = Vec::new();
+        flatten_alternation(node, file, &mut alternatives)?;
+        return Ok(MatchPattern::Alt { alternatives });
+    }
+    // `in pattern => name`.
+    if let Some(cap) = node.as_capture_pattern_node() {
+        let pattern = Box::new(ingest_pattern(&cap.value(), file)?);
+        let name = Symbol::from(constant_id_str(&cap.target().name()));
+        return Ok(MatchPattern::Capture { pattern, name });
+    }
+    // `in [a, b, *rest, c]` / `in Success(page)` / `in Success[a, b]`.
+    if let Some(arr) = node.as_array_pattern_node() {
+        return ingest_array_pattern(&arr, file);
+    }
+    // `in [*, x, y, *post]`.
+    if let Some(find) = node.as_find_pattern_node() {
+        return ingest_find_pattern(&find, file);
+    }
+    // `in {status: "ok", data:, **rest}` / `in Success(value:)`.
+    if let Some(h) = node.as_hash_pattern_node() {
+        return ingest_hash_pattern(&h, file);
+    }
+    let expr = ingest_expr(node, file)?;
+    Ok(MatchPattern::Value { expr })
+}
+
+/// Flatten Prism's left-associative `AlternationPatternNode` binary
+/// tree (`(a | b) | c` for source `a | b | c`) into one flat `Vec` in
+/// source order.
+fn flatten_alternation(
+    node: &Node<'_>,
+    file: &str,
+    out: &mut Vec<crate::expr::MatchPattern>,
+) -> IngestResult<()> {
+    if let Some(alt) = node.as_alternation_pattern_node() {
+        flatten_alternation(&alt.left(), file, out)?;
+        flatten_alternation(&alt.right(), file, out)?;
+    } else {
+        out.push(ingest_pattern(node, file)?);
+    }
+    Ok(())
+}
+
+/// Ingest an array pattern's `*`/`*name` rest marker — a `SplatNode`
+/// (name-optional: `Some` for `*rest`, `None` for a bare `*`) or an
+/// `ImplicitRestNode` (always bare, no name — the trailing-comma
+/// shape, `in [a, b,]`). Anything else is a defect in the caller: only
+/// these two node kinds ever appear in a pattern's rest position.
+fn splat_name(node: &Node<'_>, file: &str) -> IngestResult<Option<Symbol>> {
+    if let Some(s) = node.as_splat_node() {
+        return match s.expression() {
+            None => Ok(None),
+            Some(e) => {
+                let lvt = e.as_local_variable_target_node().ok_or_else(|| {
+                    IngestError::Unsupported {
+                        file: file.into(),
+                        message: format!("unsupported splat target in pattern: {e:?}"),
+                    }
+                })?;
+                Ok(Some(Symbol::from(constant_id_str(&lvt.name()))))
+            }
+        };
+    }
+    if node.as_implicit_rest_node().is_some() {
+        return Ok(None);
+    }
+    Err(IngestError::Unsupported {
+        file: file.into(),
+        message: format!("unsupported pattern rest node: {node:?}"),
+    })
+}
+
+fn ingest_array_pattern(
+    arr: &ruby_prism::ArrayPatternNode<'_>,
+    file: &str,
+) -> IngestResult<crate::expr::MatchPattern> {
+    use crate::expr::MatchPattern;
+    let constant = match arr.constant() {
+        Some(c) => Some(ingest_expr(&c, file)?),
+        None => None,
+    };
+    let pre = arr
+        .requireds()
+        .iter()
+        .map(|n| ingest_pattern(&n, file))
+        .collect::<IngestResult<Vec<_>>>()?;
+    let post = arr
+        .posts()
+        .iter()
+        .map(|n| ingest_pattern(&n, file))
+        .collect::<IngestResult<Vec<_>>>()?;
+    let rest = match arr.rest() {
+        None => None,
+        Some(r) => Some(splat_name(&r, file)?),
+    };
+    Ok(MatchPattern::Array { constant, pre, rest, post })
+}
+
+fn ingest_find_pattern(
+    find: &ruby_prism::FindPatternNode<'_>,
+    file: &str,
+) -> IngestResult<crate::expr::MatchPattern> {
+    use crate::expr::MatchPattern;
+    let constant = match find.constant() {
+        Some(c) => Some(ingest_expr(&c, file)?),
+        None => None,
+    };
+    let pre_rest = splat_name(&find.left().as_node(), file)?;
+    let middle = find
+        .requireds()
+        .iter()
+        .map(|n| ingest_pattern(&n, file))
+        .collect::<IngestResult<Vec<_>>>()?;
+    let post_rest = splat_name(&find.right(), file)?;
+    Ok(MatchPattern::Find { constant, pre_rest, middle, post_rest })
+}
+
+fn ingest_hash_pattern(
+    h: &ruby_prism::HashPatternNode<'_>,
+    file: &str,
+) -> IngestResult<crate::expr::MatchPattern> {
+    use crate::expr::MatchPattern;
+    let constant = match h.constant() {
+        Some(c) => Some(ingest_expr(&c, file)?),
+        None => None,
+    };
+    let mut pairs = Vec::new();
+    for el in h.elements().iter() {
+        let assoc = el.as_assoc_node().ok_or_else(|| IngestError::Unsupported {
+            file: file.into(),
+            message: format!("unsupported hash pattern element: {el:?}"),
+        })?;
+        let key = symbol_value(&assoc.key()).ok_or_else(|| IngestError::Unsupported {
+            file: file.into(),
+            message: format!("unsupported hash pattern key: {:?}", assoc.key()),
+        })?;
+        let value_node = assoc.value();
+        // Ruby 3.1 keyword-value-omission shorthand (`data:`): Prism
+        // wraps the implied `LocalVariableTargetNode` in an
+        // `ImplicitNode`. That IS what `MatchPattern::Hash`'s `None`
+        // pair value means, so unwrap and discard rather than
+        // ingesting the wrapped bind as an explicit sub-pattern (which
+        // would double-bind under a redundant `Bind` node).
+        let sub = if value_node.as_implicit_node().is_some() {
+            None
+        } else {
+            Some(ingest_pattern(&value_node, file)?)
+        };
+        pairs.push((Symbol::from(key.as_str()), sub));
+    }
+    let rest = match h.rest() {
+        None => None,
+        Some(r) => Some(ingest_hash_rest(&r, file)?),
+    };
+    Ok(MatchPattern::Hash { constant, pairs, rest })
+}
+
+fn ingest_hash_rest(node: &Node<'_>, file: &str) -> IngestResult<crate::expr::HashRest> {
+    use crate::expr::HashRest;
+    if node.as_no_keywords_parameter_node().is_some() {
+        return Ok(HashRest::Nil);
+    }
+    if let Some(splat) = node.as_assoc_splat_node() {
+        let Some(value) = splat.value() else { return Ok(HashRest::Ignore); };
+        let lvt = value.as_local_variable_target_node().ok_or_else(|| {
+            IngestError::Unsupported {
+                file: file.into(),
+                message: format!("unsupported hash pattern **rest target: {value:?}"),
+            }
+        })?;
+        return Ok(HashRest::Collect { name: Symbol::from(constant_id_str(&lvt.name())) });
+    }
+    Err(IngestError::Unsupported {
+        file: file.into(),
+        message: format!("unsupported hash pattern rest node: {node:?}"),
+    })
 }
 
 /// Map a Prism `binary_operator` symbol (`+`, `-`, `<<`, …) to the IR
@@ -1915,7 +2417,7 @@ fn ingest_index_argument(
 /// can share it.
 pub(super) fn ingest_ruby_program(source: &str, file: &str) -> IngestResult<Expr> {
     super::sources::register(file, source);
-    // Raw parse, NOT the parse-diagnostic wrapper: `source` here is the
+    // Silent parse, NOT the parse-diagnostic wrapper: `source` here is the
     // compiled-from-ERB buffer (or a seeds script), parsed out of its
     // true method-body context. Prism flags context-only errors on it —
     // a layout's `<%= yield %>` compiles to a top-level `yield`, which is
@@ -1923,7 +2425,7 @@ pub(super) fn ingest_ruby_program(source: &str, file: &str) -> IngestResult<Expr
     // method roundhouse ingests it into. Reporting those would be a false
     // positive on every layout, so this path stays silent (as it was
     // before the wrapper); real `.rb` source files report via the wrapper.
-    let result = ruby_prism::parse(source.as_bytes());
+    let result = super::prism::parse_silent(source.as_bytes());
     let root = result.node();
     let program = root.as_program_node().ok_or_else(|| IngestError::Parse {
         file: file.into(),
@@ -1979,6 +2481,26 @@ fn ingest_forwardable_arguments(
                 end: loc.end_offset() as u32,
             }, ExprNode::ForwardArgs));
         } else {
+            if let Some(hash) = arg.as_keyword_hash_node() {
+                let elements: Vec<_> = hash.elements().iter().collect();
+                if elements.iter().any(|e| e.as_assoc_splat_node().is_some_and(|s| s.value().is_none())) {
+                    if elements.len() != 1 {
+                        // Mixed forwarding remains outside this slice. Keep
+                        // its existing ledger identity; only lone `**` is new.
+                        return Err(IngestError::Unsupported {
+                            file: file.into(),
+                            message: "anonymous `**` keyword forwarding not yet supported".into(),
+                        });
+                    }
+                    let loc = elements[0].location();
+                    args.push(Expr::new(Span {
+                        file: super::sources::file_id(file),
+                        start: loc.start_offset() as u32,
+                        end: loc.end_offset() as u32,
+                    }, ExprNode::ForwardKeywords));
+                    continue;
+                }
+            }
             let value = ingest_expr(&arg, file)?;
             // Only a CALL's KeywordHashNode owns this fact. `{**h}`
             // remains an ordinary positional hash/merge expression.
@@ -2139,11 +2661,12 @@ fn ingest_call_block(
             // which is immaterial once it sits in block-argument position.
             if let Some(lam) = expr.as_lambda_node() {
                 let params = block_param_names(lam.parameters());
-                let rest_param = block_rest_param(lam.parameters());
+                let mut rest_param = block_rest_param(lam.parameters());
                 let body = match lam.body() {
                     Some(body) => ingest_expr(&body, file)?,
                     None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
                 };
+                let body = desugar_post_params(&mut rest_param, block_post_params(lam.parameters()), body);
                 let block_style = block_style_from_opening(lam.opening_loc().as_slice());
                 return Ok(Some(Expr::new(
                     Span::synthetic(),
@@ -2204,11 +2727,12 @@ fn ingest_call_block(
 /// `proc`/`lambda` call's own block).
 fn ingest_block_node_as_lambda(b: &ruby_prism::BlockNode<'_>, file: &str) -> IngestResult<Expr> {
     let params = block_param_names(b.parameters());
-    let rest_param = block_rest_param(b.parameters());
+    let mut rest_param = block_rest_param(b.parameters());
     let body = match b.body() {
         Some(body) => ingest_expr(&body, file)?,
         None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
     };
+    let body = desugar_post_params(&mut rest_param, block_post_params(b.parameters()), body);
     let block_style = block_style_from_opening(b.opening_loc().as_slice());
     Ok(Expr::new(
         Span::synthetic(),
@@ -2289,6 +2813,65 @@ fn block_rest_param(params_node: Option<Node<'_>>) -> Option<Symbol> {
     let rest = pn.rest()?;
     let rp = rest.as_rest_parameter_node()?;
     Some(Symbol::from(constant_id_str(&rp.name()?)))
+}
+
+/// The parameters AFTER a block's or lambda's rest (`|*, payload|`,
+/// `->(*rest, a, b)`): Prism's `posts`, required names only.
+fn block_post_params(params_node: Option<Node<'_>>) -> Vec<Symbol> {
+    let Some(params_node) = params_node else { return vec![] };
+    let Some(bpn) = params_node.as_block_parameters_node() else { return vec![] };
+    let Some(pn) = bpn.parameters() else { return vec![] };
+    pn.posts()
+        .iter()
+        .filter_map(|post| post.as_required_parameter_node())
+        .map(|rp| Symbol::from(constant_id_str(&rp.name())))
+        .collect()
+}
+
+/// Lambda IR has no slot for parameters after a rest, and dropping them
+/// left the body reading names nothing bound: campfire's query counters
+/// (`->(*, payload) { payload[:sql] }`) emitted as `-> { payload[:sql] }`.
+/// Ruby's rule is that the rest takes everything but the trailing
+/// parameters, so name the rest (`__rest` when it is anonymous) and pop
+/// them off it, last first, ahead of the body. A named rest is left
+/// holding exactly what Ruby gives it. The one difference: too few
+/// arguments bind nil where a lambda would raise ArgumentError.
+fn desugar_post_params(rest_param: &mut Option<Symbol>, posts: Vec<Symbol>, body: Expr) -> Expr {
+    if posts.is_empty() {
+        return body;
+    }
+    let rest = rest_param.get_or_insert_with(|| Symbol::from("__rest")).clone();
+    let mut exprs: Vec<Expr> = posts
+        .into_iter()
+        .rev()
+        .map(|name| {
+            let pop = Expr::new(
+                Span::synthetic(),
+                ExprNode::Send {
+                    recv: Some(Expr::new(
+                        Span::synthetic(),
+                        ExprNode::Var { id: crate::ident::VarId(0), name: rest.clone() },
+                    )),
+                    method: Symbol::from("pop"),
+                    args: vec![],
+                    block: None,
+                    parenthesized: false,
+                },
+            );
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::Assign {
+                    target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name },
+                    value: pop,
+                },
+            )
+        })
+        .collect();
+    match *body.node {
+        ExprNode::Seq { exprs: inner } => exprs.extend(inner),
+        other => exprs.push(Expr::new(body.span, other)),
+    }
+    Expr::new(Span::synthetic(), ExprNode::Seq { exprs })
 }
 
 /// Map the operator bytes of an `OrNode` / `AndNode` to the surface form.
@@ -2419,17 +3002,14 @@ fn ingest_hash_literal(
                 message: format!("unsupported hash element: {el:?}"),
             });
         };
-        // Anonymous `**` forwarding (`def f(**) ; g(**) ; end`) has no
-        // value to merge, and the declaration side drops the unnamed
-        // parameter — fail loud rather than emit a silently empty hash.
-        let Some(value) = splat.value() else {
-            return Err(IngestError::Unsupported {
-                file: file.into(),
-                message: "anonymous `**` keyword forwarding not yet supported".into(),
-            });
-        };
-        saw_splat = true;
+        // Nameless call forwarding is an opaque packet, handled by the
+        // argument-list walk. It cannot be used as an ordinary hash value.
+        let value = splat.value().ok_or_else(|| IngestError::Unsupported {
+            file: file.into(),
+            message: "anonymous `**` outside a call argument is not supported".into(),
+        })?;
         let value = ingest_expr(&value, file)?;
+        saw_splat = true;
         chain = Some(merge_into(chain, std::mem::take(&mut pending), span, value));
     }
 

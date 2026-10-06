@@ -70,7 +70,9 @@ require_relative "../app/models"
 # that did not exist. campfire's `vips_loader_policy_test` asks
 # `Vips.vips_foreign_find_load` for a BMP and expects nil; without this
 # line it got "VipsForeignLoadMagickFile" and nine tests read as a
-# missing feature rather than a missing require.
+# missing feature rather than a missing require. The processor also
+# wraps find_load itself: applying the policy is not enough on libvips
+# 8.14, which still names a blocked Magick/Svg loader.
 #
 # After app/models.rb, so `Rails.application`'s reopen (the lifted
 # policy) is defined before the file reads it — boot.rb's own order,
@@ -235,6 +237,8 @@ module Dom
   # the tag.
   def self.select(root, selector)
     chunk = target_chunk(selector)
+    negated = negated_attrs(chunk)
+    chunk = without_negations(chunk)
     base = chunk.split("[")[0].to_s
     want_tag = selector_tag(base)
     want_id = selector_id(base)
@@ -256,7 +260,11 @@ module Dom
         present = tag_classes(tag)
         want_classes.each { |c| ok = false unless present.include?(c) }
       end
-      attrs.each { |a| ok = false unless tag.include?(a) }
+      # An attribute value matches as written or HTML-escaped: the tag
+      # helper escapes `>` (`change-&gt;form#submit`) where a hand-written
+      # attribute keeps it, and assert_select compares decoded values.
+      attrs.each { |a| ok = false unless attr_matches?(tag, a) }
+      negated.each { |a| ok = false if attr_present?(tag, a) }
       nodes << root if ok
     end
     nodes
@@ -393,6 +401,68 @@ module Dom
   # UNPASSABLE rather than loose: `assert_select
   # "turbo-stream[action='append']"` could not succeed against a body
   # that contained exactly that element.
+  # `:not([checked])` — the attribute predicates a match must NOT carry
+  # (campfire's `input.switch__input[type=checkbox]:not([checked])`).
+  # Attribute predicates only; anything else inside `:not` is left out of
+  # the match rather than read as required.
+  def self.negated_attrs(chunk)
+    out = []
+    from = 0
+    while (at = chunk.index(":not(", from))
+      close = chunk.index(")", at)
+      break if close.nil?
+      inner = chunk[at + 5, close - at - 5].to_s
+      selector_attrs(inner).each { |a| out << a }
+      from = close + 1
+    end
+    out
+  end
+
+  def self.without_negations(chunk)
+    out = ""
+    from = 0
+    while (at = chunk.index(":not(", from))
+      close = chunk.index(")", at)
+      break if close.nil?
+      out = out + chunk[from, at - from].to_s
+      from = close + 1
+    end
+    out + chunk[from, chunk.length].to_s
+  end
+
+  # One positive attribute predicate against a start tag. A value
+  # matches as written or HTML-escaped: the tag helper escapes `>`
+  # (`change-&gt;form#submit`) where a hand-written attribute keeps it,
+  # and assert_select compares decoded values.
+  def self.attr_matches?(tag, pred)
+    ["*=", "^=", "$="].each do |op|
+      at = pred.index(op)
+      next if at.nil? || pred.include?("=\"")
+      name = pred[0, at].to_s
+      want = pred[at + 2, pred.length].to_s
+      start = tag.index(" #{name}=\"")
+      return false if start.nil?
+      rest = tag[start + name.length + 3, tag.length].to_s
+      close = rest.index("\"")
+      value = close.nil? ? rest : rest[0, close].to_s
+      escaped = want.gsub(">", "&gt;").gsub("<", "&lt;")
+      return case op
+             when "*=" then value.include?(want) || value.include?(escaped)
+             when "^=" then value.start_with?(want) || value.start_with?(escaped)
+             else value.end_with?(want) || value.end_with?(escaped)
+             end
+    end
+    tag.include?(pred) || tag.include?(pred.gsub(">", "&gt;").gsub("<", "&lt;"))
+  end
+
+  # Whether a start tag carries the attribute a predicate names: a
+  # `name="value"` predicate is matched whole, a bare name at a word
+  # boundary, so `checked` does not hold on `data-checked-by`.
+  def self.attr_present?(tag, pred)
+    return tag.include?(pred) if pred.include?("=")
+    [" #{pred}=", " #{pred} ", " #{pred}>", " #{pred}/"].any? { |form| tag.include?(form) }
+  end
+
   def self.selector_attrs(chunk)
     out = []
     parts = chunk.split("[")
@@ -405,7 +475,16 @@ module Dom
       else
         name = pred[0, eq].to_s
         value = pred[eq + 1, pred.length].to_s.gsub("'", "").gsub("\"", "")
-        out << %(#{name}="#{value}")
+        # `*=` / `^=` / `$=` — substring, prefix and suffix matches
+        # (campfire's `img[src*='install-edge']`). Kept as the operator
+        # spelled out, which `attr_matches?` reads; `=` stays the literal
+        # `name="value"` every other caller already matches.
+        op = name[-1, 1].to_s
+        if op == "*" || op == "^" || op == "$"
+          out << "#{name[0, name.length - 1]}#{op}=#{value}"
+        else
+          out << %(#{name}="#{value}")
+        end
       end
       i += 1
     end
@@ -480,9 +559,15 @@ end
 # method, and clearing would hide what an earlier block did.
 module ActiveJob
   module TestHelper
+    # With a block, the jobs the block enqueues; without one, every job
+    # enqueued since the test began, which is what Rails' blockless
+    # `assert_enqueued_with` / `assert_enqueued_jobs` read.
     def capture_enqueued_jobs(only, &block)
-      before = ActiveJob.performed.length
-      block.call
+      before = @__jobs_from || 0
+      if block
+        before = ActiveJob.performed.length
+        block.call
+      end
       ActiveJob.performed[before..].select { |name| only.empty? || only.include?(name) }
     end
 
@@ -506,7 +591,12 @@ module ActiveJob
     #
     # `ensure`, and a STACK in `ActiveJob`, so a nested block and a
     # raising one both restore what they found.
+    # Without a block, Rails runs what the `:test` adapter already holds.
     def perform_enqueued_jobs(only: [], &block)
+      if block.nil?
+        ActiveJob.perform_held(only)
+        return nil
+      end
       ActiveJob.run_enqueued
       begin
         block.call
@@ -597,6 +687,23 @@ module ActionDispatch
       ActionDispatch::Http::UploadedFile.new(
         File.binread(File.join(__dir__, "fixtures", "files", name)), name, content_type
       )
+    end
+  end
+end
+
+# rack-test's `Rack::Test::UploadedFile`, in the form that hands it a
+# StringIO — campfire's undecodable-image test builds one from half a
+# WebP. Rack turns it into an `ActionDispatch::Http::UploadedFile` on
+# the way into params, so here it IS one: the controller's
+# `from_params` takes it as the file it would see in production.
+# rack-test requires `original_filename` for a StringIO; the path form
+# (copying a file on disk into a tempfile) is not modeled.
+module Rack
+  module Test
+    class UploadedFile < ActionDispatch::Http::UploadedFile
+      def initialize(io, content_type = "text/plain", binary = false, original_filename:)
+        super(io.read, original_filename, content_type)
+      end
     end
   end
 end
@@ -710,6 +817,133 @@ end
 class TestSkipped < Exception
 end
 
+# ---- Caching knobs a test turns ---------------------------------------
+#
+# campfire's messages caching test (basecamp/once-campfire#292) swaps in
+# a memory store and turns caching on around one block, through Rails'
+# four knobs, then asserts a cached page runs no presentation queries.
+# The runtime fragment-caches message partials in its own store; these
+# give the test the settings it reads and restores. `MemoryStore` is the
+# store class `Rails.cache` already answers with on this tree.
+module Rails
+  def self.cache=(store)
+    @cache_store = store
+  end
+end
+
+module ActiveSupport
+  module Cache
+    class MemoryStore
+      def self.new
+        Rails.cache.class.new
+      end
+    end
+  end
+end
+
+module ActionView
+  class PartialRenderer
+    def self.collection_cache
+      @collection_cache
+    end
+
+    def self.collection_cache=(store)
+      @collection_cache = store
+    end
+  end
+end
+
+module ActionController
+  class Base
+    def self.cache_store
+      @cache_store
+    end
+
+    def self.cache_store=(store)
+      @cache_store = store
+    end
+
+    def self.perform_caching
+      @perform_caching
+    end
+
+    def self.perform_caching=(value)
+      @perform_caching = value
+    end
+  end
+end
+
+# ---- Query assertions ------------------------------------------------
+#
+# Rails' `ActiveSupport::Notifications.subscribed(callback,
+# "sql.active_record") { … }` and the `ActiveRecord::Assertions::
+# QueryAssertions` built on it, over `Db.capture_sql`, which records
+# every statement a prepare/exec issues and skips a query-cache replay,
+# as Rails' counter skips CACHE events. The callback gets Rails' five
+# arguments; the payload carries `:sql` and `:name` ("SQL", since the
+# runtime does not name its queries). Called after the block rather than
+# during it, which no test can tell: they collect, then inspect.
+module ActiveSupport
+  module Notifications
+    def self.subscribed(callback, name, &block)
+      return block.call unless name == "sql.active_record"
+      result = nil
+      statements = Db.capture_sql { result = block.call }
+      statements.each { |sql| callback.call(name, nil, nil, nil, { sql: sql, name: "SQL" }) }
+      result
+    end
+  end
+end
+
+module ActiveRecord
+  module Assertions
+    module QueryAssertions
+      # Statements the block issued. Schema introspection is left out,
+      # as Rails leaves out SCHEMA-named queries, unless asked for.
+      def capture_queries(include_schema, &block)
+        result = nil
+        statements = Db.capture_sql { result = block.call }
+        unless include_schema
+          statements = statements.reject { |sql| sql.start_with?("PRAGMA") || sql.include?("sqlite_master") || sql.include?("sqlite_schema") }
+        end
+        [result, statements]
+      end
+
+      def assert_queries_count(count = nil, include_schema: false, &block)
+        result, statements = capture_queries(include_schema, &block)
+        if count.nil?
+          raise "expected at least one query, got none" if statements.empty?
+        elsif statements.length != count
+          raise "expected #{count} queries, got #{statements.length}:\n#{statements.join("\n")}"
+        end
+        result
+      end
+
+      def assert_no_queries(include_schema: false, &block)
+        assert_queries_count(0, include_schema: include_schema, &block)
+      end
+
+      def assert_queries_match(match, count: nil, include_schema: false, &block)
+        result, statements = capture_queries(include_schema, &block)
+        matched = statements.select { |sql| match === sql }
+        if count.nil?
+          raise "expected a query matching #{match.inspect}, got:\n#{statements.join("\n")}" if matched.empty?
+        elsif matched.length != count
+          raise "expected #{count} queries matching #{match.inspect}, got #{matched.length}"
+        end
+        result
+      end
+
+      def assert_no_queries_match(match, include_schema: false, &block)
+        result, statements = capture_queries(include_schema, &block)
+        matched = statements.select { |sql| match === sql }
+        raise "expected no query matching #{match.inspect}, got:\n#{matched.join("\n")}" unless matched.empty?
+        result
+      end
+    end
+  end
+end
+
 class TestBase
   # Rails puts both of these on `ActiveSupport::TestCase` itself, so a
   # test that never writes `include ActiveJob::TestHelper` still has
@@ -718,6 +952,8 @@ class TestBase
   # a module twice is inert.
   include ActiveJob::TestHelper
   include ActionCable::TestHelper
+  # Rails 7.2 puts the query assertions on every ActiveSupport::TestCase.
+  include ActiveRecord::Assertions::QueryAssertions
   include ActionDispatch::TestProcess
 
   # Zero-arg initializer; the shim does `__t = XTest.new` per test
@@ -740,6 +976,17 @@ class TestBase
     # `assert_turbo_stream_broadcasts` does (see its note) would carry
     # one test's broadcasts into the next.
     Broadcasts.reset_log! if defined?(Broadcasts)
+    # Rails' `:test` job adapter starts each test empty. AFTER the
+    # schema reset for the same reason as the log above: fixture
+    # callbacks enqueue.
+    if defined?(ActiveJob)
+      ActiveJob.clear_held
+      @__jobs_from = ActiveJob.performed.length
+    end
+    # Rails' integration test clears the :test delivery log around every
+    # test (`ActionMailer::TestCase::ClearTestDeliveries`); the mailer
+    # assertions below count from it.
+    ActionMailer::Base.deliveries.clear if defined?(ActionMailer)
     # WebMock's stub registry is a GLOBAL, and its Minitest integration
     # empties it in an `after_teardown` hook this TestBase never runs —
     # the helper is deliberately Minitest-free, which is the same reason
@@ -975,6 +1222,48 @@ class TestBase
     end
     return if to.nil? || after == to
     raise(message || "assert_changes failed: expected #{to.inspect}, got #{after.inspect}")
+  end
+
+  # `assert_no_changes -> { @user.reload.password_digest } do … end` —
+  # the Rails 8 authentication generator's mismatched-password test.
+  def assert_no_changes(expression, message = nil, &block)
+    before = expression.call
+    block.call
+    after = expression.call
+    return if after == before
+    raise(message || "assert_no_changes failed: #{before.inspect} changed to #{after.inspect}")
+  end
+
+  # ---- ActionMailer::TestHelper -----------------------------------
+  #
+  # `deliver_later` collects into `ActionMailer::Base.deliveries` as it
+  # is called (runtime/action_mailer.rb: no queue in one process), so the
+  # deliveries ARE the enqueued mail, and `setup` clears them the way
+  # Rails' integration test does (`ClearTestDeliveries`).
+  #
+  # DIVERGENCE, stated rather than hidden: a `deliver_now` lands in the
+  # same list, so it counts as enqueued here; and only the COUNT is
+  # checked — a Message does not carry the mailer class, action, or
+  # arguments that built it, the same narrowing `assert_enqueued_with`
+  # documents for jobs.
+  #
+  # `assert_enqueued_emails 0` (no block) counts everything this test
+  # has sent so far; with a block, what the block sent.
+  def assert_enqueued_emails(count)
+    before = block_given? ? ActionMailer::Base.deliveries.length : 0
+    yield if block_given?
+    actual = ActionMailer::Base.deliveries.length - before
+    return if actual == count
+    raise("assert_enqueued_emails failed: expected #{count} email(s), got #{actual}")
+  end
+
+  # `assert_enqueued_email_with PasswordsMailer, :reset, args: [ @user ]`.
+  # `mailer` arrives as the class NAME (`lower::job_test_only`).
+  def assert_enqueued_email_with(mailer, method, args: nil)
+    before = block_given? ? ActionMailer::Base.deliveries.length : 0
+    yield if block_given?
+    return if ActionMailer::Base.deliveries.length > before
+    raise("assert_enqueued_email_with failed: no #{mailer}##{method} email was enqueued")
   end
 end
 
@@ -1501,16 +1790,39 @@ module RequestDispatch
     # yielder forwarded through a second yielder types its block value
     # once for every site (matz/spinel#4495), and campfire's web-push
     # handler already wraps with a block of another type.
+    #
+    # A GET/HEAD reads through one snapshot, as the dispatcher serves it,
+    # so the suite exercises the same transaction shape production does.
+    snapshot = method == "GET" || method == "HEAD"
     if Db.in_lease?
-      controller.process_action(matched.action)
+      Db.read_snapshot_begin if snapshot
+      begin
+        controller.process_action(matched.action)
+      ensure
+        Db.read_snapshot_end if snapshot
+      end
     else
-      Db.with_connection { controller.process_action(matched.action) }
+      Db.with_connection do
+        Db.read_snapshot_begin if snapshot
+        begin
+          controller.process_action(matched.action)
+        ensure
+          Db.read_snapshot_end if snapshot
+        end
+      end
     end
     @__flash = controller.flash
     # Fold this response's Set-Cookie writes back into the browser.
     @__cookies = ActionController::CookieJar.new(
       accept_cookies(cookies.to_h, controller.cookies.pending)
     )
+    copied_headers = {}
+    hi = 0
+    hn = controller.headers.size
+    while hi < hn
+      copied_headers[controller.headers.key_at(hi)] = controller.headers.val_at(hi)
+      hi += 1
+    end
     @__response = ActionResponse.new(
       status:   controller.status,
       body:     controller.body,
@@ -1520,7 +1832,7 @@ module RequestDispatch
       content_type: controller.content_type,
       cache_control_max_age: controller.cache_control_max_age,
       cache_control_public: controller.cache_control_public,
-      headers:  controller.headers,
+      headers:  copied_headers,
     )
     # Rails' OWN names, alongside the `__`-prefixed ones the harness
     # methods read. An integration test writes `@response.body` and
@@ -1612,7 +1924,11 @@ module RequestDispatch
     error:    500..599,
   }.freeze
 
-  def assert_response(expected, response = @__response)
+  # Rails' second argument is a failure message, which campfire passes
+  # when it checks several responses in one test
+  # (`assert_response :success, platform`).
+  def assert_response(expected, message = nil)
+    response = @__response
     actual = response.status
     matches = if expected.is_a?(Symbol)
                 range = STATUS_RANGES[expected]
@@ -1631,7 +1947,10 @@ module RequestDispatch
     # body emits as a vacuous 0 and lets failures pass silently. Same
     # rationale for the other helpers in this file. See
     # project_spinel_assertions_vacuous.md.
-    raise "expected response #{expected.inspect}, got status=#{actual} body=#{response.body[0, 200].inspect}" unless matches
+    unless matches
+      detail = "expected response #{expected.inspect}, got status=#{actual} body=#{response.body[0, 200].inspect}"
+      raise(message.nil? ? detail : "#{message}: #{detail}")
+    end
   end
 
   # Two-argument form retained for hand-written spinel-blog tests

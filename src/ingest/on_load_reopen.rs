@@ -47,7 +47,7 @@
 use ruby_prism::Node;
 
 use crate::app::App;
-use crate::ident::Symbol;
+use crate::ident::{ClassId, Symbol};
 
 use super::util::{
     class_name_path, constant_id_str, constant_path_of, find_all_classes_with_scope,
@@ -103,6 +103,20 @@ pub(super) fn ingest_on_load_reopens(source: &[u8], file: &str, app: &mut App) {
                          load-hook mixin installation is unsupported"
                     ),
                 });
+                // Class-method macros may still expand at ingest
+                // (`App.load_hook_class_macros`). Mixin instance
+                // methods stay uninstalled — that is the gap this
+                // survey line names.
+                if hook == "active_record" {
+                    for arg in include.arguments().iter().flat_map(|a| a.arguments().iter()) {
+                        if let Some(path) = constant_path_of(&arg) {
+                            let id = ClassId(Symbol::from(path.join("::")));
+                            if !app.load_hook_class_macros.contains(&id) {
+                                app.load_hook_class_macros.push(id);
+                            }
+                        }
+                    }
+                }
             }
         }
 

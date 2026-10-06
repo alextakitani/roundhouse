@@ -898,6 +898,10 @@ fn cookie_jar_ty() -> Ty {
     Ty::Class { id: ClassId(Symbol::from("ActionController::CookieJar")), args: vec![] }
 }
 
+fn permanent_cookie_jar_ty() -> Ty {
+    Ty::Class { id: ClassId(Symbol::from("ActionController::PermanentCookieJar")), args: vec![] }
+}
+
 fn signed_cookie_jar_ty() -> Ty {
     Ty::Class { id: ClassId(Symbol::from("ActionController::SignedCookieJar")), args: vec![] }
 }
@@ -916,7 +920,7 @@ fn insert_cookie_jar_baseline(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("raw", fn_sig(vec![key()], Ty::Str)),
         ("raw_set", fn_sig(vec![key(), value()], Ty::Str)),
         ("delete", fn_sig(vec![key()], Ty::Str)),
-        ("permanent", fn_sig(vec![], cookie_jar_ty())),
+        ("permanent", fn_sig(vec![], permanent_cookie_jar_ty())),
         ("signed", fn_sig(vec![], signed_cookie_jar_ty())),
         ("pending", fn_sig(vec![], str_hash.clone())),
         ("to_h", fn_sig(vec![], str_hash.clone())),
@@ -971,6 +975,24 @@ fn insert_cookie_jar_baseline(classes: &mut HashMap<ClassId, ClassInfo>) {
         signed.clone(),
     );
     classes.insert(ClassId(Symbol::from("SignedCookieJar")), signed);
+
+    // `cookies.permanent`: the unsigned jar's surface, writes expiring.
+    let mut permanent = ClassInfo::default();
+    for (name, sig) in [
+        ("[]", fn_sig(vec![key()], Ty::Str)),
+        ("[]=", fn_sig(vec![key(), value()], Ty::Str)),
+        ("delete", fn_sig(vec![key()], Ty::Str)),
+        ("signed", fn_sig(vec![], signed_cookie_jar_ty())),
+    ] {
+        let sym = Symbol::from(name);
+        permanent.instance_methods.insert(sym.clone(), sig);
+        permanent.instance_method_kinds.insert(sym, AccessorKind::Method);
+    }
+    classes.insert(
+        ClassId(Symbol::from("ActionController::PermanentCookieJar")),
+        permanent.clone(),
+    );
+    classes.insert(ClassId(Symbol::from("PermanentCookieJar")), permanent);
 }
 
 /// Insert a `Minitest::Test` ClassInfo entry — the parent of every

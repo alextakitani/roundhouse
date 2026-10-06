@@ -70,14 +70,21 @@ module Rails
       @base = base
     end
 
-    def join(part)
-      AppPath.new(@base + "/" + part)
+    # Pathname#join takes any number of parts
+    # (`Rails.root.join("source", "posts")`), and with none it answers
+    # the path itself.
+    def join(*parts)
+      if parts.empty?
+        self
+      else
+        AppPath.new(@base + "/" + parts.join("/"))
+      end
     end
 
     # `Rails.root + "storage/x"` — Pathname#+ is a path join, not string
     # concatenation, so it is `join` under another name.
     def +(part)
-      AppPath.new(@base + "/" + part)
+      join(part)
     end
 
     def to_s
@@ -216,7 +223,8 @@ module Rails
       k = key.to_s
       return nil unless @entries.key?(k)
       due = @expires_at[k]
-      return @entries[k] if due == 0 || due > Time.now.to_i
+      return @entries[k] if due == 0
+      return @entries[k] if due > Time.now.to_i
       forget(k)
       nil
     end
@@ -479,14 +487,23 @@ module Rails
     # user uploads sets before any image is decoded. Lifted at ingest
     # onto the reopen, the same way as the trim above; applied by the
     # image processor (runtime/spinel/facades/active_storage_processor
-    # _vips.rb) when it loads. Nothing blocked when the app says
-    # nothing, which is libvips' own default.
+    # _vips.rb) when it loads, which also wraps find_load so a blocked
+    # loader is not selected on libvips 8.14. Nothing blocked when the
+    # app says nothing, which is libvips' own default.
     def vips_block_untrusted
       false
     end
 
     def vips_blocked_operations
       []
+    end
+
+    # Default page size for `Relation#page`. Ingest lifts a literal
+    # `config.default_per_page = N` from a `Kaminari.configure` block
+    # (one input spelling) onto this reopen; 25 when the app configures
+    # none.
+    def default_per_page
+      25
     end
   end
 end

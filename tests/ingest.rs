@@ -931,7 +931,7 @@ fn classifies_models_vs_library_classes() {
 /// Survey-mode ingest must recover from an unsupported construct (rather
 /// than aborting the whole app) and must record skipped view templates.
 /// This is the behavior the LSP/MCP rely on to stay usable on real apps,
-/// and the surfacing that keeps unsupported (Slim/`.text.erb`/`.ruby`)
+/// and the surfacing that keeps unsupported (RABL/`.text.erb`/`.ruby`)
 /// views from vanishing silently.
 #[test]
 fn survey_mode_recovers_from_unsupported_construct_and_records_skipped_views() {
@@ -948,8 +948,8 @@ fn survey_mode_recovers_from_unsupported_construct_and_records_skipped_views() {
         ),
         // A HAML view: now ingested through the shared view pipeline.
         ("app/views/widgets/show.html.haml", "%h1= @widget.name\n"),
-        // A Slim view: still an unsupported engine the analyzer skips.
-        ("app/views/widgets/show.html.slim", "h1 = @widget.name\n"),
+        // A RABL view: still an unsupported engine the analyzer skips.
+        ("app/views/widgets/index.html.rabl", "object @widget\n"),
     ];
     let tree = || -> HashMap<PathBuf, Vec<u8>> {
         files
@@ -987,8 +987,8 @@ fn survey_mode_recovers_from_unsupported_construct_and_records_skipped_views() {
     assert!(
         messages
             .iter()
-            .any(|m| m.contains("view template not ingested: slim")),
-        "skipped Slim view should be recorded as a gap, got: {messages:?}"
+            .any(|m| m.contains("view template not ingested: rabl")),
+        "skipped RABL view should be recorded as a gap, got: {messages:?}"
     );
     assert!(
         !messages.is_empty(),
@@ -1554,5 +1554,450 @@ fn block_arg_ivar_and_call_result_preserve_the_forwarded_expression() {
         } else {
             assert!(matches!(&*block.node, ExprNode::Send { method, args, .. } if method.as_str() == "compute" && args.len() == 1));
         }
+    }
+}
+
+#[test]
+fn defined_extended_targets_ingest_and_round_trip() {
+    // Gap #18.2: retain Tim Tischler's constant, call and super controls.
+    use roundhouse::emit::ruby::emit_expr;
+
+    for source in ["defined?(Widget)", "defined?(Widget::Kind)", "defined?(widget.kind)", "defined?(super)"] {
+        let parse = |source: &str| {
+            let result = ruby_prism::parse(source.as_bytes());
+            let program = result.node();
+            let stmt = program.as_program_node().unwrap().statements().body().iter().next().unwrap();
+            roundhouse::ingest::ingest_expr(&stmt, "<snippet>").unwrap()
+        };
+        let expr = parse(source);
+        let ExprNode::Defined { operand } = &*expr.node else {
+            panic!("expected native defined? syntax: {expr:?}");
+        };
+        match source {
+            "defined?(Widget)" => assert!(matches!(&*operand.node, ExprNode::Const { path } if path.iter().map(|s| s.as_str()).collect::<Vec<_>>() == ["Widget"])),
+            "defined?(Widget::Kind)" => assert!(matches!(&*operand.node, ExprNode::Const { path } if path.iter().map(|s| s.as_str()).collect::<Vec<_>>() == ["Widget", "Kind"])),
+            "defined?(widget.kind)" => assert!(matches!(&*operand.node, ExprNode::Send { recv: Some(_), method, .. } if method.as_str() == "kind")),
+            _ => assert!(matches!(&*operand.node, ExprNode::Super { args: None })),
+        }
+        let emitted = emit_expr(&expr);
+        assert_eq!(emit_expr(&parse(&emitted)), emitted);
+        let mut children = 0;
+        expr.node.for_each_child(&mut |_| children += 1);
+        assert_eq!(children, 0, "a syntax query must not expose value children");
+    }
+}
+
+#[test]
+fn class_variable_compound_assignment_in_method_body_ingests_and_round_trips() {
+    use roundhouse::emit::ruby::emit_expr;
+    use roundhouse::expr::{LValue, OpAssignOp};
+
+    for source in ["@@count ||= 0", "@@count = 1"] {
+        let parse = |source: &str| {
+            let result = ruby_prism::parse(source.as_bytes());
+            let program = result.node();
+            let stmt = program.as_program_node().unwrap().statements().body().iter().next().unwrap();
+            roundhouse::ingest::ingest_expr(&stmt, "<snippet>").unwrap()
+        };
+        let expr = parse(source);
+        if source.contains("||=") {
+            assert!(matches!(&*expr.node, ExprNode::OpAssign { target: LValue::Var { name, .. }, op: OpAssignOp::OrOr, .. } if name.as_str() == "@@count"));
+        } else {
+            assert!(matches!(&*expr.node, ExprNode::Assign { target: LValue::Var { name, .. }, .. } if name.as_str() == "@@count"));
+        }
+        assert_eq!(emit_expr(&expr), source);
+        assert_eq!(emit_expr(&parse(source)), source);
+    }
+}
+
+#[test]
+fn specific_ledger_messages_replace_the_generic_catch_all() {
+    use roundhouse::ingest::IngestError;
+
+    for (source, expected) in [
+        ("`ls`", "shell command (backticks) is not modeled"),
+        ("%x{ls}", "shell command (backticks) is not modeled"),
+        ("$stdout = out", "global variable write"),
+        ("class Foo; end", "class/module defined inside a method or block (runtime class definition)"),
+        ("module Foo; end", "class/module defined inside a method or block (runtime class definition)"),
+        ("1 + ", "unparsed fragment (Prism recovery node)"),
+    ] {
+        let result = ruby_prism::parse(source.as_bytes());
+        let program = result.node();
+        let stmt = program.as_program_node().unwrap().statements().body().iter().next().unwrap();
+        let Err(IngestError::Unsupported { message, .. }) = roundhouse::ingest::ingest_expr(&stmt, "<snippet>") else {
+            panic!("expected unsupported: {source}");
+        };
+        assert_eq!(message, expected);
+    }
+}
+
+#[test]
+fn multi_write_with_post_rest_targets_ingests_and_round_trips() {
+    use roundhouse::emit::ruby::emit_expr;
+
+    let parse = |source: &str| {
+        let result = ruby_prism::parse(source.as_bytes());
+        let program = result.node();
+        roundhouse::ingest::ingest_expr(&program.as_program_node().unwrap().statements().as_node(), "<snippet>").unwrap()
+    };
+    let expr = parse("a, *b, c = [1, 2, 3, 4]");
+    let emitted = emit_expr(&expr);
+    assert!(emitted.contains("a = "), "{emitted}");
+    assert!(emitted.contains(".drop(1).take("), "{emitted}");
+    assert!(emitted.contains("[-1]"), "{emitted}");
+    assert_eq!(expr, parse(&emitted), "round-trip IR, not only emitted text, must be stable");
+    assert_eq!(emit_expr(&parse(&emitted)), emitted);
+}
+
+#[test]
+fn multi_write_temporary_does_not_capture_a_user_target() {
+    let source = "a, *__mw_0, c = [11, 22, 33]";
+    let result = ruby_prism::parse(source.as_bytes());
+    let stmt = result.node().as_program_node().unwrap().statements().body().iter().next().unwrap();
+    let expr = roundhouse::ingest::ingest_expr(&stmt, "<snippet>").unwrap();
+    let ExprNode::Seq { exprs } = &*expr.node else { panic!("expected desugared assignment") };
+    let ExprNode::Assign { target: LValue::Var { name, .. }, .. } = &*exprs[0].node else {
+        panic!("expected temporary binding");
+    };
+    assert_ne!(name.as_str(), "__mw_0");
+}
+
+#[test]
+fn simple_defined_operands_keep_ruby_descriptors() {
+    for (source, expected) in [
+        ("defined?(self)", "self"), ("defined?(nil)", "nil"),
+        ("defined?(true)", "true"), ("defined?(false)", "false"),
+        ("defined?(17)", "expression"),
+    ] {
+        let result = ruby_prism::parse(source.as_bytes());
+        let stmt = result.node().as_program_node().unwrap().statements().body().iter().next().unwrap();
+        let expr = roundhouse::ingest::ingest_expr(&stmt, "<snippet>").unwrap();
+        assert!(matches!(&*expr.node, ExprNode::Lit { value: Literal::Str { value } } if value == expected), "{source}: {expr:?}");
+    }
+}
+
+#[test]
+fn post_rest_effectful_targets_remain_explicitly_unsupported() {
+    for source in [
+        "a, *, mark(log)[0] = [rhs(log)]",
+        "mark(log)[0], *b, c = [rhs(log)]",
+        "a, *mark(log)[0], c = [rhs(log)]",
+        "a, *, target.value = [rhs(log)]",
+    ] {
+        let result = ruby_prism::parse(source.as_bytes());
+        assert_eq!(result.errors().count(), 0, "legal Ruby control: {source}");
+        let program = result.node();
+        let stmt = program.as_program_node().unwrap().statements().body().iter().next().unwrap();
+        let err = roundhouse::ingest::ingest_expr(&stmt, "<snippet>").expect_err("LHS order must not change silently");
+        assert!(err.to_string().contains("preserved LHS evaluation order"), "{err}");
+    }
+}
+
+#[test]
+fn class_method_classvar_writes_cannot_be_normalized_to_per_class_storage() {
+    for method in ["def self.bump", "class << self; def bump"] {
+        for write in ["@@count ||= 11", "@@count = 14", "@@count &&= 17", "@@count += 3", "@@count -= 1"] {
+            let extra_end = if method.starts_with("class") { "end" } else { "" };
+            let source = format!("class Parent; {method}; {write}; @@count; end; {extra_end}; end\nclass Child < Parent; end");
+            let err = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
+                .expect_err("shared classvar storage must not become a class ivar");
+            assert!(err.to_string().contains("shared inheritance storage"), "{err}");
+        }
+    }
+}
+
+#[test]
+fn post_rest_nonliteral_rhs_remains_unsupported_without_coercion() {
+    for rhs in ["11", "nil", "Coercible.new", "values", "[11, 22].dup"] {
+        let source = format!("a, *b, c = {rhs}");
+        let result = ruby_prism::parse(source.as_bytes());
+        assert_eq!(result.errors().count(), 0, "legal Ruby control: {source}");
+        let program = result.node();
+        let stmt = program.as_program_node().unwrap().statements().body().iter().next().unwrap();
+        let err = roundhouse::ingest::ingest_expr(&stmt, "<snippet>")
+            .expect_err("collection methods do not implement Ruby coercion");
+        assert!(err.to_string().contains("to_ary coercion"), "{err}");
+    }
+}
+
+#[test]
+fn richer_defined_call_shapes_remain_explicitly_unsupported() {
+    for source in ["defined?(self.call(11))", "defined?(self.call {})", "defined?(self&.call)"] {
+        let result = ruby_prism::parse(source.as_bytes());
+        assert_eq!(result.errors().count(), 0);
+        let program = result.node();
+        let stmt = program.as_program_node().unwrap().statements().body().iter().next().unwrap();
+        let err = roundhouse::ingest::ingest_expr(&stmt, "<snippet>").expect_err("unverified query shape");
+        assert!(err.to_string().contains("defined? calls"), "{err}");
+    }
+}
+
+#[test]
+fn native_classvar_writes_cannot_split_modeled_cattr_storage() {
+    for declaration in ["cattr_accessor", "mattr_accessor"] {
+        let source = format!("class Probe; {declaration} :count; def bump; @@count = 11; end; def self.current; @@count; end; end");
+        let err = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
+            .expect_err("native and modeled storage cannot silently diverge");
+        assert!(err.to_string().contains("alongside cattr/mattr storage"), "{err}");
+    }
+}
+
+#[test]
+fn cattr_defaults_cannot_be_silently_dropped_with_native_initializers() {
+    for declaration in ["cattr_reader", "cattr_writer", "cattr_accessor", "mattr_reader", "mattr_writer", "mattr_accessor"] {
+        for default in ["default: 41", "default: nil", "**{default: 41}", "**options", ""] {
+            let call = if default.is_empty() {
+                format!("{declaration}(:count) {{ 41 }}")
+            } else {
+                format!("{declaration} :count, {default}")
+            };
+            for body in [format!("@@count = nil; {call}"), format!("{call}; @@count = nil")] {
+                let source = format!("class Probe; {body}; def self.current; @@count; end; end");
+                let err = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
+                    .expect_err("an unmodeled default must not become an unset class ivar");
+                assert!(err.to_string().contains("cattr/mattr defaults require source-order initialization"), "{err}");
+            }
+            // Standalone cattr/mattr modeling predates this native-initializer
+            // slice; don't widen its existing approximation in this PR.
+            let source = format!("class Probe; {call}; end");
+            roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
+                .expect("standalone class-attribute ingest remains unchanged");
+        }
+        let source = format!("class Probe; @@count = nil; {declaration} :count; end");
+        let classes = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb").unwrap();
+        assert!(classes[0].class_ivar_initializers.is_empty(), "default-free nil storage remains modeled");
+    }
+}
+
+#[test]
+fn native_classvar_initialization_uses_owned_initializer_ir() {
+    let classes = roundhouse::ingest::ingest_library_classes(
+        b"class Probe; @@count = nil; def self.current; @@count; end; end", "probe.rb",
+    ).unwrap();
+    assert!(classes[0].unknown_calls.is_empty());
+    assert!(matches!(&*classes[0].class_ivar_initializers[0].node,
+        ExprNode::Assign { target: LValue::Var { name, .. }, .. } if name.as_str() == "@@count"));
+    for declaration in ["arbitrary_dsl", "INITIAL = @@count", "include Other"] {
+        let source = format!("class Probe; @@count = nil; {declaration}; end");
+        let err = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
+            .expect_err("separate class-body buckets cannot preserve interleaving");
+        assert!(err.to_string().contains("requires source ordering"), "{err}");
+    }
+}
+
+#[test]
+fn native_initializers_keep_order_across_singleton_body_merges() {
+    let classes = roundhouse::ingest::ingest_library_classes(
+        b"class Probe; @@before=nil; class << self; @@middle=nil; end; @@after=nil; end",
+        "recursive_initializer.rb",
+    ).unwrap();
+    let names: Vec<_> = classes[0].class_ivar_initializers.iter().map(|expr| {
+        assert!(!expr.span.is_synthetic());
+        match &*expr.node {
+            ExprNode::Assign { target: LValue::Var { name, .. }, .. } => name.as_str(),
+            other => panic!("unexpected initializer: {other:?}"),
+        }
+    }).collect();
+    assert_eq!(names, ["@@before", "@@middle", "@@after"]);
+}
+
+#[test]
+fn case_in_pattern_matching() {
+    use roundhouse::expr::{HashRest, MatchGuardKind, MatchPattern};
+
+    fn parse_one(source: &[u8]) -> roundhouse::expr::Expr {
+        let result = ruby_prism::parse(source);
+        let program = result.node();
+        let prog = program.as_program_node().unwrap();
+        let stmt = prog.statements().body().iter().next().unwrap();
+        roundhouse::ingest::ingest_expr(&stmt, "<literal>").unwrap()
+    }
+
+    // `nil`, a bare bind, and a guard (`if`).
+    let e = parse_one(
+        b"case p\nin nil\n  0\nin company if company.present?\n  1\nend",
+    );
+    let ExprNode::CaseMatch { arms, else_body, .. } = &*e.node else {
+        panic!("expected CaseMatch, got {:?}", e.node);
+    };
+    assert!(else_body.is_none());
+    assert_eq!(arms.len(), 2);
+    assert!(matches!(arms[0].pattern, MatchPattern::Nil));
+    assert!(arms[0].guard.is_none());
+    match &arms[1].pattern {
+        MatchPattern::Bind { name } => assert_eq!(name.as_str(), "company"),
+        other => panic!("expected Bind, got {other:?}"),
+    }
+    match &arms[1].guard {
+        Some((MatchGuardKind::If, _)) => {}
+        other => panic!("expected an `if` guard, got {other:?}"),
+    }
+
+    // Constant-narrowed array-style deconstruct (`Success(page)`) — the
+    // dominant real-world shape (dry-monads `Result`).
+    let e = parse_one(b"case r\nin Success(page)\n  page\nin Failure(error)\n  error\nend");
+    let ExprNode::CaseMatch { arms, .. } = &*e.node else {
+        panic!("expected CaseMatch, got {:?}", e.node);
+    };
+    match &arms[0].pattern {
+        MatchPattern::Array { constant: Some(c), pre, rest, post } => {
+            assert!(matches!(&*c.node, ExprNode::Const { .. }));
+            assert_eq!(pre.len(), 1);
+            assert!(rest.is_none());
+            assert!(post.is_empty());
+            match &pre[0] {
+                MatchPattern::Bind { name } => assert_eq!(name.as_str(), "page"),
+                other => panic!("expected Bind, got {other:?}"),
+            }
+        }
+        other => panic!("expected constant-narrowed Array, got {other:?}"),
+    }
+
+    // Array pattern with a leading Capture and a named rest.
+    let e = parse_one(b"case a\nin [Integer => n, *rest]\n  n\nend");
+    let ExprNode::CaseMatch { arms, .. } = &*e.node else {
+        panic!("expected CaseMatch, got {:?}", e.node);
+    };
+    match &arms[0].pattern {
+        MatchPattern::Array { constant: None, pre, rest: Some(Some(rest_name)), post } => {
+            assert_eq!(rest_name.as_str(), "rest");
+            assert!(post.is_empty());
+            match &pre[0] {
+                MatchPattern::Capture { pattern, name } => {
+                    assert_eq!(name.as_str(), "n");
+                    assert!(matches!(&**pattern, MatchPattern::Value { .. }));
+                }
+                other => panic!("expected Capture, got {other:?}"),
+            }
+        }
+        other => panic!("expected plain Array with named rest, got {other:?}"),
+    }
+
+    // Find pattern: bare splats on both sides around a fixed middle.
+    let e = parse_one(b"case a\nin [*, 5, *post]\n  post\nend");
+    let ExprNode::CaseMatch { arms, .. } = &*e.node else {
+        panic!("expected CaseMatch, got {:?}", e.node);
+    };
+    match &arms[0].pattern {
+        MatchPattern::Find { constant: None, pre_rest: None, middle, post_rest: Some(name) } => {
+            assert_eq!(middle.len(), 1);
+            assert_eq!(name.as_str(), "post");
+        }
+        other => panic!("expected Find, got {other:?}"),
+    }
+
+    // Hash pattern: value-omission bind, explicit sub-pattern, and
+    // `**rest` collection.
+    let e = parse_one(b"case h\nin {status: \"ok\", data:, **rest}\n  data\nend");
+    let ExprNode::CaseMatch { arms, .. } = &*e.node else {
+        panic!("expected CaseMatch, got {:?}", e.node);
+    };
+    match &arms[0].pattern {
+        MatchPattern::Hash { constant: None, pairs, rest: Some(HashRest::Collect { name }) } => {
+            assert_eq!(name.as_str(), "rest");
+            assert_eq!(pairs.len(), 2);
+            assert_eq!(pairs[0].0.as_str(), "status");
+            assert!(pairs[0].1.is_some());
+            assert_eq!(pairs[1].0.as_str(), "data");
+            assert!(pairs[1].1.is_none());
+        }
+        other => panic!("expected Hash with **rest, got {other:?}"),
+    }
+
+    // `**nil` — no unmatched keys allowed.
+    let e = parse_one(b"case h\nin {a:, **nil}\n  a\nend");
+    let ExprNode::CaseMatch { arms, .. } = &*e.node else {
+        panic!("expected CaseMatch, got {:?}", e.node);
+    };
+    assert!(matches!(
+        &arms[0].pattern,
+        MatchPattern::Hash { rest: Some(HashRest::Nil), .. }
+    ));
+
+    // Alternation flattens Prism's binary tree to one flat Vec.
+    let e = parse_one(b"case x\nin 'a' | 'b' | 'c'\n  1\nend");
+    let ExprNode::CaseMatch { arms, .. } = &*e.node else {
+        panic!("expected CaseMatch, got {:?}", e.node);
+    };
+    match &arms[0].pattern {
+        MatchPattern::Alt { alternatives } => assert_eq!(alternatives.len(), 3),
+        other => panic!("expected Alt, got {other:?}"),
+    }
+
+    // Pin operator: `^name` and `^(expr)` both fold into `Value`.
+    let e = parse_one(b"case x\nin ^expected\n  1\nelse\n  2\nend");
+    let ExprNode::CaseMatch { arms, else_body, .. } = &*e.node else {
+        panic!("expected CaseMatch, got {:?}", e.node);
+    };
+    assert!(else_body.is_some());
+    match &arms[0].pattern {
+        MatchPattern::Value { expr } => assert!(matches!(&*expr.node, ExprNode::Var { .. })),
+        other => panic!("expected pinned Value, got {other:?}"),
+    }
+
+    // `value in pattern` — MatchPredicate, never raises.
+    let e = parse_one(b"x in Integer");
+    match &*e.node {
+        ExprNode::MatchPredicate { pattern, .. } => {
+            assert!(matches!(pattern, MatchPattern::Value { .. }));
+        }
+        other => panic!("expected MatchPredicate, got {other:?}"),
+    }
+
+    // `value => pattern` — MatchRequired, binds or raises.
+    let e = parse_one(b"y => Integer");
+    assert!(matches!(&*e.node, ExprNode::MatchRequired { .. }));
+}
+
+#[test]
+fn nested_class_methods_cannot_relocate_native_initializers() {
+    use roundhouse::ingest::ingest_library_classes;
+    let err = ingest_library_classes(
+        b"module Probe; module ClassMethods; @@flag = nil; def flag; @@flag; end; end; end",
+        "probe.rb",
+    ).expect_err("ClassMethods owns @@flag, not the enclosing Probe");
+    assert!(err.to_string().contains("class-variable initialization in module ClassMethods is not modeled"), "{err}");
+
+    // A cattr in the same body keeps its pre-existing storage approximation.
+    let classes = ingest_library_classes(
+        b"module Probe; module ClassMethods; @@flag = nil; cattr_accessor :flag; def read; @@flag; end; end; end",
+        "probe.rb",
+    ).unwrap();
+    let probe = classes.iter().find(|class| class.name.0.as_str() == "Probe").unwrap();
+    assert!(probe.class_ivar_initializers.is_empty());
+    assert!(probe.methods.iter().any(|method| method.name.as_str() == "read"));
+
+    // An initializer actually owned by Probe must not be rejected.
+    let classes = ingest_library_classes(
+        b"module Probe; @@flag = nil; module ClassMethods; def flag; @@flag; end; end; end",
+        "probe.rb",
+    ).unwrap();
+    let probe = classes.iter().find(|class| class.name.0.as_str() == "Probe").unwrap();
+    assert_eq!(probe.class_ivar_initializers.len(), 1);
+}
+
+/// Parameters after a rest (`->(*, payload)`, `|*rest, a, b|`) used to
+/// vanish: Lambda IR has no slot for them, so `->(*, payload) {
+/// payload[:sql] }` emitted as `-> { payload[:sql] }`, a body reading a
+/// name nothing bound, and the expression IR diverged across a round
+/// trip. They are now popped off the rest, last first, which is Ruby's
+/// own rule, and the emitted form reaches a fixed point.
+#[test]
+fn parameters_after_a_rest_are_popped_off_it() {
+    use roundhouse::emit::ruby::emit_expr;
+    let cases: &[(&[u8], &[&str])] = &[
+        (b"cb = ->(*, payload) { payload[:sql] }", &["->(*__rest)", "payload = __rest.pop"]),
+        (b"cb = ->(*rest, a, b) { [rest, a, b] }", &["->(*rest)", "b = rest.pop", "a = rest.pop"]),
+        (b"cb = ->(*args) { args }", &["->(*args)"]),
+        (b"xs.each { |*, last| p last }", &["|*__rest|", "last = __rest.pop"]),
+    ];
+    for (source, wants) in cases {
+        let first = emit_expr(&ingest_snippet(source));
+        for want in *wants {
+            assert!(first.contains(want), "{}: expected `{want}` in:\n{first}", String::from_utf8_lossy(source));
+        }
+        let second = emit_expr(&ingest_snippet(first.as_bytes()));
+        assert_eq!(first, second, "{} is not a fixed point", String::from_utf8_lossy(source));
     }
 }

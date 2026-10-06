@@ -26,6 +26,7 @@ mod library;
 mod rbs;
 pub mod shake;
 mod shared;
+pub mod source_markers;
 
 /// Render a `Ty` to its RBS string form (`String`, `Array[Comment]`,
 /// `Article`, `Integer?`). Re-exported for non-emit consumers — e.g. the
@@ -72,7 +73,24 @@ pub fn emit_method(m: &MethodDef) -> String {
         format!("({})", ps.join(", "))
     };
     let mut out = String::new();
+    // The body's first statement: a Seq writes markers only between
+    // its statements, so the first is named here.
+    let first = match &*m.body.node {
+        crate::expr::ExprNode::Seq { exprs } => exprs.first().unwrap_or(&m.body),
+        _ => &m.body,
+    };
+    let body_marker = source_markers::marker_for(&first.span);
+    // A marker ABOVE the def, so the def line never reports the previous
+    // method's held position: Spinel names a --debug backtrace frame by
+    // its def line (spinel#7658). A synthesized method has no name span;
+    // its body's first statement stands in.
+    if let Some(mk) = source_markers::marker_for(&m.name_span).or_else(|| body_marker.clone()) {
+        writeln!(out, "{mk}").unwrap();
+    }
     writeln!(out, "def {prefix}{}{}", m.name, params).unwrap();
+    if let Some(mk) = body_marker {
+        writeln!(out, "{mk}").unwrap();
+    }
     let body_text = emit_expr(&m.body);
     fn emit_default(default: &crate::expr::Expr) -> String {
         let src = expr::emit_expr(default);
@@ -304,7 +322,7 @@ pub(crate) fn apply_model_lowering(mut lcs: &mut [LibraryClass], app: &App) {
     // machinery + belongs_to reader cache guards, so `includes(...)`
     // on a runtime Relation executes as batched IN-loads instead of
     // N+1 lazy reads. Runs last so nothing reprocesses the synthesized
-    // bodies (no-op unless the app has scopes AND surviving includes).
+    // bodies (no-op unless the app mentions includes).
     library::apply_preload_lowering(&mut lcs, app);
     // A belongs_to reader memoizes, and writing the foreign key
     // invalidates it (no-op for models with no belongs_to). AFTER the

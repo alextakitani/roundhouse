@@ -678,7 +678,11 @@ fn emit_block_with_value(e: &Expr) -> String {
 
 // ---- expression emit ------------------------------------------------
 
+/// Render an Elixir expression while preserving complete-call primitive semantics.
 pub(super) fn emit_expr(e: &Expr) -> String {
+    if let Some(s) = crate::emit::shared::string_bytes::emit(e, crate::emit::shared::string_bytes::Target::Elixir, emit_expr) {
+        return s;
+    }
     // String-builder hint sites (`io = String.new; io << "..."; io`,
     // tagged by the view/jbuilder lowerer) → the iolist idiom. One hook
     // covers the Append + terminal-Result sites; Init is intercepted in

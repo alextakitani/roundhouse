@@ -748,7 +748,11 @@ fn children(e: &Expr) -> Vec<&Expr> {
 
 // ---- Expression rendering (value position) ----
 
+/// Render a C# value expression after shared primitive and string-builder selection.
 pub fn emit_expr(e: &Expr) -> String {
+    if let Some(s) = crate::emit::shared::string_bytes::emit(e, crate::emit::shared::string_bytes::Target::CSharp, emit_expr) {
+        return s;
+    }
     if let Some(s) = try_string_builder(e) {
         return s;
     }

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Select coverage, not test results. Unknown inputs expand to full validation."""
+"""Select coverage, not test results.
+
+Extra-language SDKs need a path owner, `ci:full`, or scheduled full
+validation. Unknown inputs keep the Ruby floor plus Spinel.
+"""
 
 import argparse
 import json
@@ -21,21 +25,30 @@ TARGETS = [
     "ruby",
     "jruby",
 ]
+# PR floor: the Ruby shape plus Campfire. Extra languages, Rust/TS
+# compare, WASM, and Spinel are not in this list.
 BASE = [
     "generate-fixture",
     "unit",
+    "build-roundhouse",
     "store-check",
-    "compare",
     "compare-ruby",
-    "browser-smoke-typescript",
     "campfire-conformance",
     "campfire-compare",
 ]
+# Compact publication additionally waits on Rust/TS when those jobs were
+# selected (scheduled full, or a change that owns them). Unselected skips
+# must not fail the Ruby PR floor.
+PUBLICATION = [*BASE, "compare", "browser-smoke-typescript"]
 CORE = ["build-spinel", "toolchain-spinel", "compare-spinel"]
 SPINEL_TESTS = [
+    "date_columns_spinel",
     "framework_tests_spinel",
     "spinel_web_push_crypto",
     "spinel_db_lease",
+    "param_binds",
+    "spinel_stmt_cache_lru",
+    "db_sqlite_concurrency",
     "spinel_param_builder",
     "rails_compat_vectors_spinel",
 ]
@@ -52,8 +65,19 @@ SPINEL11 = [
     "smoke-campfire",
     "smoke-campfire-docker",
 ]
+# Opt-in Spinel lane (`ci:spinel`): Ruby floor plus the full Spinel suite,
+# without other-language emitters, WASM, or Writebook. smoke-spinel needs
+# build-site; archive-results closes packaging evidence.
+SPINEL_LANE = [*BASE, *SPINEL11, "build-site", "archive-results"]
 ADVISORY = set(SPINEL11) - {"build-campfire-archive"}
 SHA = re.compile(r"[0-9a-f]{40}\Z")
+PROJECT_BUILDERS = {
+    "ruby_runtime_files": "interpreted",
+    "jruby_runtime_files": "interpreted",
+    "ruby_family_runtime_files": "interpreted",
+    "spinel_files": "ruby-family",
+    "spin_shape": "ruby-family",
+}
 
 
 def native_coverage(path):
@@ -72,6 +96,7 @@ def native_coverage(path):
         or path == "src/emit/ruby.rs"
         or (path.startswith("tests/spinel") and path.endswith((".rs", ".rb")))
         or path in {f"tests/{name}.rs" for name in SPINEL_TESTS}
+        or path == "tests/support/db_concurrency_spinel.rb"
     ) and not interpreter_only
     suites = set()
     if path.startswith("runtime/ruby/") and path.endswith((".rb", ".rbs")):
@@ -79,6 +104,16 @@ def native_coverage(path):
     focused = re.fullmatch(r"tests/([^/]+)\.(?:rs|rb)", path)
     if focused and focused[1] in SPINEL_TESTS:
         suites.add(focused[1])
+    if path == "tests/support/db_concurrency_spinel.rb":
+        suites.add("db_sqlite_concurrency")
+    if path in {
+        "tests/param_binds_emit.rb",
+        "tests/param_binds_raw_where.rb",
+        "tests/param_binds_runtime.rb",
+        "tests/support/emit_and_run.rs",
+        "src/lower/model_to_library/adapter_emit.rs",
+    } or path.startswith("src/lower/arel/"):
+        suites.add("param_binds")
     if path.startswith(("runtime/spinel/", "runtime/ruby/")) and not interpreter_only:
         name = path.rsplit("/", 1)[-1]
         owned_tests = set()
@@ -98,9 +133,33 @@ def native_coverage(path):
         if any(
             word in path for word in ("/db", "sqlite", "active_support_time_parsing")
         ):
-            owned_tests.add("spinel_db_lease")
+            # Shared database inputs own lease/ownership, binds, cache recency,
+            # and the snapshot / write-permit / checkpoint policy.
+            owned_tests.update(
+                (
+                    "spinel_db_lease",
+                    "param_binds",
+                    "spinel_stmt_cache_lru",
+                    "db_sqlite_concurrency",
+                )
+            )
         if any(word in name for word in ("param", "multipart", "request")):
             owned_tests.add("spinel_param_builder")
+        if name in {
+            "date.rb",
+            "date.rbs",
+            "active_support_date_parsing.rb",
+            "active_support_date_parsing.rbs",
+            "active_record_date_serialization.rb",
+            "active_record_date_serialization.rbs",
+            "sqlite_adapter.rb",
+        }:
+            owned_tests.add("date_columns_spinel")
+        if name in {
+            "active_record_date_serialization.rb",
+            "active_record_serialization.rb",
+        }:
+            owned_tests.add("framework_tests_spinel")
         if (
             path.startswith("runtime/spinel/")
             and not path.startswith("runtime/spinel/scaffold/")
@@ -158,41 +217,40 @@ def archive_and_campfire_jobs(path, interpreter_only):
     return jobs
 
 
-def select(paths, *, draft=False, full=False, publish=False):
-    if draft:
+def select(
+    paths,
+    *,
+    full=False,
+    spinel_lane=False,
+    publish=False,
+    project_scope=None,
+):
+    if spinel_lane and not full:
         return finish(
-            BASE[:2],
+            SPINEL_LANE,
             [],
             [],
             False,
             False,
-            False,
-            ["draft: fixture and unit only"],
-            spinel_tests=[],
+            True,
+            ["ci:spinel: Ruby floor plus Spinel suite"],
+            spinel_tests=list(SPINEL_TESTS),
         )
     targets, smoke = set(), set()
     jobs_selected, spinel_tests = set(), set()
     wasm = site = spinel = writebook = False
     reasons = []
     for path in paths:
-        if path.startswith((".github/", ".cargo/")) or path in {
-            "scripts/ci-plan.py",
-            "scripts/ci-reuse.py",
-            "scripts/ci-archive-evidence.py",
-            "tests/ci_plan_test.py",
-            "tests/ci_archive_evidence_test.py",
-            "tests/workflow_yaml_parses.rs",
-            "tests/ci_policy_workflow.rs",
-            "src/project.rs",
-            "src/bin/roundhouse.rs",
-            "Cargo.toml",
-            "Cargo.lock",
-            "build.rs",
-            "rust-toolchain.toml",
-            ".cargo/config.toml",
-        }:
-            full = True
-            reasons.append(f"{path}: validation/packaging policy")
+        if path == "src/project.rs" and project_scope in PROJECT_BUILDERS.values():
+            targets.update(("ruby", "jruby"))
+            smoke.update(("ruby", "jruby"))
+            writebook = True
+            if project_scope == "ruby-family":
+                spinel = True
+                jobs_selected.update(SPINEL11)
+                spinel_tests.update(SPINEL_TESTS)
+            reasons.append(f"{path}: proven {project_scope} assembly bodies only")
+            continue
         match = re.match(r"(?:src/emit/|runtime/)([^/.]+)(?:[/.]|$)", path)
         test = re.match(
             r"tests/(?:framework_tests_)?([a-z]+)_toolchain\.rs$|tests/framework_tests_([a-z]+)\.rs$",
@@ -238,15 +296,6 @@ def select(paths, *, draft=False, full=False, publish=False):
         elif target == "shared":
             full = True
             reasons.append(f"{path}: shared code generation")
-        elif target and target not in {
-            "ruby",
-            "ruby_family",
-            "roda",
-            "mod",
-            "rails",
-        }:
-            full = True
-            reasons.append(f"{path}: unknown target ownership")
         if path.startswith("wasm/"):
             wasm = True
             reasons.append(f"{path}: WASM/browser compiler")
@@ -293,10 +342,14 @@ def select(paths, *, draft=False, full=False, publish=False):
         for t in TARGETS
         if t in targets and t not in {"rust", "typescript", "ruby", "jruby"}
     ]
+    if "rust" in targets or "typescript" in targets:
+        jobs.append("compare")
     if extra:
         jobs.append("compare-extra")
     if "jruby" in targets:
         jobs.append("compare-jruby")
+    if wasm or "typescript" in targets:
+        jobs.append("browser-smoke-typescript")
     if wasm:
         jobs.extend(["build-wasm", "browser-smoke-ide"])
     if smoke or site:
@@ -358,39 +411,130 @@ def git(*args):
     return subprocess.check_output(["git", *args])
 
 
-def changed_paths(event, event_name, sha):
+def ensure_commit(sha):
+    """Fetch a commit by SHA when the plan checkout is too shallow to see it."""
+    try:
+        git("cat-file", "-e", f"{sha}^{{commit}}")
+    except subprocess.CalledProcessError:
+        git("fetch", "--no-tags", "--depth=1", "origin", sha)
+        git("cat-file", "-e", f"{sha}^{{commit}}")
+
+
+def project_change_scope(before, after):
+    """Narrow only body-only edits in known builders; all other bytes must match.
+
+    This is not a Rust parser. Only indented bodies without raw strings or
+    block comments qualify; unknown shapes/signatures/items do not narrow
+    and stay on the Ruby floor.
+    """
+    pattern = re.compile(
+        r"(?P<header>^fn (?P<name>"
+        + "|".join(sorted(PROJECT_BUILDERS))
+        + r")\([^{};]*\{\n)(?P<body>(?:[ \t]+[^\n]*\n|\n)*)^}\n",
+        re.MULTILINE,
+    )
+    # Exclude function-looking text in Rust literals/comments. Block comments
+    # (including nested ones) are deliberately unsupported, not half-parsed.
+    literals = re.compile(
+        r'//[^\n]*|\b[bc]?r(?P<hash>#+)"[\s\S]*?"(?P=hash)'
+        r'|"(?:\\[\s\S]|[^"\\])*"'
+        r"|'(?:\\(?:u\{[0-9a-fA-F]+\}|x[0-9a-fA-F]{2}|.)|[^'\\\n])'"
+        r"|/\*"
+    )
+    bodies = []
+    skeletons = []
+    for source in (before, after):
+        found = {}
+        excluded = list(literals.finditer(source))
+        if any(token[0] == "/*" for token in excluded):
+            return None
+        lexical = literals.sub(lambda token: re.sub(r"[^\n]", " ", token[0]), source)
+
+        def mask(match):
+            if any(token.start() <= match.start() < token.end() for token in excluded):
+                return match[0]
+            prefix = lexical[: match.start()]
+            if any(
+                prefix.count(left) != prefix.count(right)
+                for left, right in [("{", "}"), ("(", ")"), ("[", "]")]
+            ):
+                return match[0]  # Nested/macro input is not a top-level builder.
+            name, body = match["name"], match["body"]
+            code = "\n".join(
+                line for line in body.splitlines() if not line.lstrip().startswith("//")
+            )
+            if name in found or re.search(r'(?<!\w)[bc]?r#*"|/\*', code):
+                raise ValueError("ambiguous project assembly body")
+            found[name] = body
+            return match["header"] + "}\n"
+
+        try:
+            skeletons.append(pattern.sub(mask, source))
+        except ValueError:
+            return None
+        bodies.append(found)
+    if skeletons[0] != skeletons[1] or bodies[0].keys() != bodies[1].keys():
+        return None
+    changed = {name for name in bodies[0] if bodies[0][name] != bodies[1][name]}
+    if changed:
+        scopes = {PROJECT_BUILDERS[name] for name in changed}
+        return "ruby-family" if "ruby-family" in scopes else "interpreted"
+    return None
+
+
+def changed_inputs(event, event_name, sha, *, need_project_scope=True):
     if not SHA.fullmatch(sha) or git("rev-parse", "HEAD").decode().strip() != sha:
         raise ValueError("checkout is not the event SHA")
     if event_name == "pull_request":
         pr = event["pull_request"]
+        base, head = pr["base"]["sha"], pr["head"]["sha"]
+        if not SHA.fullmatch(base) or not SHA.fullmatch(head):
+            raise ValueError("PR event is missing base/head SHAs")
         parents = git("show", "-s", "--format=%P", "HEAD").decode().split()
-        if parents != [pr["base"]["sha"], pr["head"]["sha"]]:
-            raise ValueError("checkout is not the event's PR merge tree")
-        base = parents[0]
+        # Prefer the merge commit's first parent when this is the PR merge
+        # tree: GitHub's merge ref can land on a newer main than the event's
+        # base.sha. Do not fetch the fork head from origin; it is already a
+        # parent of the merge commit, or HEAD itself.
+        if len(parents) == 2 and parents[1] == head:
+            base = parents[0]
+        elif sha != head:
+            raise ValueError("checkout is not the event's PR merge tree or head")
+        ensure_commit(base)
     elif event_name == "push":
         base = event["before"]
         if not SHA.fullmatch(base) or base == "0" * 40:
             raise ValueError("no previous main tree")
-        try:
-            git("cat-file", "-e", base)
-        except subprocess.CalledProcessError:
-            git("fetch", "--no-tags", "--depth=1", "origin", base)
+        ensure_commit(base)
     else:
-        return []
+        return [], None
     # Renames become a deletion and addition; both ownership sets are selected.
-    return [
+    paths = [
         p.decode("utf-8")
         for p in git("diff", "--name-only", "--no-renames", "-z", base, sha).split(
             b"\0"
         )
         if p
     ]
+    scope = None
+    if need_project_scope and "src/project.rs" in paths:
+        entries = [
+            git("ls-tree", ref, "--", "src/project.rs").split() for ref in (base, sha)
+        ]
+        if all(entry and entry[0] == b"100644" for entry in entries):
+            scope = project_change_scope(
+                git("show", f"{base}:src/project.rs").decode("utf-8"),
+                git("show", f"{sha}:src/project.rs").decode("utf-8"),
+            )
+    return paths, scope
 
 
 def check_results(plan, needs, *, compact=False):
-    required = (
-        BASE[:2] if plan["jobs"] == BASE[:2] else BASE if compact else plan["required"]
-    )
+    if compact:
+        # Compact gate only observes the publication floor jobs in its needs
+        # graph. Spinel/full extras are enforced by ci-summary, not here.
+        required = [job for job in PUBLICATION if job in plan["jobs"]]
+    else:
+        required = plan["required"]
     failures = [
         f"{j}: {needs.get(j, {}).get('result', 'missing')}"
         for j in required
@@ -398,9 +542,14 @@ def check_results(plan, needs, *, compact=False):
     ]
     if needs.get("plan", {}).get("result") != "success":
         failures.append("plan: no successful routing decision")
-    if not compact and needs.get("compact-required", {}).get("result") != "success":
+    if (
+        not compact
+        and needs.get("compact-required", {}).get("result") != "success"
+    ):
         failures.append("compact-required: no successful baseline gate")
     # Advisory work never blocks the gate, but incomplete work is not complete.
+    # Compact only claims completeness for the publication floor it can see.
+    tracked = required if compact else plan["jobs"]
     complete = not failures and all(
         needs.get(j, {}).get("result") == "success"
         and (
@@ -414,7 +563,7 @@ def check_results(plan, needs, *, compact=False):
                 )
             )
         )
-        for j in plan["jobs"]
+        for j in tracked
     )
     return failures, complete
 
@@ -436,7 +585,14 @@ def main():
     parser.add_argument("command", choices=["plan", "gate", "compact-gate"])
     args = parser.parse_args()
     if args.command != "plan":
-        plan = json.loads(os.environ["CI_PLAN"])
+        raw_plan = os.environ.get("CI_PLAN", "")
+        if not raw_plan.strip():
+            # Plan cancelled/skipped leaves an empty output; do not crash the
+            # gates or claim a green floor.
+            write_outputs({"complete": False})
+            print("::notice::No plan output (cancelled or skipped); incomplete")
+            return True
+        plan = json.loads(raw_plan)
         failures, complete = check_results(
             plan,
             json.loads(os.environ["CI_NEEDS"]),
@@ -449,18 +605,37 @@ def main():
     event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
     event_name = os.environ["GITHUB_EVENT_NAME"]
     pr = event.get("pull_request", {})
-    full = os.environ.get("CI_FULL") == "true" or any(
-        label["name"] == "ci:full" for label in pr.get("labels", [])
-    )
+    labels = {label["name"] for label in pr.get("labels", [])}
+    full = os.environ.get("CI_FULL") == "true" or "ci:full" in labels
+    spinel_lane = "ci:spinel" in labels
+    if (
+        event_name == "push"
+        and os.environ.get("GITHUB_REF") == "refs/heads/main"
+        and not pr
+        and not full
+    ):
+        # Extra-language SDKs are the scheduled full-ci ledger, not every merge.
+        spinel_lane = True
     reason = None
     try:
-        paths = changed_paths(event, event_name, os.environ["GITHUB_SHA"])
-    except (KeyError, ValueError, UnicodeError, subprocess.CalledProcessError) as e:
-        paths, full, reason = (
-            [],
-            True,
-            f"Unknown changed inputs: {e}; running full validation",
+        # project_scope only narrows path selection; spinel/full short-circuit
+        # before that, so skip the expensive project.rs body scan there.
+        paths, project_scope = changed_inputs(
+            event,
+            event_name,
+            os.environ["GITHUB_SHA"],
+            need_project_scope=not full and not spinel_lane,
         )
+    except (KeyError, ValueError, UnicodeError, subprocess.CalledProcessError) as e:
+        paths, project_scope = [], None
+        if full:
+            reason = f"Unknown changed inputs: {e}; running full validation"
+        else:
+            spinel_lane = True
+            reason = (
+                f"Unknown changed inputs: {e}; "
+                "Ruby+Spinel only (extra-language SDKs not selected)"
+            )
     publish = os.environ.get("CI_PUBLISH") == "true"
     if publish and (
         os.environ["GITHUB_REPOSITORY"] != "rubys/roundhouse"
@@ -468,7 +643,13 @@ def main():
         or event_name not in {"schedule", "workflow_dispatch"}
     ):
         raise ValueError("publication is only allowed by canonical main's full caller")
-    plan = select(paths, draft=pr.get("draft", False), full=full, publish=publish)
+    plan = select(
+        paths,
+        full=full,
+        spinel_lane=spinel_lane,
+        publish=publish,
+        project_scope=project_scope,
+    )
     if reason:
         plan["reasons"].append(reason)
     spinel = os.environ.get("CI_SPINEL_REVISION", "")

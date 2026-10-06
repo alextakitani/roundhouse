@@ -34,6 +34,8 @@ pub(super) fn with_core_class_reopen<R>(yes: bool, f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// Emit Ruby-family syntax while retaining diagnostics and typed primitive
+/// semantics, including the no-block form of String#bytes with literal &nil.
 pub fn emit_expr(e: &Expr) -> String {
     // A site a lowering replaced with a stub — `lower::object_extend`,
     // the arel `ColumnSpec::Named` placeholder — renders as the raise
@@ -47,6 +49,14 @@ pub fn emit_expr(e: &Expr) -> String {
         let stub = crate::emit::diagnostics::StubStyle::Raise
             .render(&crate::diagnostic::Diagnostic::stub_text(kind));
         return format!("({stub})");
+    }
+    if crate::emit::shared::string_bytes::materializes_array(e) {
+        if let ExprNode::Send { recv, method, args, parenthesized, .. } = &*e.node {
+            // Literal &nil supplies no block. Canonicalize it here so Spinel
+            // takes the array-returning native bytes path too; arbitrary block
+            // expressions retain their effects through the ordinary emitter.
+            return emit_send_base(recv.as_ref(), method, args, *parenthesized);
+        }
     }
     if is_mutable_string_literal(e) {
         return format!("+{}", emit_node(&e.node));
@@ -90,6 +100,17 @@ fn contains_assign(e: &Expr) -> bool {
     ) {
         return true;
     }
+    let mut names = Vec::new();
+    match &*e.node {
+        ExprNode::MatchPredicate { pattern, .. } | ExprNode::MatchRequired { pattern, .. } => {
+            pattern.bound_names(&mut names);
+        }
+        ExprNode::CaseMatch { arms, .. } => {
+            for arm in arms { arm.pattern.bound_names(&mut names); }
+        }
+        _ => {}
+    }
+    if !names.is_empty() { return true; }
     let mut found = false;
     e.node.for_each_child(&mut |c| {
         if !found && contains_assign(c) {
@@ -105,9 +126,7 @@ fn emit_node(n: &ExprNode) -> String {
         ExprNode::Var { name, .. } => emit_local_read(name.as_str()),
         ExprNode::Ivar { name } => format!("@{name}"),
         ExprNode::SelfRef => "self".to_string(),
-        ExprNode::Const { path } => {
-            path.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("::")
-        }
+        ExprNode::Const { path } => emit_const_path(path),
         ExprNode::Hash { entries, kwargs } => emit_hash(entries, *kwargs),
         ExprNode::Array { elements, style } => emit_array(elements, style),
         ExprNode::StringInterp { parts } => emit_string_interp(parts),
@@ -196,12 +215,44 @@ fn emit_node(n: &ExprNode) -> String {
             s.push_str("end");
             s
         }
+        // No explicit `else … raise` needed: CRuby's own `case/in`
+        // already raises `NoMatchingPatternError` on an unmatched
+        // scrutinee when there's no `else` clause, which is exactly
+        // the semantics `else_body: None` means in this IR.
+        ExprNode::CaseMatch { scrutinee, arms, else_body } => {
+            let mut s = format!("case {}\n", emit_expr(scrutinee));
+            for arm in arms {
+                s.push_str(&emit_match_arm(arm));
+            }
+            if let Some(eb) = else_body {
+                s.push_str("else\n");
+                s.push_str(&indent_lines(&emit_expr(eb), 1));
+                s.push('\n');
+            }
+            s.push_str("end");
+            s
+        }
+        ExprNode::MatchPredicate { value, pattern } => {
+            // `in` binds below assignment and boolean operators. Protect
+            // both the subject and the match when embedded in another expression.
+            format!("(({}) in {})", emit_expr(value), emit_match_pattern(pattern))
+        }
+        ExprNode::MatchRequired { value, pattern } => {
+            format!("(({}) => {})", emit_expr(value), emit_match_pattern(pattern))
+        }
         ExprNode::Seq { exprs } => {
             let mut out = String::new();
             for (i, e) in exprs.iter().enumerate() {
                 if i > 0 {
                     out.push('\n');
                     if e.leading_blank_line {
+                        out.push('\n');
+                    }
+                    // Not before the first: a value-site Seq renders as
+                    // `(a\nb)`, and the marker must start its line. The
+                    // enclosing statement's or def's marker covers it.
+                    if let Some(m) = super::source_markers::marker_for(&e.span) {
+                        out.push_str(&m);
                         out.push('\n');
                     }
                 }
@@ -287,7 +338,7 @@ fn emit_node(n: &ExprNode) -> String {
         ExprNode::Super { args } => match args {
             None => "super".to_string(),
             Some(args) => {
-                let args_s: Vec<String> = args.iter().map(emit_arg).collect();
+                let args_s: Vec<String> = args.iter().map(emit_keyword_forward_arg).collect();
                 format!("super({})", args_s.join(", "))
             }
         },
@@ -303,6 +354,8 @@ fn emit_node(n: &ExprNode) -> String {
         ExprNode::Redo => "redo".to_string(),
         ExprNode::Splat { value } => format!("*{}", emit_expr(value)),
         ExprNode::ForwardArgs => "...".to_string(),
+        ExprNode::ForwardKeywords => "**".to_string(),
+        ExprNode::Defined { operand } => format!("defined?({})", emit_expr(operand)),
         ExprNode::KeywordSplat { value } => format!("**{}", paren_multiline(emit_arg(value))),
         ExprNode::MultiAssign { targets, value } => {
             let lhs: Vec<String> = targets.iter().map(emit_lvalue).collect();
@@ -753,7 +806,7 @@ fn emit_hash(entries: &[(Expr, Expr)], kwargs: bool) -> String {
 
 /// Can `s` appear as a bareword hash key (`s: value`)? The bareword form
 /// requires a `[A-Za-z_][A-Za-z0-9_]*` identifier, optionally ending in
-/// `?`, `!`, or `=`. Anything else (hyphens, spaces, colons, digits-first)
+/// `?` or `!`. Anything else (hyphens, spaces, colons, digits-first, `=`)
 /// must be quoted: `"s": value`.
 fn is_simple_ident(s: &str) -> bool {
     let mut chars = s.chars();
@@ -769,7 +822,7 @@ fn is_simple_ident(s: &str) -> bool {
         if c.is_ascii_alphanumeric() || c == '_' {
             continue;
         }
-        if matches!(c, '?' | '!' | '=') {
+        if matches!(c, '?' | '!') {
             saw_suffix = true;
             continue;
         }
@@ -998,12 +1051,12 @@ pub(super) fn emit_send_base(
     args: &[Expr],
     parenthesized: bool,
 ) -> String {
-    let args_s: Vec<String> = args.iter().map(emit_arg).collect();
+    let args_s: Vec<String> = args.iter().map(emit_keyword_forward_arg).collect();
     let m = method.as_str();
     // `...` is a send argument packet, never an index or infix operand.
     // Preserve explicit call syntax even for operator/setter method names
     // and `self`, before any surface-syntax prettification below.
-    if args.iter().any(|a| matches!(&*a.node, ExprNode::ForwardArgs | ExprNode::KeywordSplat { .. })) {
+    if args.iter().any(|a| matches!(&*a.node, ExprNode::ForwardArgs | ExprNode::ForwardKeywords | ExprNode::KeywordSplat { .. })) {
         return match recv {
             Some(r) => {
                 let receiver = emit_expr(r);
@@ -1124,9 +1177,13 @@ pub(super) fn emit_send_base(
             // Equality/comparison operators are non-associative in Ruby:
             // `a <=> b == 0` does not parse, so an equal-precedence left
             // operand needs parens too.
-            let lhs = if binop_of(r).is_some_and(|o| {
-                binop_prec(o) < prec || (prec == 30 && binop_prec(o) == 30)
-            }) {
+            // A trailing-modifier operand (`(x rescue nil) == true`) would
+            // swallow the operator.
+            let lhs = if renders_as_trailing_modifier(r)
+                || binop_of(r).is_some_and(|o| {
+                    binop_prec(o) < prec || (prec == 30 && binop_prec(o) == 30)
+                })
+            {
                 format!("({})", emit_expr(r))
             } else {
                 emit_expr(r)
@@ -1148,7 +1205,7 @@ pub(super) fn emit_send_base(
         (None, _) => {
             if args_s.is_empty() {
                 method.to_string()
-            } else if parenthesized {
+            } else if parenthesized || first_arg_opens_block(&args_s) {
                 format!("{method}({})", args_s.join(", "))
             } else {
                 format!("{method} {}", args_s.join(", "))
@@ -1159,13 +1216,21 @@ pub(super) fn emit_send_base(
             let recv_s = if recv_needs_parens(r) { format!("({recv_s})") } else { recv_s };
             if args_s.is_empty() {
                 format!("{recv_s}.{method}")
-            } else if parenthesized {
+            } else if parenthesized || first_arg_opens_block(&args_s) {
                 format!("{recv_s}.{method}({})", args_s.join(", "))
             } else {
                 format!("{recv_s}.{method} {}", args_s.join(", "))
             }
         }
     }
+}
+
+/// A leading `if`/`case`/… argument must be parenthesized: paren-less,
+/// `j if c … end` reads `if` as a statement modifier of the call.
+fn first_arg_opens_block(args_s: &[String]) -> bool {
+    args_s.first().is_some_and(|a| {
+        ["if ", "unless ", "case ", "while ", "until ", "begin"].iter().any(|k| a.starts_with(k))
+    })
 }
 
 /// A read of the local `name`. A reserved-word local (a keyword param
@@ -1392,6 +1457,26 @@ pub(crate) fn ruby_sym_literal(value: &str) -> String {
     }
 }
 
+/// A call or `super` argument. A bare `**` is already a keyword splat;
+/// wrapping it again would print `****`.
+fn emit_keyword_forward_arg(arg: &Expr) -> String {
+    if matches!(&*arg.node, ExprNode::KeywordSplat { .. }) {
+        emit_node(&arg.node)
+    } else {
+        emit_arg(arg)
+    }
+}
+
+/// `::File` is stored with an empty first segment. Joining that as
+/// `::File` keeps the rooted spelling; a relative path stays `A::B`.
+fn emit_const_path(path: &[crate::Symbol]) -> String {
+    if path.first().is_some_and(|s| s.as_str().is_empty()) {
+        format!("::{}", path[1..].iter().map(|s| s.to_string()).collect::<Vec<_>>().join("::"))
+    } else {
+        path.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("::")
+    }
+}
+
 pub(super) fn emit_literal(l: &Literal) -> String {
     match l {
         Literal::Nil => "nil".to_string(),
@@ -1472,6 +1557,124 @@ fn emit_pattern(p: &Pattern) -> String {
     }
 }
 
+/// Emit one `CaseMatch` arm as Ruby's `in pattern [if/unless guard]`.
+fn emit_match_arm(arm: &crate::expr::MatchArm) -> String {
+    use crate::expr::MatchGuardKind;
+    let mut s = format!("in {}", emit_match_pattern(&arm.pattern));
+    if let Some((kind, g)) = &arm.guard {
+        let kw = match kind {
+            MatchGuardKind::If => "if",
+            MatchGuardKind::Unless => "unless",
+        };
+        s.push_str(&format!(" {kw} {}", emit_expr(g)));
+    }
+    s.push('\n');
+    s.push_str(&indent_lines(&emit_expr(&arm.body), 1));
+    s.push('\n');
+    s
+}
+
+/// Emit a `MatchPattern` as Ruby `case/in` pattern syntax — the
+/// round-trip-checked inverse of `ingest_pattern`.
+///
+/// `Value`'s pin handling is the one non-obvious case: CRuby's pattern
+/// grammar treats a bare identifier as ALWAYS binding (that's
+/// `MatchPattern::Bind`, handled below), so the only way a `Var`/`Ivar`
+/// read ends up wrapped in `Value` is if the source pinned it (`^name`,
+/// `^@name`) — `ingest_pattern` folds both `PinnedVariableNode` and
+/// `PinnedExpressionNode` into `Value` with no separate "was this
+/// pinned" flag, since the pin sigil is recoverable from the payload
+/// shape alone. Anything else non-literal/non-const/non-range inside a
+/// `Value` (a method call, a boolop, …) is equally pin-only — Ruby's
+/// grammar rejects an unpinned arbitrary expression in pattern
+/// position — so it gets the general `^(expr)` form. This loses exact
+/// byte fidelity for a source that wrote `^(x)` around a bare variable
+/// (re-emitted as `^x`), which is fine: `roundhouse-ast --round-trip`
+/// checks that re-ingesting reaches the same IR, and `^x` and `^(x)`
+/// ingest identically.
+fn emit_match_pattern(p: &crate::expr::MatchPattern) -> String {
+    use crate::expr::{HashRest, MatchPattern};
+    match p {
+        MatchPattern::Nil => "nil".to_string(),
+        MatchPattern::Bind { name } => name.to_string(),
+        MatchPattern::Value { expr } => match &*expr.node {
+            // A bare `nil` ingests as MatchPattern::Nil, so this shape
+            // can only have come from a pinned expression.
+            ExprNode::Lit { value: Literal::Nil } => "^(nil)".to_string(),
+            ExprNode::Lit { .. } | ExprNode::Const { .. } | ExprNode::Range { .. } => {
+                emit_expr(expr)
+            }
+            ExprNode::Var { name, .. } => format!("^{name}"),
+            ExprNode::Ivar { name } => format!("^@{name}"),
+            _ => format!("^({})", emit_expr(expr)),
+        },
+        MatchPattern::Capture { pattern, name } => {
+            format!("({} => {name})", emit_match_pattern(pattern))
+        }
+        MatchPattern::Alt { alternatives } => {
+            format!("({})", alternatives.iter().map(emit_match_pattern).collect::<Vec<_>>().join(" | "))
+        }
+        MatchPattern::Array { constant, pre, rest, post } => {
+            let mut parts: Vec<String> = pre.iter().map(emit_match_pattern).collect();
+            if let Some(r) = rest {
+                parts.push(match r {
+                    Some(name) => format!("*{name}"),
+                    None => "*".to_string(),
+                });
+            }
+            parts.extend(post.iter().map(emit_match_pattern));
+            match constant {
+                Some(c) => format!("{}({})", emit_expr(c), parts.join(", ")),
+                None => format!("[{}]", parts.join(", ")),
+            }
+        }
+        MatchPattern::Find { constant, pre_rest, middle, post_rest } => {
+            let mut parts: Vec<String> = Vec::new();
+            parts.push(match pre_rest {
+                Some(name) => format!("*{name}"),
+                None => "*".to_string(),
+            });
+            parts.extend(middle.iter().map(emit_match_pattern));
+            parts.push(match post_rest {
+                Some(name) => format!("*{name}"),
+                None => "*".to_string(),
+            });
+            let inner = format!("[{}]", parts.join(", "));
+            match constant {
+                Some(c) => format!("{}{inner}", emit_expr(c)),
+                None => inner,
+            }
+        }
+        MatchPattern::Hash { constant, pairs, rest } => {
+            let mut parts: Vec<String> = pairs
+                .iter()
+                .map(|(key, sub)| {
+                    let key = if is_simple_ident(key.as_str()) {
+                        key.to_string()
+                    } else {
+                        ruby_str_literal(key.as_str())
+                    };
+                    match sub {
+                        Some(p) => format!("{key}: {}", emit_match_pattern(p)),
+                        None => format!("{key}:"),
+                    }
+                })
+                .collect();
+            if let Some(r) = rest {
+                parts.push(match r {
+                    HashRest::Ignore => "**".to_string(),
+                    HashRest::Collect { name } => format!("**{name}"),
+                    HashRest::Nil => "**nil".to_string(),
+                });
+            }
+            match constant {
+                Some(c) => format!("{}({})", emit_expr(c), parts.join(", ")),
+                None => format!("{{ {} }}", parts.join(", ")),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1485,6 +1688,41 @@ mod tests {
 
     fn lit_str(s: &str) -> Expr {
         Expr::new(Span::default(), ExprNode::Lit { value: Literal::Str { value: s.to_string() } })
+    }
+
+    #[test]
+    fn a_rescue_modifier_operand_keeps_its_parens() {
+        let rescued = Expr::new(
+            Span::default(),
+            ExprNode::RescueModifier {
+                expr: send(None, "a", vec![]),
+                fallback: lit_sym("n"),
+            },
+        );
+        let eq = send(Some(rescued.clone()), "==", vec![lit_sym("n")]);
+        assert_eq!(emit_expr(&eq), "(a rescue :n) == :n");
+        let eq = send(Some(lit_sym("n")), "==", vec![rescued]);
+        assert_eq!(emit_expr(&eq), ":n == (a rescue :n)");
+    }
+
+    #[test]
+    fn a_command_call_with_an_if_argument_is_parenthesized() {
+        let cond = send(None, "c", vec![]);
+        let branch = Expr::new(
+            Span::default(),
+            ExprNode::If { cond, then_branch: lit_str("m"), else_branch: lit_str("f") },
+        );
+        let call = Expr::new(
+            Span::default(),
+            ExprNode::Send {
+                recv: None,
+                method: Symbol::from("j"),
+                args: vec![branch],
+                block: None,
+                parenthesized: false,
+            },
+        );
+        assert!(emit_expr(&call).starts_with("j(if "), "got {}", emit_expr(&call));
     }
 
     fn self_ref() -> Expr {
