@@ -1093,6 +1093,7 @@ pub(super) fn library_class_from_module_node_with_scope(
 fn take_class_ivar_initializers(calls: &mut Vec<Expr>) -> Vec<Expr> {
     calls.extract_if(.., |expr| matches!(&*expr.node,
         ExprNode::Assign { target: LValue::Ivar { .. }, .. }
+        | ExprNode::OpAssign { target: LValue::Ivar { .. }, .. }
     )).collect()
 }
 
@@ -1538,9 +1539,14 @@ fn walk_decl_body_with_visibility<'pr>(
             out.constants.push((name, value));
             continue;
         }
-        // A direct assignment initializes this class/module object. Inside
+        // A direct write initializes this class/module object. Inside
         // `class << self` the receiver is its singleton class instead.
-        if !force_class_receiver && stmt.as_instance_variable_write_node().is_some() {
+        if !force_class_receiver
+            && (stmt.as_instance_variable_write_node().is_some()
+                || stmt.as_instance_variable_or_write_node().is_some()
+                || stmt.as_instance_variable_and_write_node().is_some()
+                || stmt.as_instance_variable_operator_write_node().is_some())
+        {
             out.unknown_calls.push(ingest_expr(&stmt, file)?);
             continue;
         }

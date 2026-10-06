@@ -220,6 +220,53 @@ fn class_instance_state_preserves_subclass_accessors() {
     subclass_accessors_app().run_ruby(SUBCLASS_ACCESSORS).assert_passes();
 }
 
+const COMPOUND_SOURCE: &str = r#"class DefaultCounter
+  @value ||= 7
+  FIRST = @value
+  @value ||= 1 / 0
+  @falsey = false
+  @falsey ||= 13
+  FALSEY = @falsey
+  @unset &&= 1 / 0
+  UNSET = @unset
+  @value += 5
+  SECOND = @value
+  @value &&= 14
+  def self.value
+    @value
+  end
+end
+"#;
+
+fn compound_state_app(is_module: bool) -> emit_and_run::Overlay {
+    let source = if is_module {
+        COMPOUND_SOURCE.replacen("class DefaultCounter", "module DefaultCounter", 1)
+    } else {
+        COMPOUND_SOURCE.to_string()
+    };
+    app().write("app/services/default_counter.rb", &source)
+}
+
+const COMPOUND_STATE: &str = r#"raise "default initializer lost" unless DefaultCounter::FIRST == 7
+raise "falsey default lost" unless DefaultCounter::FALSEY == 13
+raise "unset &&= ran" unless DefaultCounter::UNSET.nil?
+raise "compound write reordered" unless DefaultCounter::SECOND == 12
+raise "truthy &&= lost" unless DefaultCounter.value == 14
+require_relative "app/models/default_counter"
+raise "compound initializer ran twice" unless DefaultCounter.value == 14
+puts "compound class state passed"
+"#;
+
+#[test]
+fn class_instance_state_retains_compound_writes() {
+    compound_state_app(false).run_ruby(COMPOUND_STATE).assert_passes();
+}
+
+#[test]
+fn module_instance_state_retains_compound_writes() {
+    compound_state_app(true).run_ruby(COMPOUND_STATE).assert_passes();
+}
+
 #[test]
 #[ignore = "requires the native Spinel compiler"]
 fn class_instance_state_runs_natively() {
@@ -228,6 +275,8 @@ fn class_instance_state_runs_natively() {
     module_state_app().run_spinel(MODULE_STATE).assert_passes();
     method_order_app().run_spinel(METHOD_ORDER).assert_passes();
     subclass_accessors_app().run_spinel(SUBCLASS_ACCESSORS).assert_passes();
+    compound_state_app(false).run_spinel(COMPOUND_STATE).assert_passes();
+    compound_state_app(true).run_spinel(COMPOUND_STATE).assert_passes();
 }
 
 #[test]
