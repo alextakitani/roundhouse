@@ -620,12 +620,23 @@ fn expand_mattr_cattr(
     if unsupported || names.is_empty() {
         return Ok(None);
     }
-    // A default needs a home on the model; concern collectors that cannot
-    // carry class-ivar seeds must leave the declaration unexpanded.
+    // A non-nil / block default needs a home on the model; concern
+    // collectors that cannot carry class-variable seeds leave the
+    // declaration unexpanded. Plain mattr/cattr still expand accessors.
     if default.is_some() && class_attr_defaults.is_none() {
         return Ok(None);
     }
-    if let (Some(defaults), Some(expr)) = (class_attr_defaults, default) {
+    if let Some(defaults) = class_attr_defaults {
+        // Rails `class_variable_set`: nil when no default, else the value.
+        // `@@` storage requires an explicit seed (unlike `@ivar`).
+        let expr = default.unwrap_or_else(|| {
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::Lit {
+                    value: Literal::Nil,
+                },
+            )
+        });
         for attr in &names {
             defaults.insert(attr.clone(), expr.clone());
         }
@@ -639,9 +650,9 @@ fn expand_mattr_cattr(
         } else {
             Vec::new()
         };
-        // Class side owns `@attr` (and the default seed). Instance side
-        // delegates to `self.class`, as Rails' mattr/cattr copies do —
-        // a shared ivar on the instance would miss the class default.
+        // Class side owns `@@attr` (shared across the hierarchy). Instance
+        // side delegates to `self.class`, matching Rails' mattr/cattr
+        // copies without placing a per-instance ivar.
         let mut first_method = true;
         let mut push = |method: crate::dialect::MethodDef| {
             out.push(ModelBodyItem::Method {
@@ -656,7 +667,7 @@ fn expand_mattr_cattr(
             first_method = false;
         };
         if want_reader {
-            push(super::library_class::synth_attr_reader(
+            push(super::library_class::synth_mattr_reader(
                 owner,
                 attr,
                 crate::dialect::MethodReceiver::Class,
@@ -664,7 +675,7 @@ fn expand_mattr_cattr(
             push(synth_mattr_instance_reader(owner, attr));
         }
         if want_writer {
-            push(super::library_class::synth_attr_writer(
+            push(super::library_class::synth_mattr_writer(
                 owner,
                 attr,
                 crate::dialect::MethodReceiver::Class,

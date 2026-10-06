@@ -1124,51 +1124,48 @@ impl DeclBody {
         has_class_attr_default: bool,
         file: &str,
     ) -> IngestResult<()> {
-        fn writes_classvar(expr: &Expr, class_attributes: Option<&HashSet<Symbol>>) -> bool {
-            if let ExprNode::Assign { target: LValue::Var { name, .. }, .. }
-                | ExprNode::OpAssign { target: LValue::Var { name, .. }, .. } = &*expr.node
-                && let Some(bare) = name.as_str().strip_prefix("@@")
-                && class_attributes.is_none_or(|attrs| attrs.iter().any(|attr| attr.as_str() == bare))
-            {
-                return true;
-            }
-            let mut found = false;
-            expr.node.for_each_child(&mut |child| found |= writes_classvar(child, class_attributes));
-            found
-        }
-        for m in &mut self.methods {
-            if writes_classvar(&m.body, Some(class_attributes)) {
-                return Err(IngestError::Unsupported {
-                    file: file.into(),
-                    message: "native class-variable writes alongside cattr/mattr storage are not modeled".into(),
-                });
-            }
-            if m.receiver == MethodReceiver::Class {
-                // Native @@ storage is shared with subclasses, unlike the
-                // per-class @ storage of the existing cattr approximation.
-                if writes_classvar(&m.body, None) {
-                    return Err(IngestError::Unsupported {
-                        file: file.into(),
-                        message: "class-variable writes in class methods require shared inheritance storage".into(),
-                    });
-                }
-                normalize_classvars_to_ivars(&mut m.body, class_attributes);
-            }
-        }
-        // Preserve standalone cattr/mattr approximation, but never erase
-        // initialization across a default: these effects depend on order.
+        // Library-class `default:` / block values are not applied here
+        // (model ingest owns those seeds). Mixing the flag with native
+        // @@ initializers would drop or reorder the default — refuse.
         if has_class_attr_default && !self.class_initializers.is_empty() {
             return Err(IngestError::Unsupported {
                 file: file.into(),
                 message: "cattr/mattr defaults require source-order initialization".into(),
             });
         }
-        self.class_initializers.retain(|expr| !matches!(&*expr.node,
-            ExprNode::Assign { target: LValue::Var { name, .. }, .. }
-                if name.as_str().strip_prefix("@@").is_some_and(|bare|
-                    class_attributes.iter().any(|attr| attr.as_str() == bare))));
-        if !self.class_initializers.is_empty()
-            && (!self.unknown_calls.is_empty() || !self.constants.is_empty() || !self.includes.is_empty())
+        // Rails mattr/cattr uses @@ shared across the hierarchy. Seed
+        // `@@attr = nil` when no source initializer and no unmodeled
+        // default (matches `class_variable_set` in Module#mattr_reader).
+        if !has_class_attr_default {
+            let mut attrs: Vec<&Symbol> = class_attributes.iter().collect();
+            attrs.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            for attr in attrs {
+                let cvar = mattr_cvar_name(attr);
+                let already = self.class_initializers.iter().any(|expr| {
+                    matches!(
+                        &*expr.node,
+                        ExprNode::Assign {
+                            target: LValue::Var { name, .. },
+                            ..
+                        } if name == &cvar
+                    )
+                });
+                if !already {
+                    self.class_initializers.push(mattr_nil_seed(attr));
+                }
+            }
+        }
+        // Source-spanned @@ initializers still need a body with no other
+        // class-body buckets (ordering). Synthetic mattr nil seeds are
+        // order-insensitive relative to includes/constants.
+        let has_source_ordered_init = self
+            .class_initializers
+            .iter()
+            .any(|expr| !expr.span.is_synthetic());
+        if has_source_ordered_init
+            && (!self.unknown_calls.is_empty()
+                || !self.constants.is_empty()
+                || !self.includes.is_empty())
         {
             return Err(IngestError::Unsupported {
                 file: file.into(),
@@ -1753,10 +1750,10 @@ fn walk_decl_body_with_visibility<'pr>(
                         //   attr_writer :foo  → def foo=(v); @foo = v; end
                         //   attr_accessor :foo → both
                         // The `cattr_*` / `mattr_*` (ActiveSupport class- and
-                        // module-level attribute accessors) generate the same
-                        // pair on the *singleton*, so a bare `Keybase.DOMAIN`
-                        // resolves; we model the class form (Rails also makes
-                        // instance-level copies, not needed by the corpus).
+                        // module-level attribute accessors) use @@ storage
+                        // shared across the class hierarchy. We model the
+                        // class form (Rails also makes instance-level
+                        // copies; models synthesize those separately).
                         let is_class_attr =
                             kw.starts_with("cattr_") || kw.starts_with("mattr_");
                         let mut has_default = is_class_attr && call.block().is_some();
@@ -1788,7 +1785,11 @@ fn walk_decl_body_with_visibility<'pr>(
                             let want_reader = kw.ends_with("_reader") || kw.ends_with("_accessor");
                             let want_writer = kw.ends_with("_writer") || kw.ends_with("_accessor");
                             if want_reader {
-                                let mut method = synth_attr_reader(owner, name, recv);
+                                let mut method = if is_class_attr {
+                                    synth_mattr_reader(owner, name, recv)
+                                } else {
+                                    synth_attr_reader(owner, name, recv)
+                                };
                                 visibility.apply(&statement, &mut method);
                                 // Skip when a `def` of this name already
                                 // walked (unusual order); a later `def`
@@ -1800,7 +1801,11 @@ fn walk_decl_body_with_visibility<'pr>(
                                 }
                             }
                             if want_writer {
-                                let mut method = synth_attr_writer(owner, name, recv);
+                                let mut method = if is_class_attr {
+                                    synth_mattr_writer(owner, name, recv)
+                                } else {
+                                    synth_attr_writer(owner, name, recv)
+                                };
                                 visibility.apply(&statement, &mut method);
                                 if !out.methods.iter().any(|e| {
                                     e.name == method.name && e.receiver == method.receiver
@@ -1964,21 +1969,6 @@ fn walk_decl_body_with_visibility<'pr>(
     Ok(out)
 }
 
-/// Only declared cattr/mattr reads use the existing class-ivar approximation.
-/// Ordinary class-variable reads retain native shared inheritance storage.
-fn normalize_classvars_to_ivars(e: &mut Expr, class_attributes: &HashSet<Symbol>) {
-    match &mut *e.node {
-        ExprNode::Var { name, .. } if name.as_str().starts_with("@@")
-            && class_attributes.iter().any(|attr| attr.as_str() == &name.as_str()[2..]) => {
-            let bare = Symbol::from(&name.as_str()[2..]);
-            *e.node = ExprNode::Ivar { name: bare };
-        }
-        _ => {
-            e.node.for_each_child_mut(&mut |c| normalize_classvars_to_ivars(c, class_attributes));
-        }
-    }
-}
-
 /// For `alias_method :new, :old`: the new name, and the index of the
 /// last `old` already walked on the same side (instance, or class inside
 /// `class << self`). None when either name is not a literal symbol or
@@ -2029,6 +2019,99 @@ pub(crate) fn synth_attr_reader(owner: &ClassId, name: &Symbol, receiver: Method
         is_async: false,
             mutates_self: false,
             block_param: None,
+    }
+}
+
+/// Class-variable name for a `mattr_*` / `cattr_*` attribute (`@@channel`).
+pub(crate) fn mattr_cvar_name(attr: &Symbol) -> Symbol {
+    Symbol::from(format!("@@{}", attr.as_str()))
+}
+
+/// Rails `mattr_*` / `cattr_*` seed: `@@attr = nil` when no default is set
+/// (`Module#mattr_reader` calls `class_variable_set` so first read is nil).
+pub(crate) fn mattr_nil_seed(attr: &Symbol) -> Expr {
+    Expr::new(
+        Span::synthetic(),
+        ExprNode::Assign {
+            target: LValue::Var {
+                id: VarId(0),
+                name: mattr_cvar_name(attr),
+            },
+            value: Expr::new(
+                Span::synthetic(),
+                ExprNode::Lit {
+                    value: Literal::Nil,
+                },
+            ),
+        },
+    )
+}
+
+/// `def self.<name>; @@<name>; end` — Rails mattr/cattr class reader
+/// (shared across the inheritance hierarchy).
+pub(crate) fn synth_mattr_reader(owner: &ClassId, name: &Symbol, receiver: MethodReceiver) -> MethodDef {
+    let body = Expr::new(
+        Span::synthetic(),
+        ExprNode::Var {
+            id: VarId(0),
+            name: mattr_cvar_name(name),
+        },
+    );
+    MethodDef {
+        name_span: Span::synthetic(),
+        name: name.clone(),
+        receiver,
+        visibility: crate::dialect::MethodVisibility::Public,
+        params: Vec::new(),
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        body,
+        signature: None,
+        effects: EffectSet::default(),
+        enclosing_class: Some(owner.0.clone()),
+        kind: crate::dialect::AccessorKind::AttributeReader,
+        is_async: false,
+        mutates_self: false,
+        block_param: None,
+    }
+}
+
+/// `def self.<name>=(value); @@<name> = value; end` — Rails mattr/cattr
+/// writer; subclass writes update the declaring class's value.
+pub(crate) fn synth_mattr_writer(owner: &ClassId, name: &Symbol, receiver: MethodReceiver) -> MethodDef {
+    let value_param = Symbol::from("value");
+    let body = Expr::new(
+        Span::synthetic(),
+        ExprNode::Assign {
+            target: LValue::Var {
+                id: VarId(0),
+                name: mattr_cvar_name(name),
+            },
+            value: Expr::new(
+                Span::synthetic(),
+                ExprNode::Var {
+                    id: VarId(0),
+                    name: value_param.clone(),
+                },
+            ),
+        },
+    );
+    MethodDef {
+        name_span: Span::synthetic(),
+        name: Symbol::from(format!("{}=", name.as_str())),
+        receiver,
+        visibility: crate::dialect::MethodVisibility::Public,
+        params: vec![Param::positional(value_param)],
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        body,
+        signature: None,
+        effects: EffectSet::default(),
+        enclosing_class: Some(owner.0.clone()),
+        kind: crate::dialect::AccessorKind::AttributeWriter,
+        is_async: false,
+        mutates_self: false,
+        block_param: None,
     }
 }
 

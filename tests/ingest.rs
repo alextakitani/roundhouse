@@ -2036,12 +2036,27 @@ fn richer_defined_call_shapes_remain_explicitly_unsupported() {
 }
 
 #[test]
-fn native_classvar_writes_cannot_split_modeled_cattr_storage() {
+fn mattr_and_native_classvar_writes_share_storage() {
+    // Rails mattr/cattr is @@; a hand-written @@ write is the same slot.
     for declaration in ["cattr_accessor", "mattr_accessor"] {
-        let source = format!("class Probe; {declaration} :count; def bump; @@count = 11; end; def self.current; @@count; end; end");
-        let err = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
-            .expect_err("native and modeled storage cannot silently diverge");
-        assert!(err.to_string().contains("alongside cattr/mattr storage"), "{err}");
+        let source = format!(
+            "class Probe; {declaration} :count; def bump; @@count = 11; end; def self.current; @@count; end; end"
+        );
+        let classes = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
+            .expect("shared @@ storage must ingest");
+        assert!(
+            classes[0].class_ivar_initializers.iter().any(|expr| {
+                matches!(
+                    &*expr.node,
+                    ExprNode::Assign {
+                        target: LValue::Var { name, .. },
+                        ..
+                    } if name.as_str() == "@@count"
+                )
+            }),
+            "mattr seeds @@count = nil: {:?}",
+            classes[0].class_ivar_initializers
+        );
     }
 }
 
@@ -2060,15 +2075,26 @@ fn cattr_defaults_cannot_be_silently_dropped_with_native_initializers() {
                     .expect_err("an unmodeled default must not become an unset class ivar");
                 assert!(err.to_string().contains("cattr/mattr defaults require source-order initialization"), "{err}");
             }
-            // Standalone cattr/mattr modeling predates this native-initializer
-            // slice; don't widen its existing approximation in this PR.
+            // Standalone cattr/mattr with default: still synthesizes accessors;
+            // applying the default value is a separate claim.
             let source = format!("class Probe; {call}; end");
             roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
                 .expect("standalone class-attribute ingest remains unchanged");
         }
         let source = format!("class Probe; @@count = nil; {declaration} :count; end");
         let classes = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb").unwrap();
-        assert!(classes[0].class_ivar_initializers.is_empty(), "default-free nil storage remains modeled");
+        assert_eq!(
+            classes[0].class_ivar_initializers.len(),
+            1,
+            "source @@nil seed is kept for shared mattr storage"
+        );
+        assert!(matches!(
+            &*classes[0].class_ivar_initializers[0].node,
+            ExprNode::Assign {
+                target: LValue::Var { name, .. },
+                ..
+            } if name.as_str() == "@@count"
+        ));
     }
 }
 

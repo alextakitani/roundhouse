@@ -6509,9 +6509,10 @@ fn emit_library_class_decl_inner(
     }
 
     // Finite class-side initialization is lowered IR, not replay of a
-    // framework DSL. Each statement runs once on this class object, after
-    // the class methods it may call (a Concern macro writing its
-    // `class_attribute`); unset subclasses keep their ivar absent.
+    // framework DSL. Runs after class methods (a Concern macro may write
+    // its `class_attribute`). Per-class `@ivar` seeds leave unset
+    // subclasses absent; `mattr_*` / `cattr_*` seeds are `@@` and share
+    // across the hierarchy by Ruby class-variable rules.
     if !lc.class_ivar_initializers.is_empty() && !lc.methods.is_empty() {
         writeln!(s).unwrap();
     }

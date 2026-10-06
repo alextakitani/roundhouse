@@ -576,8 +576,8 @@ fn model_class(model: &Model, methods: Vec<MethodDef>, table: Option<&Table>) ->
     }
 }
 
-/// `mattr_accessor` / `cattr_accessor` `default:` / block seeds → class
-/// ivar writes emitted once on the model class object.
+/// `mattr_*` / `cattr_*` seeds → `@@attr = <expr>` on the model class
+/// object (Rails class-variable storage, shared with subclasses).
 fn collect_class_attr_initializers(model: &Model) -> Vec<Expr> {
     model
         .class_attr_defaults
@@ -586,7 +586,10 @@ fn collect_class_attr_initializers(model: &Model) -> Vec<Expr> {
             Expr::new(
                 Span::synthetic(),
                 ExprNode::Assign {
-                    target: crate::expr::LValue::Ivar { name: name.clone() },
+                    target: crate::expr::LValue::Var {
+                        id: VarId(0),
+                        name: Symbol::from(format!("@@{}", name.as_str())),
+                    },
                     value: value.clone(),
                 },
             )
