@@ -1687,6 +1687,11 @@ fn walk_decl_body_with_visibility<'pr>(
                 if let Some(source) = out.methods.iter().rposition(|method| method.name.as_str() == from && method.receiver == receiver) {
                     let mut copy = out.methods[source].clone();
                     copy.name = Symbol::from(to.as_str());
+                    copy.name_span = Span {
+                        file: super::sources::file_id(file),
+                        start: alias.location().start_offset() as u32,
+                        end: alias.location().end_offset() as u32,
+                    };
                     visibility.apply(&statement, &mut copy);
                     out.methods.push(copy);
                     continue;
@@ -1854,6 +1859,11 @@ fn walk_decl_body_with_visibility<'pr>(
                             alias_source(&call, &out.methods, force_class_receiver).unwrap();
                         let mut copy = out.methods[source].clone();
                         copy.name = Symbol::from(to.as_str());
+                        copy.name_span = Span {
+                            file: super::sources::file_id(file),
+                            start: call.location().start_offset() as u32,
+                            end: call.location().end_offset() as u32,
+                        };
                         visibility.apply(&statement, &mut copy);
                         out.methods.push(copy);
                     }
