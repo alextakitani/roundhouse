@@ -1818,6 +1818,12 @@ end
     crate::lower::rich_text::synthesize_record_model(&mut app);
     crate::lower::plain_text_attr::synthesize_record_model(&mut app);
     crate::lower::attachment_model::synthesize_attachment_model(&mut app);
+    // Second chance for `on_load(:active_storage_attachment)` includes
+    // whose target was only synthesized above; then splice so
+    // `has_many_attached` from the concern lands on the new model.
+    super::on_load_reopen::apply_pending(&mut app);
+    splice_concerns_into_models(&mut app);
+    super::on_load_reopen::drain_pending(&mut app);
     app.const_resolver = crate::timings::phase("rubydex: wait", || const_resolver.finish());
     // Admission needs complete controller permit demand and model DSL,
     // including declarations contributed by either kind of Concern,

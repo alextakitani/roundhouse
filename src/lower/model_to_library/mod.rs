@@ -976,9 +976,11 @@ pub fn writable_field_set(
     for (_span, attr) in crate::lower::attached::attached_attrs(model) {
         writable.insert(attr);
     }
-    for (_span, attr) in crate::lower::attached::many_attached_attrs(model) {
-        writable.insert(attr);
-    }
+    // `has_many_attached` is claimed for the proxy reader / `.attach` /
+    // `.attachments` surface only. There is no `attr=` / after_save
+    // writer yet (Many appends via the proxy, not mass-assign), so the
+    // attrs stay OUT of the writable set — putting them in would make
+    // `update(uploads: …)` / permit emit a missing writer (inv. 6).
     writable
 }
 

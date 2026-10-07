@@ -263,15 +263,32 @@ fn includes_only_reopen(class: &ruby_prism::ClassNode<'_>) -> Option<Vec<String>
 /// reopens.
 pub(super) fn apply_pending(app: &mut App) {
     let pending = std::mem::take(&mut app.pending_attachment_on_load);
+    let mut still = Vec::new();
     for (model_name, mods) in pending {
-        let name = model_name.as_str().to_string();
         if let Some(model) = app.models.iter_mut().find(|m| m.name.0 == model_name) {
             for path in &mods {
                 push_model_include(model, path.as_str());
             }
         } else {
-            not_carried("<on_load>", "active_storage_attachment", &name);
+            // Model may appear later via synthesis (`has_markdown` /
+            // Attachment table). Keep the queue for a second apply
+            // after synthesize; [`drain_pending`] surveys leftovers.
+            still.push((model_name, mods));
         }
+    }
+    app.pending_attachment_on_load = still;
+}
+
+/// Survey any `on_load(:active_storage_attachment)` includes that
+/// never found a model — call after the last synthesize pass.
+pub(super) fn drain_pending(app: &mut App) {
+    let pending = std::mem::take(&mut app.pending_attachment_on_load);
+    for (model_name, _) in pending {
+        not_carried(
+            "<on_load>",
+            "active_storage_attachment",
+            model_name.as_str(),
+        );
     }
 }
 

@@ -604,6 +604,36 @@ impl Analyzer {
                     args: vec![],
                 });
             }
+            // `ActiveStorage::Attachment` helpers synthesized by
+            // `lower::attachment_model::push_attachment_record_methods`
+            // at the emit seam — register here so `attachment.url` /
+            // `.filename` resolve in check the same way the reader
+            // macros do.
+            if crate::lower::attachment_model::is_attachment_model(model) {
+                let blob = Ty::Class {
+                    id: ClassId(Symbol::from("ActiveStorage::Blob")),
+                    args: vec![],
+                };
+                let filename = Ty::Class {
+                    id: ClassId(Symbol::from("ActiveStorage::Filename")),
+                    args: vec![],
+                };
+                let nilable = |ty: Ty| Ty::Union {
+                    variants: vec![ty, Ty::Nil],
+                };
+                cls.instance_methods
+                    .entry(Symbol::from("blob"))
+                    .or_insert(nilable(blob));
+                cls.instance_methods
+                    .entry(Symbol::from("url"))
+                    .or_insert(Ty::Str);
+                cls.instance_methods
+                    .entry(Symbol::from("filename"))
+                    .or_insert(nilable(filename));
+                cls.instance_methods
+                    .entry(Symbol::from("content_type"))
+                    .or_insert(nilable(Ty::Str));
+            }
             // `attr_accessor :x` — and `attr_accessor *CONST`, which is
             // how campfire's `Opengraph::Metadata` names its four. The
             // reader/writer pair is synthesized by

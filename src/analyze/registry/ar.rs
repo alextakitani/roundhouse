@@ -327,6 +327,9 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
             ("audio?", Ty::Bool),
             ("variable?", Ty::Bool),
             ("url", Ty::Str),
+            // Attachment#url and Attached#url call `redirect_url`;
+            // register it beside `url` so synthesized helpers type.
+            ("redirect_url", Ty::Str),
             // Action Text's `_blob` partial: a previewable or variable
             // blob renders through `representation(transformations)`.
             ("representable?", Ty::Bool),
