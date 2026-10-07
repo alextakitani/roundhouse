@@ -607,7 +607,13 @@ module Db
     last = @checkpoint_warn_at
     return if last && (now - last) < CHECKPOINT_WARN_INTERVAL
     @checkpoint_warn_at = now
-    warn "[db] WAL checkpoint failed: #{error.class}: #{error.message}"
+    begin
+      warn "[db] WAL checkpoint failed: #{error.class}: #{error.message}"
+    rescue StandardError
+      # A failing warning sink must not kill the checkpointer thread —
+      # wal_autocheckpoint is already 0 on serving connections.
+      nil
+    end
   end
   private_class_method :warn_checkpoint_failure
 

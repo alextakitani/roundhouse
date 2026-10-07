@@ -356,6 +356,17 @@ check("first failure warned", out.include?("first"))
 check("second failure suppressed inside the interval", !out.include?("second"))
 check("third failure warned after the interval", out.include?("third"))
 check("warn names the checkpoint", out.include?("WAL checkpoint failed"))
+# A raising warning sink must not escape — otherwise checkpoint_loop dies
+# after wal_autocheckpoint=0 with no restart.
+Db.instance_variable_set(:@checkpoint_warn_at, nil)
+def Kernel.warn(*)
+  raise IOError, "broken pipe"
+end
+begin
+  Db.send(:warn_checkpoint_failure, RuntimeError.new("sink"))
+rescue StandardError => e
+  raise "warn sink escaped: #{e.class}: #{e.message}"
+end
 "#,
     );
 }
