@@ -439,14 +439,22 @@ impl<'a> BodyTyper<'a> {
                     for c in std::iter::once(cls)
                         .chain(cls.includes.iter().filter_map(|m| self.classes().get(m)))
                     {
-                        let sig = if class_object_receiver {
-                            c.class_methods
-                                .get(method)
-                                .or_else(|| c.instance_methods.get(method))
+                        // Prefer the receiver-side table, but if that
+                        // entry is only a return seed (`Nil` / bare
+                        // `Fn` without `block`) while the other side
+                        // still carries the RBS/sig block contract,
+                        // take the block-bearing Fn. Dual-name both-
+                        // sides-with-block keeps the receiver side.
+                        let (preferred, other) = if class_object_receiver {
+                            (&c.class_methods, &c.instance_methods)
                         } else {
-                            c.instance_methods
-                                .get(method)
-                                .or_else(|| c.class_methods.get(method))
+                            (&c.instance_methods, &c.class_methods)
+                        };
+                        let sig = match (preferred.get(method), other.get(method)) {
+                            (Some(s @ Ty::Fn { block: Some(_), .. }), _) => Some(s),
+                            (_, Some(s @ Ty::Fn { block: Some(_), .. })) => Some(s),
+                            (Some(s), _) => Some(s),
+                            (None, o) => o,
                         };
                         if let Some(sig) = sig {
                             // The block's yield may name the receiver
