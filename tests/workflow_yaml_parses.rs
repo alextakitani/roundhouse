@@ -321,7 +321,9 @@ fn host_libvips_dev_jobs_share_cached_apt_deb_install() {
     assert_eq!(save["continue-on-error"].as_bool(), Some(true));
     assert_eq!(
         save["if"].as_str(),
-        Some("steps.cache.outputs.cache-hit != 'true'")
+        Some(
+            "steps.cache.outputs.cache-hit != 'true' && steps.install.outputs.harvested == 'true'"
+        )
     );
     let install = action_steps
         .iter()

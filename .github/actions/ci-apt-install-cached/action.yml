@@ -46,6 +46,7 @@ runs:
           ${{ steps.key.outputs.prefix }}
 
     - name: Install apt packages
+      id: install
       shell: bash
       env:
         PACKAGES: ${{ steps.key.outputs.packages }}
@@ -56,13 +57,19 @@ runs:
         # Package names are caller-controlled (workflow literals).
         # shellcheck disable=SC2086
         "$GITHUB_WORKSPACE/scripts/ci-apt-install" $PACKAGES
-        # Harvest is cache-only; a disk/permission miss must not fail install.
-        "$GITHUB_WORKSPACE/scripts/ci-apt-archives" harvest "$APT_ARCHIVE_DIR" \
-          || echo "::warning::apt archive harvest failed; cache will not be saved"
+        # Harvest is cache-only; a disk/permission miss must not fail install,
+        # and must not save a stale/partial archive dir under today's key.
+        if "$GITHUB_WORKSPACE/scripts/ci-apt-archives" harvest "$APT_ARCHIVE_DIR"; then
+          echo "harvested=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "::warning::apt archive harvest failed; cache will not be saved"
+          echo "harvested=false" >> "$GITHUB_OUTPUT"
+        fi
 
     - name: Save apt .deb archives
-      # Exact hit already holds today's archives. Prefix hits and misses save.
-      if: steps.cache.outputs.cache-hit != 'true'
+      # Exact hit already holds today's archives. Prefix hits and misses save
+      # only when harvest refreshed the archive dir.
+      if: steps.cache.outputs.cache-hit != 'true' && steps.install.outputs.harvested == 'true'
       continue-on-error: true
       uses: actions/cache/save@v6
       with:
