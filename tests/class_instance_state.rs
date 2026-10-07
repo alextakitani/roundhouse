@@ -291,3 +291,49 @@ fn spinel_refuses_class_state_with_redefined_methods() {
     ).unwrap_err();
     assert!(error.contains("method redefinition is not supported (spinel)"), "{error}");
 }
+
+fn once_initialized_app() -> emit_and_run::Overlay {
+    app()
+        .write("app/services/initializer_tally.rb", r#"class InitializerTally
+  @value = 0
+  def self.advance
+    @value += 1
+    @value
+  end
+  def self.value
+    @value
+  end
+end
+"#)
+        .write("app/services/once_initialized.rb", r#"class OnceInitialized
+  @value = InitializerTally.advance
+  FIRST = @value
+  @value = InitializerTally.advance
+  SECOND = @value
+  def self.value
+    @value
+  end
+end
+"#)
+}
+
+const ONCE_INITIALIZED: &str = r#"
+raise "first initializer reordered" unless OnceInitialized::FIRST == 1
+raise "second initializer reordered" unless OnceInitialized::SECOND == 2
+raise "initializer rendered twice" unless OnceInitialized.value == 2
+raise "initializer side effects repeated" unless InitializerTally.value == 2
+require_relative "app/models/once_initialized"
+raise "require repeated initialization" unless InitializerTally.value == 2
+puts "initializers run once in source order"
+"#;
+
+#[test]
+fn class_instance_state_initializers_run_once() {
+    once_initialized_app().run_ruby(ONCE_INITIALIZED).assert_passes();
+}
+
+#[test]
+#[ignore = "requires the native Spinel compiler"]
+fn class_instance_state_initializers_run_once_natively() {
+    once_initialized_app().run_spinel(ONCE_INITIALIZED).assert_passes();
+}

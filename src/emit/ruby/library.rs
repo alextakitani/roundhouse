@@ -6118,7 +6118,12 @@ fn emit_library_class_decl_inner(
     // Source class state can call methods and read constants between writes.
     // Keep those declarations in source order; synthesized framework classes
     // retain their existing initialization/deferral policy.
-    let ordered_body = lc.origin.is_none() && !lc.class_ivar_initializers.is_empty();
+    // Lowered controllers also have no origin, but Concern methods carry
+    // spans from another file. Their offsets cannot order the controller's
+    // macro calls: those initializers must run after all collected methods.
+    let ordered_body = lc.origin.is_none()
+        && !lc.class_ivar_initializers.is_empty()
+        && !app.controllers.iter().any(|controller| controller.name == lc.name);
     let (mut eager, mut deferred, initializers_call_self) = partition_deferred_constants(lc);
     let load_time_bodies = initializers_call_self || !deferred.is_empty();
     if ordered_body {
@@ -6491,11 +6496,14 @@ fn emit_library_class_decl_inner(
         for (_, item) in items {
             match item {
                 BodyItem::Constant(i, _) => render_constants(s, &[*i]),
-                BodyItem::Initializer(expr) => {
+                BodyItem::Initializer(expr) if ordered_body => {
                     for line in super::emit_expr(expr).lines() {
                         writeln!(s, "{body_pad}{line}").unwrap();
                     }
                 }
+                // Keep initialization in the require plan even when the
+                // lowered class renders it after its methods below.
+                BodyItem::Initializer(_) => {}
                 BodyItem::Method(method) => {
                     writeln!(s).unwrap();
                     render_method(s, method);
@@ -6560,10 +6568,10 @@ fn emit_library_class_decl_inner(
     // framework DSL. Each statement runs once on this class object, after
     // the class methods it may call (a Concern macro writing its
     // `class_attribute`); unset subclasses keep their ivar absent.
-    if !lc.class_ivar_initializers.is_empty() && !lc.methods.is_empty() {
+    if !ordered_body && !lc.class_ivar_initializers.is_empty() && !lc.methods.is_empty() {
         writeln!(s).unwrap();
     }
-    for init in &lc.class_ivar_initializers {
+    for init in lc.class_ivar_initializers.iter().filter(|_| !ordered_body) {
         for line in super::emit_expr(init).lines() {
             writeln!(s, "{body_pad}{line}").unwrap();
         }
