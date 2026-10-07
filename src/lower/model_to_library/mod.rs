@@ -678,13 +678,12 @@ fn report_unclaimed_unknowns(model: &Model, schema: &Schema) {
         if matches!(name, "attr_accessor" | "attr_reader" | "attr_writer") {
             continue;
         }
-        // `has_one_attached :name` (with or without the variants
-        // block) — claimed by lower::attached on exactly that shape, a
-        // name and any block. Campfire's three (`avatar`, `attachment`,
+        // `has_one_attached` / `has_many_attached :name` (with or
+        // without a variants block) — claimed by lower::attached on
+        // exactly that shape. Campfire's three (`avatar`, `attachment`,
         // `logo`) were reported as not lowered on every emit while the
-        // attachment lowering ran on each. `has_many_attached` is not
-        // claimed by anything and keeps warning.
-        if name == "has_one_attached" {
+        // attachment lowering ran on each.
+        if name == "has_one_attached" || name == "has_many_attached" {
             if let ExprNode::Send { args, .. } = &*expr.node {
                 if !args.is_empty() {
                     continue;
@@ -977,6 +976,9 @@ pub fn writable_field_set(
     for (_span, attr) in crate::lower::attached::attached_attrs(model) {
         writable.insert(attr);
     }
+    for (_span, attr) in crate::lower::attached::many_attached_attrs(model) {
+        writable.insert(attr);
+    }
     writable
 }
 
@@ -1188,9 +1190,12 @@ fn build_methods_with_finder_inputs(
     // Named plain-text association (`has_markdown`) — same slot; the
     // record's `content` column needs no coder override.
     crate::lower::plain_text_attr::push_plain_text_methods(&mut methods, model, schema);
-    // `has_one_attached` — the attachment-EXISTENCE reader, over the
-    // synthesized `ActiveStorage::Attachment` row. Same ordering
-    // rationale as the macros above (a hand-written method wins).
+    // `has_one_attached` / `has_many_attached` — the attachment
+    // readers, over the synthesized `ActiveStorage::Attachment` row.
+    // Same ordering rationale as the macros above (a hand-written
+    // method wins). The Attachment MODEL itself gets its blob helpers
+    // here too (`url` / `filename` / `content_type`).
+    crate::lower::attachment_model::push_attachment_record_methods(&mut methods, model);
     crate::lower::attached::push_attached_methods(&mut methods, model);
     push_user_methods(&mut methods, model);
     push_dom_prefix_method(&mut methods, model);

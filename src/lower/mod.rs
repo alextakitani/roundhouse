@@ -155,6 +155,7 @@ pub mod send_dispatch;
 pub mod relation_counted_terminal;
 pub(crate) mod secure_password;
 pub mod attached;
+pub mod attachment_model;
 pub mod attached_url;
 pub mod send_file;
 pub mod helper_kwargs;
