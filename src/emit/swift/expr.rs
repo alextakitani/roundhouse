@@ -106,6 +106,9 @@ thread_local! {
     /// nil-guard — reads force-unwrap (Kotlin's `!!` smart-cast
     /// cluster, Swift's `!`).
     static NONNULL_PROPS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    /// Reassigned locals a terminal nil-guard proved non-nil (`emit_stmts`).
+    /// Not in `NONNULL_PROPS`: an ivar of the same camelCased name was not proven.
+    static NARROWED_LOCALS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
     /// Closure-nesting depth — `next` is a closure `return` inside an
     /// iterator block, `continue` in a loop.
     static IN_LAMBDA: RefCell<usize> = const { RefCell::new(0) };
@@ -662,6 +665,57 @@ fn coerce_for_prop(prop_camel: &str, value: &Expr, val: String) -> String {
     }
 }
 
+/// Declared `Ty` of an instance property by camelCased name (accessors +
+/// body ivars installed by `set_instance_prop_types`).
+fn instance_prop_ty(name: &str) -> Option<crate::ty::Ty> {
+    INSTANCE_PROP_TYPES.with(|m| m.borrow().get(&camel(name)).cloned())
+}
+
+/// Elem type of an Array-typed receiver (ivar field table or
+/// expression ty), peeling a nullable outer `Array[T]?`.
+fn array_elem_ty(r: &Expr) -> Option<crate::ty::Ty> {
+    // Property types apply only to `@ivar` — a local `Var` that
+    // shadows must keep `r.ty` (nullable elem vs non-nullable prop).
+    let from_prop = match &*r.node {
+        ExprNode::Ivar { name } => instance_prop_ty(name.as_str()),
+        _ => None,
+    };
+    let array_ty = from_prop.as_ref().or(r.ty.as_ref());
+    match array_ty {
+        Some(crate::ty::Ty::Array { elem }) => Some((**elem).clone()),
+        Some(crate::ty::Ty::Union { variants }) => variants.iter().find_map(|t| match t {
+            crate::ty::Ty::Array { elem } => Some((**elem).clone()),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+/// `String?` into `[String]` (HeaderStore `@vals << value` after
+/// `header_value_ok?` rejects nil). Swift rejects the mismatch; coalesce
+/// to `""` so the write typechecks. Non-string / already-matching shapes
+/// pass through unchanged.
+fn coerce_list_elem_arg(recv: &Expr, arg: &Expr, arg_s: &str) -> String {
+    let Some(elem) = array_elem_ty(recv) else {
+        return arg_s.to_string();
+    };
+    let elem_is_plain_str = matches!(elem, crate::ty::Ty::Str | crate::ty::Ty::Sym);
+    let arg_nilable_str = matches!(
+        arg.ty.as_ref(),
+        Some(crate::ty::Ty::Union { variants })
+            if variants.len() == 2
+                && variants.iter().any(|v| matches!(v, crate::ty::Ty::Nil))
+                && variants
+                    .iter()
+                    .any(|v| matches!(v, crate::ty::Ty::Str | crate::ty::Ty::Sym))
+    );
+    if elem_is_plain_str && arg_nilable_str {
+        format!("({arg_s} ?? \"\")")
+    } else {
+        arg_s.to_string()
+    }
+}
+
 /// Is the receiver statically a Hash (directly or through a nullable
 /// Union / the declared prop type)?
 fn recv_is_hash(r: &Expr) -> bool {
@@ -1140,7 +1194,14 @@ fn children(e: &Expr) -> Vec<&Expr> {
     v
 }
 
+/// Render a Swift value expression after shared primitive and string-builder selection.
 pub fn emit_expr(e: &Expr) -> String {
+    if let Some(s) = crate::emit::shared::utf8_chr::emit(e, crate::emit::shared::utf8_chr::Target::Swift, emit_expr) {
+        return s;
+    }
+    if let Some(s) = crate::emit::shared::string_bytes::emit(e, crate::emit::shared::string_bytes::Target::Swift, emit_expr) {
+        return s;
+    }
     if let Some(s) = try_string_builder(e) {
         return s;
     }
@@ -1257,7 +1318,9 @@ fn emit_node(n: &ExprNode, e: &Expr) -> String {
         ExprNode::Lit { value } => emit_literal(value),
         ExprNode::Var { name, .. } => {
             let n = camel(name.as_str());
-            if NONNULL_PROPS.with(|s| s.borrow().contains(&n)) {
+            if NONNULL_PROPS.with(|s| s.borrow().contains(&n))
+                || NARROWED_LOCALS.with(|s| s.borrow().contains(&n))
+            {
                 format!("{n}!")
             } else {
                 n
@@ -1539,7 +1602,7 @@ fn emit_string_interp(parts: &[InterpPart]) -> String {
 
 fn emit_bool_op(op: BoolOpKind, left: &Expr, right: &Expr, e: &Expr) -> String {
     let l = emit_expr(left);
-    let r = emit_expr(right);
+    let r = group_try_rhs(&emit_expr(right));
     match op {
         BoolOpKind::And => format!("{l} && {r}"),
         // `||` is logical-or for Bool results, but Ruby's `x || default`
@@ -1845,8 +1908,25 @@ fn emit_case(scrutinee: &Expr, arms: &[Arm], returning: bool) -> String {
 /// `wrap_return`.
 pub(super) fn emit_stmts(exprs: &[Expr], returning: bool) -> String {
     let mut lines: Vec<String> = Vec::new();
+    // Reassigned locals a terminal nil-guard proved non-nil: read as `x!` until the next assignment.
+    let mut narrowed: Vec<String> = Vec::new();
     let mut i = 0;
     while i < exprs.len() {
+        // A write to a narrowed local ends its narrowing. Not before a statement that is itself
+        // that write: its right-hand side (`m = m.next`) still reads the proven value.
+        let own_write = statement_writes_local(&exprs[i]);
+        let mut ending: Vec<String> = Vec::new();
+        narrowed.retain(|n| {
+            if !writes_local(&exprs[i], n) {
+                return true;
+            }
+            if own_write.as_deref() == Some(n.as_str()) {
+                ending.push(n.clone());
+            } else {
+                NARROWED_LOCALS.with(|s| s.borrow_mut().remove(n));
+            }
+            false
+        });
         let is_last = i == exprs.len() - 1;
         // A bare `nil` statement (a lowered no-op branch filler) has no
         // contextual type in Swift — drop it.
@@ -1872,15 +1952,108 @@ pub(super) fn emit_stmts(exprs: &[Expr], returning: bool) -> String {
                 i += 1;
                 continue;
             }
+            if let Some((n, line)) = reassigned_nil_guard(&exprs[i]) {
+                lines.push(line);
+                if NARROWED_LOCALS.with(|s| s.borrow_mut().insert(n.clone())) {
+                    narrowed.push(n);
+                }
+                i += 1;
+                continue;
+            }
         }
         if returning && is_last {
             lines.push(wrap_return(&exprs[i]));
         } else {
             lines.push(emit_expr(&exprs[i]));
         }
+        NARROWED_LOCALS.with(|s| {
+            let mut set = s.borrow_mut();
+            for n in &ending {
+                set.remove(n);
+            }
+        });
         i += 1;
     }
+    NARROWED_LOCALS.with(|s| {
+        let mut set = s.borrow_mut();
+        for n in &narrowed {
+            set.remove(n);
+        }
+    });
     lines.join("\n")
+}
+
+/// `if x.nil? { <terminal> }` (or `x.nil? || <more>`) over an Optional
+/// local that is reassigned later, so `try_param_guard` declined to
+/// shadow it: the name to read force-unwrapped until its next
+/// assignment, and the `if` itself, whose `<more>` already reads it so.
+fn reassigned_nil_guard(stmt: &Expr) -> Option<(String, String)> {
+    let ExprNode::If { cond, then_branch, else_branch } = &*stmt.node else {
+        return None;
+    };
+    if !is_empty_branch(else_branch) || !branch_is_terminal(then_branch) {
+        return None;
+    }
+    let (nil_check, rest) = match &*cond.node {
+        ExprNode::BoolOp { op: BoolOpKind::Or, left, right, .. } => (left, Some(right)),
+        _ => (cond, None),
+    };
+    let ExprNode::Send { recv: Some(r), method, args, .. } = &*nil_check.node else {
+        return None;
+    };
+    if method.as_str() != "nil?" || !args.is_empty() {
+        return None;
+    }
+    let ExprNode::Var { name, .. } = &*r.node else {
+        return None;
+    };
+    let optionalish = matches!(
+        r.ty.as_ref(),
+        Some(crate::ty::Ty::Union { variants })
+            if variants.iter().any(|v| matches!(v, crate::ty::Ty::Nil))
+    );
+    let n = camel(name.as_str());
+    if !optionalish || !REASSIGNED.with(|s| s.borrow().contains(&n)) {
+        return None;
+    }
+    let more = match rest {
+        Some(rhs) => format!(" || ({})", with_narrowed_local(&n, rhs)),
+        None => String::new(),
+    };
+    let line = format!("if {n} == nil{more} {{\n{}\n}}", indent(&emit_expr(then_branch)));
+    Some((n, line))
+}
+
+/// Emit `e` with the local `name` read force-unwrapped.
+fn with_narrowed_local(name: &str, e: &Expr) -> String {
+    let added = NARROWED_LOCALS.with(|s| s.borrow_mut().insert(name.to_string()));
+    let out = emit_expr(e);
+    if added {
+        NARROWED_LOCALS.with(|s| s.borrow_mut().remove(name));
+    }
+    out
+}
+
+/// Does `e` assign the local `name` anywhere (`=` or a compound `op=`)?
+fn writes_local(e: &Expr, name: &str) -> bool {
+    match &*e.node {
+        ExprNode::Assign { target: LValue::Var { name: n, .. }, .. }
+        | ExprNode::OpAssign { target: LValue::Var { name: n, .. }, .. }
+            if camel(n.as_str()) == name =>
+        {
+            true
+        }
+        _ => children(e).into_iter().any(|c| writes_local(c, name)),
+    }
+}
+
+/// The local a statement assigns at its top (`x = …`, `x op= …`).
+fn statement_writes_local(e: &Expr) -> Option<String> {
+    match &*e.node {
+        ExprNode::Assign { target: LValue::Var { name, .. }, .. }
+        | ExprNode::OpAssign { target: LValue::Var { name, .. }, .. } => Some(camel(name.as_str())),
+        _ => None,
+    }
 }
 
 fn try_guard_let(assign: &Expr, guard: &Expr) -> Option<String> {
@@ -2013,6 +2186,10 @@ fn try_param_guard(stmt: &Expr) -> Option<String> {
         return None;
     }
     let n = camel(name.as_str());
+    // Not shadowed when reassigned later: the `let` rebinding would reject the next assignment.
+    if REASSIGNED.with(|r| r.borrow().contains(&n)) {
+        return None;
+    }
     let extra = match rest {
         Some(rhs) => format!(", !({})", emit_expr(rhs)),
         None => String::new(),
@@ -2096,7 +2273,12 @@ fn assign_value(value: &Expr) -> String {
 }
 
 fn emit_assign(target: &LValue, value: &Expr) -> String {
-    let val = emit_expr(value);
+    let val = match target {
+        LValue::Index { recv, .. } if !recv_is_hash(recv) => {
+            coerce_list_elem_arg(recv, value, &emit_expr(value))
+        }
+        _ => emit_expr(value),
+    };
     match target {
         LValue::Var { name, .. } => {
             let n = camel(name.as_str());
@@ -2321,6 +2503,19 @@ fn forces_parens(method: &str) -> bool {
     )
 }
 
+/// Swift forbids a bare `try` / `try!` / `try?` as the RHS of a
+/// non-assignment operator (`!=`, `&&`, `??`, …). Wrap so
+/// `expected != (try f())` is legal. A leading try on the whole infix
+/// expression stays unwrapped at the call site.
+fn group_try_rhs(rhs: &str) -> String {
+    if rhs.starts_with("try ") || rhs.starts_with("try!") || rhs.starts_with("try?") {
+        format!("({rhs})")
+    } else {
+        rhs.to_string()
+    }
+}
+
+/// Render a Ruby send as a Swift call, property access, or primitive operation.
 fn emit_send(
     recv: Option<&Expr>,
     method: &str,
@@ -2516,11 +2711,13 @@ fn emit_send(
         }
         match crate::emit::shared::ops::classify_binop(method) {
             crate::emit::shared::ops::BinopCase::NativeInfix(op) => {
-                return format!("{} {} {}", emit_expr(r), op, args_s[0]);
+                let rhs = group_try_rhs(&args_s[0]);
+                return format!("{} {} {rhs}", emit_expr(r), op);
             }
             // `<<` / `push` → Array.append.
             crate::emit::shared::ops::BinopCase::Append => {
-                return format!("{}.append({})", emit_expr(r), args_s[0]);
+                let arg = coerce_list_elem_arg(r, &args[0], &args_s[0]);
+                return format!("{}.append({})", emit_expr(r), arg);
             }
             crate::emit::shared::ops::BinopCase::NotBinop => {}
         }
@@ -2562,6 +2759,27 @@ fn emit_send(
         }
         if method == "include?" {
             return format!("{}.contains({})", emit_expr(r), args_s[0]);
+        }
+        // `String#match?(re)` / `Regexp#match?(str)` → RhString helper.
+        // NSRegularExpression has no compact String predicate; the
+        // primitive mirrors the TypeScript `re.test(s)` flip.
+        if method == "match?" {
+            // Require Regexp ty or a regex literal — not bare Const
+            // shape (a String-valued PATTERN must not flip).
+            let arg_is_regexp = matches!(
+                args[0].ty.as_ref(),
+                Some(crate::ty::Ty::Class { id, .. }) if id.0.as_str() == "Regexp"
+            ) || matches!(&*args[0].node, ExprNode::Lit { value: Literal::Regex { .. } });
+            let recv_is_regexp = matches!(
+                r.ty.as_ref(),
+                Some(crate::ty::Ty::Class { id, .. }) if id.0.as_str() == "Regexp"
+            );
+            if arg_is_regexp && !recv_is_regexp {
+                return format!("RhString.matchPred({}, {})", emit_expr(r), args_s[0]);
+            }
+            if recv_is_regexp {
+                return format!("RhString.matchPred({}, {})", args_s[0], emit_expr(r));
+            }
         }
         if method == "join" {
             return format!("{}.joined(separator: {})", emit_expr(r), args_s[0]);
@@ -2625,7 +2843,12 @@ fn emit_send(
     }
     if let (Some(r), 2) = (recv, args.len()) {
         if method == "[]=" {
-            return format!("{}[{}] = {}", emit_expr(r), args_s[0], args_s[1]);
+            let val = if recv_is_hash(r) {
+                args_s[1].clone()
+            } else {
+                coerce_list_elem_arg(r, &args[1], &args_s[1])
+            };
+            return format!("{}[{}] = {}", emit_expr(r), args_s[0], val);
         }
         // Ruby `str[start, len]` positional slice.
         if method == "[]" {

@@ -90,8 +90,14 @@ end
 
 # ── ordering / metadata ──────────────────────────────────────────────
 
-TARGET_ORDER = %w[rust crystal go csharp-aot kotlin swift csharp spinel spinel-1p spinel-fiber elixir typescript python ruby ruby-1p ruby-int jruby truffleruby rails rails-nocache rails-1p rails-int rails-jruby rails-truffleruby]
-ENDPOINT_ORDER = %w[/articles /articles/1 /articles/new /articles.json /articles/1.json]
+TARGET_ORDER = %w[rust crystal go csharp-aot kotlin swift csharp spinel spinel-1p spinel-fiber elixir typescript python tobi ruby ruby-1p ruby-int jruby truffleruby rails rails-nocache rails-1p rails-int rails-jruby rails-truffleruby]
+ENDPOINT_ORDER = %w[
+  /articles /articles/1 /articles/new /articles.json /articles/1.json
+  /rooms/1 /rooms/1/messages /users/me/sidebar /searches?q=coffee
+]
+# Seed-resolved leftovers (`/rooms/N/messages?before=ID`,
+# `POST:/rooms/N/messages`) are not in the hint — their ids move with
+# the seed. `order_first` sorts those after the named rooms routes.
 
 # A lane the palette has never seen still needs a bar. Prefer its
 # family's colour, lightened so the pair is distinguishable side by side
@@ -118,6 +124,7 @@ COLOR = {
   'swift'      => '#f05138',
   'csharp'     => '#8a6fe0',
   'spinel'     => '#7d4cdb',
+  'tobi'       => '#d4883a',
   'spinel-1p'  => '#a98ae4',
   'spinel-fiber' => '#b59ae8',
   'elixir'     => '#4b275f',
@@ -155,12 +162,21 @@ cells.each { |c| by[c['endpoint']][c['target']] = c }
 # that makes campfire's comparison honest, was dropped from every chart,
 # leaving a page that said "Rails is 1.6x faster" by omission. What a
 # report renders is the data it was handed. The hint only orders it.
+# How a route reads on the page. campfire's per-route suite records the
+# lane-specific paths as placeholders ({avatar}, {css}) and writes as
+# `POST:<path>`; the record keeps those so cells line up across lanes.
+def ep_label(ep)
+  ep.sub(/\APOST:/, 'POST ').sub('{avatar}', ':avatar_token').sub(/\A\{css\}\z/, 'a stylesheet (/assets/*.css)')
+end
+
 def order_first(values, hint)
   known = hint & values
   known + (values - known).sort
 end
 
-endpoints = order_first(by.keys, ENDPOINT_ORDER)
+# A harness that names its endpoints (campfire's per-route suite) has
+# already put them in reading order; that order wins over the hint.
+endpoints = order_first(by.keys, Array(env&.dig('harness', 'endpoints')) | ENDPOINT_ORDER)
 targets   = order_first(cells.map { |c| c['target'] }.uniq, TARGET_ORDER)
 
 # A cell with a nil req_sec was never measured: wrk found nothing serving,
@@ -713,7 +729,7 @@ html << h2.('Throughput across targets')
 html << %(<p>Each endpoint is its own chart. Bars are log-scaled; raw req/sec is shown at the right.</p>\n)
 endpoints.each do |ep|
   rows = targets.map { |t| by[ep][t] }.compact
-  html << "<h3>#{ep}</h3>\n"
+  html << "<h3>#{ep_label(ep)}</h3>\n"
   html << hbar_log(rows, metric: 'req_sec', unit: 'req/sec')
 end
 
@@ -732,7 +748,7 @@ if (%w[ruby rails] - measured_targets).empty?
     ruby_v  = by[ep]['ruby']&.dig('req_sec').to_f
     rails_v = by[ep]['rails']&.dig('req_sec').to_f
     {
-      label:      ep,
+      label:      ep_label(ep),
       annotation: rails_v > 0 ? "#{fmt_dec(ruby_v / rails_v, 1)}×" : '',
       values:     { 'ruby' => ruby_v, 'rails' => rails_v },
     }
@@ -819,7 +835,7 @@ html << <<~P
 P
 endpoints.each do |ep|
   rows = targets.map { |t| by[ep][t] }.compact
-  html << "<h3>#{ep}</h3>\n"
+  html << "<h3>#{ep_label(ep)}</h3>\n"
   html << hbar_log(rows, metric: 'rps_per_gb', unit: 'req/sec/GB')
 end
 
@@ -922,33 +938,48 @@ end
 # what the latency means.
 at_c = concurrency ? " at c=#{concurrency}" : ''
 html << h2.("Latency (p50 / p99#{at_c})")
-html << "<p>Latencies are#{at_c.empty? ? '' : "#{at_c} concurrent connections"}; treat p50 as the median per-connection wait and p99 as the tail. Rows are ordered by measured median p50 across endpoints, fastest first.</p>\n"
+html << "<p>Latencies are#{at_c.empty? ? '' : "#{at_c} concurrent connections"}; treat p50 as the median per-connection wait and p99 as the tail. Lanes are ordered by measured median p50 across endpoints, fastest first.</p>\n"
 
-html << "<table>\n<thead><tr><th>target</th>"
-endpoints.each { |ep| html << "<th colspan=2>#{ep}</th>" }
-html << "</tr>\n<tr><th></th>"
-endpoints.each { html << "<th>p50</th><th>p99</th>" }
-html << "</tr></thead>\n<tbody>\n"
-# Order rows by latency (median p50 across endpoints, ascending) so the
+# Order by latency (median p50 across endpoints, ascending) so the
 # table reads as a ranking like the sorted bar charts. Median is robust
 # to single-endpoint outliers.
 lat_order = targets.sort_by do |tgt|
   ps = endpoints.map { |ep| by[ep][tgt]&.dig('p50_ms') }.compact.sort
   ps.empty? ? Float::INFINITY : ps[ps.size / 2]
 end
-lat_order.each do |tgt|
-  html << "<tr><td><strong>#{tgt}</strong></td>"
-  endpoints.each do |ep|
-    c = by[ep][tgt]
-    p50 = cell_metric(c, 'p50_ms')
-    p99 = cell_metric(c, 'p99_ms')
-    if p50 || p99
-      html << %(<td class="num">#{p50 ? fmt_dec(p50, 1) : '—'}</td><td class="num">#{p99 ? fmt_dec(p99, 1) : '—'}</td>)
-    else
-      html << "<td>—</td><td>—</td>"
-    end
+lat_pair = lambda do |c|
+  p50 = cell_metric(c, 'p50_ms')
+  p99 = cell_metric(c, 'p99_ms')
+  if p50 || p99
+    %(<td class="num">#{p50 ? fmt_dec(p50, 1) : '—'}</td><td class="num">#{p99 ? fmt_dec(p99, 1) : '—'}</td>)
+  else
+    "<td>—</td><td>—</td>"
   end
-  html << "</tr>\n"
+end
+# Many routes and few lanes (campfire's per-route suite) read better with
+# a row per route; the blog's five endpoints keep a row per target.
+if endpoints.size > lat_order.size
+  html << "<table>\n<thead><tr><th>route</th>"
+  lat_order.each { |tgt| html << "<th colspan=2>#{tgt}</th>" }
+  html << "</tr>\n<tr><th></th>"
+  lat_order.each { html << "<th>p50</th><th>p99</th>" }
+  html << "</tr></thead>\n<tbody>\n"
+  endpoints.each do |ep|
+    html << "<tr><td><code>#{ep_label(ep)}</code></td>"
+    lat_order.each { |tgt| html << lat_pair.(by[ep][tgt]) }
+    html << "</tr>\n"
+  end
+else
+  html << "<table>\n<thead><tr><th>target</th>"
+  endpoints.each { |ep| html << "<th colspan=2>#{ep_label(ep)}</th>" }
+  html << "</tr>\n<tr><th></th>"
+  endpoints.each { html << "<th>p50</th><th>p99</th>" }
+  html << "</tr></thead>\n<tbody>\n"
+  lat_order.each do |tgt|
+    html << "<tr><td><strong>#{tgt}</strong></td>"
+    endpoints.each { |ep| html << lat_pair.(by[ep][tgt]) }
+    html << "</tr>\n"
+  end
 end
 html << "</tbody></table>\n"
 html << %(<p class="legend">All values in milliseconds. Lower is better.</p>\n)
@@ -1045,7 +1076,7 @@ unless parity_rows.empty?
   html << "<table>\n<thead><tr><th>lane</th><th>endpoint</th><th>status</th><th>tags</th><th>bytes</th></tr></thead>\n<tbody>\n"
   parity_rows.each do |line|
     lane, ep, status, tags, bytes = line.split("\t").map { |f| f.to_s.sub(/\A[a-z_]+=/, '') }
-    html << %(<tr><td>#{lane}</td><td><code>#{ep}</code></td>) +
+    html << %(<tr><td>#{lane}</td><td><code>#{ep_label(ep)}</code></td>) +
             %(<td class="num">#{status}</td><td class="num">#{fmt_int(tags.to_i)}</td>) +
             %(<td class="num">#{fmt_int(bytes.to_i)}</td></tr>\n)
   end

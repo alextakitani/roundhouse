@@ -69,9 +69,7 @@
 
 use crate::app::App;
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
-use crate::expr::{
-    Arm, Expr, ExprNode, InterpPart, LValue, Literal, RescueClause,
-};
+use crate::expr::{Expr, ExprNode, LValue, Literal};
 use crate::ident::Symbol;
 use crate::ty::Ty;
 use std::collections::HashSet;
@@ -93,7 +91,9 @@ pub fn apply_blank_lowering(app: &mut App) -> Vec<Diagnostic> {
     // with closed vocabularies (python's unemittable-cond fallback is a
     // silent `False`; the flash-notice smoke caught it). Views rejoin
     // when the view pipeline migrates to shared lowerings.
-    super::for_each_hook_body(app, &mut |body| walk(body, &defs, &mut diags));
+    super::for_each_hook_body(app, &mut |body| {
+        walk(body, &defs, &mut diags);
+    });
 
     // TEST BODIES TOO, asked for by name — the widening
     // `for_each_test_body` exists to make reviewable.
@@ -111,7 +111,9 @@ pub fn apply_blank_lowering(app: &mut App) -> Vec<Diagnostic> {
     // an app body; there is no test-specific vocabulary here. On CRuby
     // the overlay served these already and the rewrite is neutral — it
     // is the AOT and strict targets that could not dispatch them.
-    super::for_each_test_body(app, &mut |body| walk(body, &defs, &mut diags));
+    super::for_each_test_body(app, &mut |body| {
+        walk(body, &defs, &mut diags);
+    });
 
     diags
 }
@@ -130,12 +132,13 @@ pub fn apply_blank_lowering(app: &mut App) -> Vec<Diagnostic> {
 /// Diagnostics go to the emit-time sink, the way every other lowering
 /// that runs this late reports (`lower::time_current`,
 /// `view_to_library`).
-pub(crate) fn ground_body(body: &mut Expr, defs: &AppDefinitions) {
+pub(crate) fn ground_body(body: &mut Expr, defs: &AppDefinitions) -> bool {
     let mut diags = Vec::new();
-    walk(body, defs, &mut diags);
+    let changed = walk(body, defs, &mut diags);
     for d in diags {
         crate::emit::diagnostics::push(d);
     }
+    changed
 }
 
 /// Which classes define their own `blank?`/`present?`/`presence`
@@ -275,7 +278,13 @@ fn classify(ty: Option<&Ty>, defs: &AppDefinitions) -> Grounding {
         Ty::Class { id, .. } => {
             let raw = id.0.as_str();
             let last = raw.rsplit("::").next().unwrap_or(raw);
-            if defs.own_predicate.contains(last) {
+            if defs.own_predicate.contains(last) || raw == "ActionText::Content" {
+                // `ActionText::Content#blank?` is a RUNTIME method that
+                // tracks plain text, not markup. The app's class
+                // registry often misses it when a single runtime file
+                // is the fixture under test (framework_tests_ruby), and
+                // folding to NeverBlank made `content.blank?` emit as
+                // `false` — wrong for an empty `<div></div>` body.
                 OwnDispatch
             } else if last == "Relation" || last == "Errors" || defs.own_empty.contains(last) {
                 // Registry classes the analyzer types but the app
@@ -293,6 +302,17 @@ fn classify(ty: Option<&Ty>, defs: &AppDefinitions) -> Grounding {
             }
         }
         Ty::Union { variants } => {
+            // `String | Content` used to fall through to Runtime, and
+            // `compact_blank` then rejected through `ActiveSupport.blank?`,
+            // which does not call `Content#blank?`. Any arm that owns the
+            // predicate keeps the dynamic path, including a nilable
+            // `Content | Nil`.
+            if variants.iter().any(|v| {
+                !matches!(v, Ty::Nil)
+                    && matches!(classify(Some(v), defs), OwnDispatch | Skip(_))
+            }) {
+                return Skip("union includes a class with its own predicate");
+            }
             let has_nil = variants.iter().any(|v| matches!(v, Ty::Nil));
             let non_nil: Vec<&Ty> = variants.iter().filter(|v| !matches!(v, Ty::Nil)).collect();
             if !has_nil || non_nil.len() != 1 {
@@ -306,11 +326,8 @@ fn classify(ty: Option<&Ty>, defs: &AppDefinitions) -> Grounding {
                 // stay correct.
                 BoolLike => BoolLike,
                 AlwaysNil => AlwaysNil,
-                // The app's own predicate must keep winning; the
-                // runtime helper knows nothing about it.
-                OwnDispatch => Skip("nilable receiver of a class with its own predicate"),
                 Runtime => Runtime,
-                other @ Skip(_) => other,
+                OwnDispatch | Skip(_) => unreachable!("own-predicate unions returned above"),
             }
         }
         Ty::Untyped | Ty::Var { .. } => Runtime,
@@ -349,172 +366,20 @@ pub(crate) fn is_effect_free_reader(e: &Expr) -> bool {
     }
 }
 
-fn walk(expr: &mut Expr, defs: &AppDefinitions, diags: &mut Vec<Diagnostic>) {
-    // Children first: a rewritten site's receiver subtree never needs
-    // revisiting, and inner blank-predicates (e.g. in an interpolation
-    // inside a `present?` receiver) are already grounded by the time
-    // the outer node is considered.
-    match &mut *expr.node {
-        ExprNode::Send { recv, args, block, .. } => {
-            if let Some(r) = recv {
-                walk(r, defs, diags);
-            }
-            for a in args {
-                walk(a, defs, diags);
-            }
-            if let Some(b) = block {
-                walk(b, defs, diags);
-            }
+fn walk(expr: &mut Expr, defs: &AppDefinitions, diags: &mut Vec<Diagnostic>) -> bool {
+    let mut changed = false;
+    expr.node.for_each_child_mut(&mut |c| {
+        if walk(c, defs, diags) {
+            changed = true;
         }
-        ExprNode::Apply { fun, args, block } => {
-            walk(fun, defs, diags);
-            for a in args {
-                walk(a, defs, diags);
-            }
-            if let Some(b) = block {
-                walk(b, defs, diags);
-            }
-        }
-        ExprNode::Seq { exprs } => {
-            for e in exprs {
-                walk(e, defs, diags);
-            }
-        }
-        ExprNode::Array { elements, .. } => {
-            for e in elements {
-                walk(e, defs, diags);
-            }
-        }
-        ExprNode::Hash { entries, .. } => {
-            for (k, v) in entries {
-                walk(k, defs, diags);
-                walk(v, defs, diags);
-            }
-        }
-        ExprNode::StringInterp { parts } => {
-            for p in parts {
-                if let InterpPart::Expr { expr: e } = p {
-                    walk(e, defs, diags);
-                }
-            }
-        }
-        ExprNode::BoolOp { left, right, .. } => {
-            walk(left, defs, diags);
-            walk(right, defs, diags);
-        }
-        ExprNode::Let { value, body, .. } => {
-            walk(value, defs, diags);
-            walk(body, defs, diags);
-        }
-        ExprNode::Lambda { body, .. } => walk(body, defs, diags),
-        ExprNode::MethodRef { recv, .. } => {
-            if let Some(r) = recv {
-                walk(r, defs, diags);
-            }
-        }
-        ExprNode::If { cond, then_branch, else_branch } => {
-            walk(cond, defs, diags);
-            walk(then_branch, defs, diags);
-            walk(else_branch, defs, diags);
-        }
-        ExprNode::Case { scrutinee, arms } => {
-            walk(scrutinee, defs, diags);
-            for Arm { guard, body, .. } in arms {
-                if let Some(g) = guard {
-                    walk(g, defs, diags);
-                }
-                walk(body, defs, diags);
-            }
-        }
-        ExprNode::Assign { target, value } => {
-            walk_lvalue(target, defs, diags);
-            walk(value, defs, diags);
-        }
-        ExprNode::OpAssign { target, value, .. } => {
-            walk_lvalue(target, defs, diags);
-            walk(value, defs, diags);
-        }
-        ExprNode::MultiAssign { targets, value } => {
-            for t in targets {
-                walk_lvalue(t, defs, diags);
-            }
-            walk(value, defs, diags);
-        }
-        ExprNode::Yield { args } => {
-            for a in args {
-                walk(a, defs, diags);
-            }
-        }
-        ExprNode::Raise { value } => walk(value, defs, diags),
-        ExprNode::RescueModifier { expr: e, fallback } => {
-            walk(e, defs, diags);
-            walk(fallback, defs, diags);
-        }
-        ExprNode::Return { value } => walk(value, defs, diags),
-        ExprNode::Super { args } => {
-            if let Some(args) = args {
-                for a in args {
-                    walk(a, defs, diags);
-                }
-            }
-        }
-        ExprNode::Next { value } | ExprNode::Break { value } => {
-            if let Some(v) = value {
-                walk(v, defs, diags);
-            }
-        }
-        ExprNode::Splat { value } | ExprNode::KeywordSplat { value } => walk(value, defs, diags),
-        ExprNode::While { cond, body, .. } => {
-            walk(cond, defs, diags);
-            walk(body, defs, diags);
-        }
-        ExprNode::Range { begin, end, .. } => {
-            if let Some(b) = begin {
-                walk(b, defs, diags);
-            }
-            if let Some(e) = end {
-                walk(e, defs, diags);
-            }
-        }
-        ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
-            walk(body, defs, diags);
-            for RescueClause { classes, body, .. } in rescues {
-                for c in classes {
-                    walk(c, defs, diags);
-                }
-                walk(body, defs, diags);
-            }
-            if let Some(e) = else_branch {
-                walk(e, defs, diags);
-            }
-            if let Some(e) = ensure {
-                walk(e, defs, diags);
-            }
-        }
-        ExprNode::Cast { value, .. } => walk(value, defs, diags),
-        ExprNode::Lit { .. }
-        | ExprNode::Var { .. }
-        | ExprNode::Ivar { .. }
-        | ExprNode::Const { .. }
-        | ExprNode::SelfRef
-        | ExprNode::Retry
-        | ExprNode::ForwardArgs
-        | ExprNode::Redo => {}
+    });
+    if try_rewrite(expr, defs, diags) {
+        changed = true;
     }
-
-    try_rewrite(expr, defs, diags);
-    try_rewrite_compact_blank(expr, defs, diags);
-}
-
-fn walk_lvalue(target: &mut LValue, defs: &AppDefinitions, diags: &mut Vec<Diagnostic>) {
-    match target {
-        LValue::Attr { recv, .. } => walk(recv, defs, diags),
-        LValue::Index { recv, index } => {
-            walk(recv, defs, diags);
-            walk(index, defs, diags);
-        }
-        _ => {}
+    if try_rewrite_compact_blank(expr, defs, diags) {
+        changed = true;
     }
+    changed
 }
 
 /// The three predicates, owned so no borrow of the Send node outlives
@@ -526,23 +391,23 @@ enum Pred {
     Presence,
 }
 
-fn try_rewrite(expr: &mut Expr, defs: &AppDefinitions, diags: &mut Vec<Diagnostic>) {
+fn try_rewrite(expr: &mut Expr, defs: &AppDefinitions, diags: &mut Vec<Diagnostic>) -> bool {
     use Grounding::*;
 
     // Decision phase: everything read out of the node is owned before
     // any mutation.
     let (pred, grounding, recv_ty, pure_recv) = {
         let ExprNode::Send { recv: Some(r), method, args, block, .. } = &*expr.node else {
-            return;
+            return false;
         };
         let pred = match method.as_str() {
             "blank?" => Pred::Blank,
             "present?" => Pred::Present,
             "presence" => Pred::Presence,
-            _ => return,
+            _ => return false,
         };
         if !args.is_empty() || block.is_some() {
-            return;
+            return false;
         }
         // A `params[:x]` read is typed `String?`, and for a form field
         // that is what it is — but campfire's `params[:attachment]` is
@@ -561,7 +426,7 @@ fn try_rewrite(expr: &mut Expr, defs: &AppDefinitions, diags: &mut Vec<Diagnosti
     // name it just bound. Only when the assigned VALUE is itself an
     // effect-free reader: `(x = save!).present?` must still refuse.
     let assign_handle: Option<Expr> = {
-        let ExprNode::Send { recv: Some(r), .. } = &*expr.node else { return };
+        let ExprNode::Send { recv: Some(r), .. } = &*expr.node else { return false };
         match &*r.node {
             ExprNode::Assign { target, value } if is_effect_free_reader(value) => match target {
                 LValue::Var { id, name } => Some(mk(
@@ -587,10 +452,10 @@ fn try_rewrite(expr: &mut Expr, defs: &AppDefinitions, diags: &mut Vec<Diagnosti
     };
 
     match &grounding {
-        OwnDispatch => return,
+        OwnDispatch => return false,
         Skip(reason) => {
             diags.push(unlowered(expr, recv_ty.as_ref(), method_name, reason));
-            return;
+            return false;
         }
         // The receiver moves into argument position, so it is read once
         // however impure it is — the effect-free gate below does not
@@ -606,7 +471,7 @@ fn try_rewrite(expr: &mut Expr, defs: &AppDefinitions, diags: &mut Vec<Diagnosti
             };
             *expr = runtime_predicate(span, r, pred, ret);
             expr.leading_blank_line = leading_blank_line;
-            return;
+            return true;
         }
         _ => {}
     }
@@ -653,7 +518,7 @@ fn try_rewrite(expr: &mut Expr, defs: &AppDefinitions, diags: &mut Vec<Diagnosti
         };
         *expr = runtime_predicate(span, r, pred, ret);
         expr.leading_blank_line = leading_blank_line;
-        return;
+        return true;
     }
     if needs_pure && !pure_recv {
         diags.push(unlowered(
@@ -662,7 +527,7 @@ fn try_rewrite(expr: &mut Expr, defs: &AppDefinitions, diags: &mut Vec<Diagnosti
             method_name,
             "receiver has effects; not safely re-evaluable",
         ));
-        return;
+        return false;
     }
 
     // Take ownership of the receiver; the placeholder node is
@@ -692,59 +557,96 @@ fn try_rewrite(expr: &mut Expr, defs: &AppDefinitions, diags: &mut Vec<Diagnosti
     *expr = replacement;
     expr.span = span;
     expr.leading_blank_line = leading_blank_line;
+    true
 }
 
-/// `Array#compact_blank` — ActiveSupport's `reject(&:blank?)`, and the
-/// same problem the three predicates have: a core_ext reopen only the
-/// CRuby overlay could host, with no `blank?` for any other target to
-/// dispatch. Grounded through the ELEMENT type, using the answer
-/// `classify` gives that type, so `[a, b].compact_blank` and `a.blank?`
-/// cannot disagree about what blank means.
+/// `Array#compact_blank` / `Hash#compact_blank` — ActiveSupport's
+/// `reject(&:blank?)` (Array) and `reject { |_k, v| v.blank? }` (Hash).
+/// Same problem the three predicates have: a core_ext reopen only the
+/// CRuby overlay could host.
 ///
-/// campfire's `User#title` is `[ name, bio ].compact_blank.join(" – ")`
-/// — the label on every avatar, so it is on the message row, the user
-/// list and the sidebar.
+/// An Array grounds through the ELEMENT type, a Hash through the VALUE
+/// type, using the answer `classify` gives so `[a, b].compact_blank`
+/// and `a.blank?` cannot disagree. campfire's `User#title` is
+/// `[ name, bio ].compact_blank.join(" – ")`; its
+/// `SetCurrentRequest#default_url_options` is
+/// `{ host:, protocol: }.compact_blank` — a Hash of nilable Strings,
+/// which used to file residue ("receiver is not a typed Array") and
+/// then fail AOT (`unsupported call: compact_blank`).
 ///
-/// Only `empty?`-able element types ground; anything else keeps the
-/// call and files residue, the same policy the predicates use. A
-/// NEVER-BLANK element type would make the whole call a no-op — a fold
-/// worth having, but not one any corpus app forces yet.
+/// An element/value type with no `empty?` grounding (an open inference
+/// var, untyped, a multi-variant union) still rewrites: the reject
+/// body calls `ActiveSupport.blank?`, the same runtime predicate an
+/// untyped `blank?` send already takes. A class with its own
+/// predicate keeps residue — `ActiveSupport.blank?` would read
+/// markup where `ActionText::Content#blank?` reads plain text.
 fn try_rewrite_compact_blank(
     expr: &mut Expr,
     defs: &AppDefinitions,
     diags: &mut Vec<Diagnostic>,
-) {
-    let (grounding, elem_ty, recv_ty) = {
+) -> bool {
+    enum Shape {
+        Array { elem: Ty },
+        Hash { key: Ty, value: Ty },
+    }
+    let (shape, grounding, recv_ty) = {
         let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*expr.node else {
-            return;
+            return false;
         };
         if method.as_str() != "compact_blank" || !args.is_empty() {
-            return;
+            return false;
         }
-        let Some(Ty::Array { elem }) = r.ty.as_ref() else {
-            // Not an Array (or untyped): the ledger says so rather than
-            // guessing at a receiver whose surface we do not know.
-            diags.push(unlowered(
-                expr,
-                r.ty.as_ref(),
-                "compact_blank",
-                "receiver is not a typed Array",
-            ));
-            return;
+        let shape = match r.ty.as_ref() {
+            Some(Ty::Array { elem }) => Shape::Array { elem: (**elem).clone() },
+            Some(Ty::Hash { key, value }) => Shape::Hash {
+                key: (**key).clone(),
+                value: (**value).clone(),
+            },
+            _ => {
+                diags.push(unlowered(
+                    expr,
+                    r.ty.as_ref(),
+                    "compact_blank",
+                    "receiver is not a typed Array or Hash",
+                ));
+                return false;
+            }
         };
-        let elem = (**elem).clone();
-        (classify(Some(&elem), defs), elem, r.ty.clone())
+        let inner = match &shape {
+            Shape::Array { elem } => elem.clone(),
+            Shape::Hash { value, .. } => value.clone(),
+        };
+        (shape, classify(Some(&inner), defs), r.ty.clone())
     };
-    let (nilable, whitespace) = match grounding {
-        Grounding::Container { nilable, whitespace } => (nilable, whitespace),
-        _ => {
+
+    let inner_ty = match &shape {
+        Shape::Array { elem } => elem.clone(),
+        Shape::Hash { value, .. } => value.clone(),
+    };
+    let cond_body = match grounding {
+        Grounding::Container { nilable, whitespace } => {
+            compact_blank_container_cond(expr.span, inner_ty.clone(), nilable, whitespace)
+        }
+        Grounding::OwnDispatch | Grounding::Skip(_) => {
             diags.push(unlowered(
                 expr,
                 recv_ty.as_ref(),
                 "compact_blank",
                 "element type has no `empty?` grounding",
             ));
-            return;
+            return false;
+        }
+        _ => {
+            // Untyped / open-var / never-blank / bool: the runtime
+            // predicate branches on the value. campfire's helper
+            // `[ author.name, author.bio ].compact_blank` is an Array
+            // whose element is still an inference var.
+            runtime_predicate(
+                expr.span,
+                compact_blank_value_var(expr.span, inner_ty.clone()),
+                Pred::Blank,
+                Ty::Bool,
+            )
         }
     };
 
@@ -753,43 +655,26 @@ fn try_rewrite_compact_blank(
     let old = std::mem::replace(&mut *expr.node, ExprNode::SelfRef);
     let ExprNode::Send { recv: Some(r), .. } = old else { unreachable!() };
 
-    // `reject { |__cb| … }`. The block parameter is read twice in the
-    // nilable form, which is free — it is a local, not the receiver
-    // expression, so none of the effect-free gating above applies.
-    let name = Symbol::new("__cb");
-    let param = |ty: Ty| {
-        mk(
-            span,
-            ExprNode::Var { id: crate::ident::VarId(0), name: name.clone() },
-            ty,
-        )
-    };
-    // The ELEMENT's emptiness test, by the same rule `a.blank?` takes —
-    // `compact_blank` is documented as `reject(&:blank?)`, so an Array
-    // of Strings must reject a whitespace-only one. campfire's
-    // `User#title` is `[ name, bio ].compact_blank.join(" – ")`.
-    let empty_form = if whitespace { blank_str } else { plain_empty };
-    let cond = if nilable {
-        bool_op(
-            span,
-            crate::expr::BoolOpKind::Or,
-            nil_check(span, param(elem_ty.clone())),
-            empty_form(span, param(non_nil(&elem_ty))),
-        )
-    } else {
-        empty_form(span, param(elem_ty.clone()))
+    let (params, out_ty) = match shape {
+        Shape::Array { elem } => (
+            vec![Symbol::new("__cb")],
+            Ty::Array { elem: Box::new(non_nil(&elem)) },
+        ),
+        Shape::Hash { key, value } => (
+            vec![Symbol::new("_k"), Symbol::new("__cb")],
+            Ty::Hash { key: Box::new(key), value: Box::new(non_nil(&value)) },
+        ),
     };
     let block = mk(
         span,
         ExprNode::Lambda { rest_param: None,
-            params: vec![name],
+            params,
             block_param: None,
-            body: cond,
+            body: cond_body,
             block_style: Default::default(),
         },
         Ty::Untyped,
     );
-    let array_ty = Ty::Array { elem: Box::new(non_nil(&elem_ty)) };
     *expr = mk(
         span,
         ExprNode::Send {
@@ -799,9 +684,42 @@ fn try_rewrite_compact_blank(
             block: Some(block),
             parenthesized: false,
         },
-        array_ty,
+        out_ty,
     );
     expr.leading_blank_line = leading_blank_line;
+    true
+}
+
+fn compact_blank_value_var(span: crate::span::Span, ty: Ty) -> Expr {
+    mk(
+        span,
+        ExprNode::Var { id: crate::ident::VarId(0), name: Symbol::new("__cb") },
+        ty,
+    )
+}
+
+/// The ELEMENT/VALUE emptiness test, by the same rule `a.blank?` takes —
+/// `compact_blank` is documented as `reject(&:blank?)`, so an Array of
+/// Strings must reject a whitespace-only one. campfire's `User#title`
+/// is `[ name, bio ].compact_blank.join(" – ")`.
+fn compact_blank_container_cond(
+    span: crate::span::Span,
+    elem_ty: Ty,
+    nilable: bool,
+    whitespace: bool,
+) -> Expr {
+    let param = |ty: Ty| compact_blank_value_var(span, ty);
+    let empty_form = if whitespace { blank_str } else { plain_empty };
+    if nilable {
+        bool_op(
+            span,
+            crate::expr::BoolOpKind::Or,
+            nil_check(span, param(elem_ty.clone())),
+            empty_form(span, param(non_nil(&elem_ty))),
+        )
+    } else {
+        empty_form(span, param(elem_ty))
+    }
 }
 
 /// The non-nil half of a nilable type — what survives the reject.

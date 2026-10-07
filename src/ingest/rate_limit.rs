@@ -21,6 +21,10 @@
 //! end
 //! ```
 //!
+//! Filters are installed only after private-method synth succeeds, so a
+//! failed re-ingest never leaves orphan `before_action`s (same collect →
+//! synth → install shape as `invisible_captcha`).
+//!
 //! Generated here as a real method and a real filter, the way
 //! `allow_browser` is, because every consumer downstream reads methods
 //! and filters and none reads a class-body macro:
@@ -46,18 +50,23 @@
 //! `head :too_many_requests`, actionpack's own defaults. `controller_path`
 //! is the class name underscored, which is what Rails derives too.
 //!
-//! WHAT IS LEFT. `if:`/`unless:`, `store:`, a `by:` or `with:` that is
-//! not a lambda, or a `name:` that is not a literal — the macro stays
+//! WHAT IS LEFT. `store:`, a `by:` or `with:` that is not a lambda, or a
+//! `name:` that is not a literal — the macro stays
 //! where it was and the survey names it, which is the contract for a
 //! class-body macro roundhouse cannot expand (`report_unrecognized_controller_macros`).
 //! The method reaches the ruby-family lanes fully; a strict target
 //! carries the `RateLimiter` call as a runtime seam, the posture
 //! `allow_browser`'s concern form already has.
 
-use crate::dialect::{Controller, ControllerBodyItem, Filter, FilterKind};
+use crate::dialect::{Controller, ControllerBodyItem};
 use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::Symbol;
 
+use super::controller_macro_synth::{
+    append_private_actions, expr_symbol_list, install_before_filter,
+};
+
+#[derive(Clone)]
 struct Limit {
     method: String,
     to_src: String,
@@ -66,64 +75,39 @@ struct Limit {
     with_src: String,
     only: Vec<Symbol>,
     except: Vec<Symbol>,
+    if_cond: Option<Symbol>,
+    unless_cond: Option<Symbol>,
+    if_cond_expr: Option<Expr>,
+    unless_cond_expr: Option<Expr>,
 }
 
 pub fn lower_rate_limit(app: &mut crate::App) {
     for controller in &mut app.controllers {
-        let limits = take_from_controller_body(controller);
+        let limits = collect_limits(controller);
         if limits.is_empty() {
             continue;
         }
         let mut methods = String::new();
-        for l in &limits {
+        for (_, l) in &limits {
             methods.push_str(&method_source(l));
         }
-        let src = format!(
-            "class {} < ApplicationController\n  private\n{}end\n",
-            controller.name.0.as_str(),
-            methods
-        );
-        // Isolated in its own `prism::scope` — never the outer one
-        // that spans the whole app's ingest — so a bug in the
-        // generated method source can't render its parse errors
-        // against an unrelated real file (see `ingest::sources`'s
-        // module doc).
-        let (result, diags) = crate::ingest::prism::scope(|| {
-            super::controller::ingest_controller(src.as_bytes(), "<rate_limit>")
-        });
-        let parsed = match (result, diags.is_empty()) {
-            (Ok(Some(c)), true) => c,
-            (Ok(None), true) => continue,
-            (Ok(_), false) => {
-                super::survey::record_synthesis_failure(
-                    "<rate_limit>",
-                    &format!("rate_limit forwarder for `{}`", controller.name.0.as_str()),
-                    &diags,
-                );
-                continue;
-            }
-            (Err(err), _) => {
-                super::survey::record(&err);
-                continue;
-            }
-        };
-        let has_private_marker = controller
-            .body
-            .iter()
-            .any(|item| matches!(item, ControllerBodyItem::PrivateMarker { .. }));
-        if !has_private_marker {
-            controller.body.push(ControllerBodyItem::PrivateMarker {
-                leading_comments: Vec::new(),
-                leading_blank_line: true,
-            });
+        if !append_private_actions(controller, "<rate_limit>", &methods) {
+            continue;
         }
-        for item in parsed.body {
-            if let ControllerBodyItem::Action { action, .. } = item {
-                controller.body.push(ControllerBodyItem::Action {
-                    action,
-                    leading_comments: Vec::new(),
-                    leading_blank_line: true,
-                });
+        // Indices are still valid: append only pushed at the end.
+        for (idx, l) in &limits {
+            if let Some(item) = controller.body.get_mut(*idx) {
+                install_before_filter(
+                    item,
+                    &l.method,
+                    l.only.clone(),
+                    l.except.clone(),
+                    false,
+                    l.if_cond.clone(),
+                    l.unless_cond.clone(),
+                    l.if_cond_expr.clone(),
+                    l.unless_cond_expr.clone(),
+                );
             }
         }
     }
@@ -143,51 +127,31 @@ fn method_source(l: &Limit) -> String {
     )
 }
 
-/// Replace every expandable `rate_limit` in the class body with its
-/// filter; return what each expands to. Ones this cannot read stay.
-fn take_from_controller_body(controller: &mut Controller) -> Vec<Limit> {
+/// Parse expandable `rate_limit` calls without mutating the body.
+fn collect_limits(controller: &Controller) -> Vec<(usize, Limit)> {
     let path = crate::naming::underscore(
         controller.name.0.as_str().strip_suffix("Controller").unwrap_or(controller.name.0.as_str()),
     );
-    let mut found: Vec<Limit> = Vec::new();
-    for item in controller.body.iter_mut() {
-        let ControllerBodyItem::Unknown { expr, leading_comments, leading_blank_line } = item else {
+    let mut found: Vec<(usize, Limit)> = Vec::new();
+    for (i, item) in controller.body.iter().enumerate() {
+        let ControllerBodyItem::Unknown { expr, .. } = item else {
             continue;
         };
-        let Some(mut limit) = limit_from_call(expr, &path) else { continue };
+        let Some(mut limit) = limit_from_call(expr, &path) else {
+            continue;
+        };
         // Two macros on one controller (or one without a `name:`) must
         // not collide on the method name; the ordinal keeps them apart.
-        if found.iter().any(|f| f.method == limit.method) {
+        if found.iter().any(|(_, f)| f.method == limit.method) {
             limit.method = format!("{}_{}", limit.method, found.len() + 1);
         }
-        let f = Filter {
-            target_span: crate::span::Span::synthetic(),
-            kind: FilterKind::Before,
-            target: Symbol::from(limit.method.as_str()),
-            from_concern: None,
-            only: limit.only.clone(),
-            except: limit.except.clone(),
-            only_style: Default::default(),
-            except_style: Default::default(),
-            if_cond: None,
-            unless_cond: None,
-            if_cond_expr: None,
-            unless_cond_expr: None,
-            block: None,
-            prepend: false,
-        };
-        *item = ControllerBodyItem::Filter {
-            filter: f,
-            leading_comments: std::mem::take(leading_comments),
-            leading_blank_line: *leading_blank_line,
-        };
-        found.push(limit);
+        found.push((i, limit));
     }
     found
 }
 
 /// `rate_limit to: N, within: D, by: -> {…}, with: -> {…}, name: "…",
-/// only: […], except: […]` → its parts, or None for any call this is
+/// scope: …, only: […], except: […]` → its parts, or None for any call this is
 /// not, or an option it cannot expand.
 fn limit_from_call(call: &Expr, controller_path: &str) -> Option<Limit> {
     let ExprNode::Send { recv: None, method, args, block: None, .. } = &*call.node else {
@@ -203,8 +167,13 @@ fn limit_from_call(call: &Expr, controller_path: &str) -> Option<Limit> {
     let mut by_src: Option<String> = None;
     let mut with_src: Option<String> = None;
     let mut name: Option<String> = None;
+    let mut scope_src: Option<String> = None;
     let mut only: Vec<Symbol> = Vec::new();
     let mut except: Vec<Symbol> = Vec::new();
+    let mut if_cond = None;
+    let mut unless_cond = None;
+    let mut if_cond_expr = None;
+    let mut unless_cond_expr = None;
     for (k, v) in entries {
         let ExprNode::Lit { value: Literal::Sym { value: key } } = &*k.node else { return None };
         match key.as_str() {
@@ -216,8 +185,38 @@ fn limit_from_call(call: &Expr, controller_path: &str) -> Option<Limit> {
                 let ExprNode::Lit { value: Literal::Str { value } } = &*v.node else { return None };
                 name = Some(value.clone());
             }
-            "only" => only = symbol_list(v)?,
-            "except" => except = symbol_list(v)?,
+            // Rails defaults the cache-key scope to this controller's
+            // path. `scope:` replaces that, so two controllers can share
+            // one budget: a symbol, a string, or a call such as
+            // `OtherController.controller_path`.
+            "scope" => scope_src = Some(scope_source(v)?),
+            "only" => only = expr_symbol_list(v)?,
+            "except" => except = expr_symbol_list(v)?,
+            "if" => match &*v.node {
+                ExprNode::Lit { value: Literal::Sym { value } } => if_cond = Some(value.clone()),
+                // The guard evaluates the predicate. Storing the lambda
+                // would test the lambda object, which is always truthy.
+                // A parameter has no binding once the body is inlined.
+                ExprNode::Lambda { params, rest_param, block_param, body, .. }
+                    if params.is_empty() && rest_param.is_none() && block_param.is_none() =>
+                {
+                    if_cond_expr = Some((*body).clone())
+                }
+                _ => return None,
+            },
+            "unless" => match &*v.node {
+                ExprNode::Lit { value: Literal::Sym { value } } => unless_cond = Some(value.clone()),
+                ExprNode::Lambda { params, rest_param, block_param, body, .. }
+                    if params.is_empty() && rest_param.is_none() && block_param.is_none() =>
+                {
+                    unless_cond_expr = Some((*body).clone())
+                }
+                _ => return None,
+            },
+            // A custom store changes which counter increments. The shared
+            // limiter has no store argument, so expanding without it would
+            // silently use the default cache.
+            "store" => return None,
             _ => return None,
         }
     }
@@ -226,18 +225,39 @@ fn limit_from_call(call: &Expr, controller_path: &str) -> Option<Limit> {
         (None, [one]) => format!("rate_limit_{}", one.as_str()),
         (None, _) => "rate_limit".to_string(),
     };
-    // Rails: ["rate-limit", controller_path, name, by].compact.join(":")
-    let mut prefix = format!("rate-limit:{controller_path}");
-    if let Some(n) = &name {
-        prefix.push(':');
-        prefix.push_str(n);
-    }
-    prefix.push(':');
-    let key_src = format!(
-        "{} + ({}).to_s",
-        ruby_string_literal(&prefix),
-        by_src.unwrap_or_else(|| "request.remote_ip".to_string())
-    );
+    // Rails: ["rate-limit", scope || controller_path, name, by].compact.join(":")
+    let key_src = match scope_src {
+        Some(scope) => {
+            let mut parts = vec![format!(
+                "{} + ({}).to_s",
+                ruby_string_literal("rate-limit:"),
+                scope
+            )];
+            if let Some(n) = &name {
+                parts.push(ruby_string_literal(&format!(":{n}:")));
+            } else {
+                parts.push(ruby_string_literal(":"));
+            }
+            parts.push(format!(
+                "({}).to_s",
+                by_src.unwrap_or_else(|| "request.remote_ip".to_string())
+            ));
+            parts.join(" + ")
+        }
+        None => {
+            let mut prefix = format!("rate-limit:{controller_path}");
+            if let Some(n) = &name {
+                prefix.push(':');
+                prefix.push_str(n);
+            }
+            prefix.push(':');
+            format!(
+                "{} + ({}).to_s",
+                ruby_string_literal(&prefix),
+                by_src.unwrap_or_else(|| "request.remote_ip".to_string())
+            )
+        }
+    };
     Some(Limit {
         method,
         to_src: to_src?,
@@ -246,7 +266,27 @@ fn limit_from_call(call: &Expr, controller_path: &str) -> Option<Limit> {
         with_src: with_src.unwrap_or_else(|| "head(:too_many_requests)".to_string()),
         only,
         except,
+        if_cond,
+        unless_cond,
+        if_cond_expr,
+        unless_cond_expr,
     })
+}
+
+/// `scope:` as the cache-key segment Rails joins. A symbol or string is
+/// that segment; a call (`SessionsController.controller_path`) is
+/// evaluated, which is how one controller names another's path.
+fn scope_source(v: &Expr) -> Option<String> {
+    // A symbol or string is captured when the macro expands, which is
+    // when Rails evaluates `scope:`. A call is not: Rails would run it
+    // once at declaration, and a nil or false result would fall back to
+    // this controller's path. Emitting the call inside the request would
+    // re-run it, and a nil result would collapse unrelated budgets.
+    match &*v.node {
+        ExprNode::Lit { value: Literal::Sym { value } } => Some(ruby_string_literal(value.as_str())),
+        ExprNode::Lit { value: Literal::Str { value } } => Some(ruby_string_literal(value)),
+        _ => None,
+    }
 }
 
 /// The body of a `-> { … }` as source; None for anything else.
@@ -280,22 +320,20 @@ fn seconds_source(v: &Expr) -> String {
 }
 
 fn ruby_string_literal(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
-}
-
-/// `:create` / `[:create, :update]` → the names; anything else → None.
-fn symbol_list(v: &Expr) -> Option<Vec<Symbol>> {
-    match &*v.node {
-        ExprNode::Lit { value: Literal::Sym { value } } => Some(vec![value.clone()]),
-        ExprNode::Array { elements, .. } => elements
-            .iter()
-            .map(|e| match &*e.node {
-                ExprNode::Lit { value: Literal::Sym { value } } => Some(value.clone()),
-                _ => None,
-            })
-            .collect(),
-        _ => None,
+    // A double-quoted literal interpolates `#{…}`, `#@ivar`, and
+    // `#$global`. The scope was a literal, so each marker stays text.
+    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+    let mut out = String::with_capacity(escaped.len());
+    let chars: Vec<char> = escaped.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '#' && matches!(chars.get(i + 1), Some('{' | '@' | '$')) {
+            out.push('\\');
+        }
+        out.push(chars[i]);
+        i += 1;
     }
+    format!("\"{out}\"")
 }
 
 #[cfg(test)]
@@ -308,6 +346,27 @@ mod tests {
             .unwrap()
     }
 
+    /// Collect then install filters (mirrors `lower_rate_limit` after synth).
+    fn collect_and_install(c: &mut Controller) -> Vec<Limit> {
+        let collected = collect_limits(c);
+        for (idx, l) in &collected {
+            if let Some(item) = c.body.get_mut(*idx) {
+                install_before_filter(
+                    item,
+                    &l.method,
+                    l.only.clone(),
+                    l.except.clone(),
+                    false,
+                    l.if_cond.clone(),
+                    l.unless_cond.clone(),
+                    l.if_cond_expr.clone(),
+                    l.unless_cond_expr.clone(),
+                );
+            }
+        }
+        collected.into_iter().map(|(_, l)| l).collect()
+    }
+
     #[test]
     fn the_store_form_expands_to_a_filter_and_a_method() {
         let mut c = controller(
@@ -315,7 +374,7 @@ mod tests {
              rate_limit to: 10, within: 3.minutes, only: :create, with: -> { redirect_to new_session_path, alert: \"Try again later.\" }\n  \
              def create\n  end\nend\n",
         );
-        let limits = take_from_controller_body(&mut c);
+        let limits = collect_and_install(&mut c);
         assert_eq!(limits.len(), 1);
         let l = &limits[0];
         assert_eq!(l.method, "rate_limit_create");
@@ -335,12 +394,12 @@ mod tests {
 
     #[test]
     fn defaults_and_the_key_name_follow_rails() {
-        let mut c = controller(
+        let c = controller(
             "class Api::TokensController < ApplicationController\n  \
              rate_limit to: 5, within: 1.hour, by: -> { params[:email] }, name: \"signup\"\nend\n",
         );
-        let limits = take_from_controller_body(&mut c);
-        let l = &limits[0];
+        let limits = collect_limits(&c);
+        let l = &limits[0].1;
         assert_eq!(l.method, "rate_limit_signup");
         assert_eq!(l.within_src, "3600");
         assert_eq!(l.key_src, "\"rate-limit:api/tokens:signup:\" + (params[:email]).to_s");
@@ -349,12 +408,101 @@ mod tests {
     }
 
     #[test]
-    fn an_option_it_cannot_expand_leaves_the_macro_in_place() {
-        let mut c = controller(
-            "class SessionsController < ApplicationController\n  \
-             rate_limit to: 10, within: 3.minutes, if: :guest?\nend\n",
+    fn a_shared_scope_replaces_the_controller_path_in_the_cache_key() {
+        // Two controllers count against one budget when the second names
+        // the first's path, a symbol, or a string. Rails joins
+        // `scope || controller_path` between `rate-limit` and `name`.
+        // A call is evaluated by Rails when the filter is declared.
+        // Expanding it into the request method would re-run it, and a
+        // nil result would collapse this controller's budget into
+        // another. The macro stays in place.
+        let shared = controller(
+            "class Users::Sessions::OtpsController < ApplicationController\n  \
+             rate_limit to: 10, within: 3.minutes, only: :create, scope: Users::SessionsController.controller_path\nend\n",
         );
-        assert!(take_from_controller_body(&mut c).is_empty());
+        assert!(collect_limits(&shared).is_empty());
+
+        let symbol = controller(
+            "class Api::TokensController < ApplicationController\n  \
+             rate_limit to: 100, within: 5.minutes, scope: :api_global\nend\n",
+        );
+        let symbol = &collect_limits(&symbol)[0].1;
+        assert_eq!(
+            symbol.key_src,
+            "\"rate-limit:\" + (\"api_global\").to_s + \":\" + (request.remote_ip).to_s"
+        );
+
+        let named = controller(
+            "class Api::TokensController < ApplicationController\n  \
+             rate_limit to: 100, within: 5.minutes, name: \"burst\", scope: \"api\"\nend\n",
+        );
+        let named = &collect_limits(&named)[0].1;
+        assert!(named.key_src.contains("\"api\""), "{}", named.key_src);
+        assert!(named.key_src.contains(":burst:"), "{}", named.key_src);
+
+        let marked = controller(
+            "class Api::TokensController < ApplicationController\n  \
+             rate_limit to: 100, within: 5.minutes, scope: \"budget-\\#{id}\"\nend\n",
+        );
+        let marked = &collect_limits(&marked)[0].1;
+        assert!(
+            marked.key_src.contains("\\#{"),
+            "a literal interpolation marker stays literal; {}",
+            marked.key_src
+        );
+
+        // Single quotes keep `#@` and `#$` as text. Emitting them inside
+        // a double-quoted key would interpolate the ivar or the global.
+        let shorthand = controller(
+            "class Api::TokensController < ApplicationController\n  \
+             rate_limit to: 100, within: 5.minutes, scope: '#@token #$budget'\nend\n",
+        );
+        let shorthand = &collect_limits(&shorthand)[0].1;
+        assert!(
+            shorthand.key_src.contains("\\#@token") && shorthand.key_src.contains("\\#$budget"),
+            "shorthand interpolation markers stay literal; {}",
+            shorthand.key_src
+        );
+    }
+
+    #[test]
+    fn an_unknown_option_leaves_the_macro_in_place() {
+        let c = controller(
+            "class SessionsController < ApplicationController\n  \
+             rate_limit to: 10, within: 3.minutes, bogus: true\nend\n",
+        );
+        assert!(collect_limits(&c).is_empty());
         assert!(c.body.iter().any(|i| matches!(i, ControllerBodyItem::Unknown { .. })));
+    }
+
+    #[test]
+    fn if_unless_and_by_lambda_are_kept() {
+        let mut c = controller(
+            "class TokensController < ApplicationController\n  \
+             rate_limit to: 5, within: 1.minute, only: :create, if: -> { @credential }, unless: :quiet?, by: -> { @token }\nend\n",
+        );
+        let limits = collect_and_install(&mut c);
+        assert_eq!(limits.len(), 1);
+        let limit = &limits[0];
+        assert_eq!(limit.only, vec![Symbol::from("create")]);
+        assert!(limit.if_cond_expr.is_some());
+        assert_eq!(limit.unless_cond.as_ref().map(|s| s.as_str()), Some("quiet?"));
+        assert!(limit.key_src.contains("@token"), "{}", limit.key_src);
+        let filter = c.body.iter().find_map(|item| match item {
+            ControllerBodyItem::Filter { filter, .. } => Some(filter),
+            _ => None,
+        }).expect("filter");
+        assert!(filter.if_cond_expr.is_some());
+        assert_eq!(filter.unless_cond.as_ref().map(|s| s.as_str()), Some("quiet?"));
+    }
+
+    #[test]
+    fn a_custom_store_is_not_dropped() {
+        let c = controller(
+            "class SessionsController < ApplicationController\n  \
+             rate_limit to: 10, within: 3.minutes, store: custom_store\nend\n",
+        );
+        assert!(collect_limits(&c).is_empty());
+        assert!(c.body.iter().any(|item| matches!(item, ControllerBodyItem::Unknown { .. })));
     }
 }

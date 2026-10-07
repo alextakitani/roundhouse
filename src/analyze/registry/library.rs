@@ -69,7 +69,16 @@ pub(in crate::analyze) fn register(
         // A helper module's own `include`s carry transitively to
         // any class that includes it; record them so dispatch can
         // chase nested mixins.
-        cls.includes = lc.includes.clone();
+        // MERGED, not assigned: a framework class is reopened once per
+        // patch file (core reopens `ActionDispatch::Request` to include
+        // `RequestHelperMethods`, `RequestBuyerSession`, ...), and each
+        // reopen is a library class of the same name. Assigning kept only
+        // the last file's mixins and lost the methods of every other.
+        for inc in &lc.includes {
+            if !cls.includes.contains(inc) {
+                cls.includes.push(inc.clone());
+            }
+        }
         // `include Singleton` provides `.instance` returning the
         // singleton — the one stdlib mixin worth special-casing:
         // service objects use it pervasively
@@ -385,6 +394,7 @@ fn ar_instance_ty(kind: crate::catalog::ReturnKind) -> Option<Ty> {
     use crate::catalog::ReturnKind;
     match kind {
         ReturnKind::Int => Some(Ty::Int),
+        ReturnKind::IntOrNil => Some(Ty::Union { variants: vec![Ty::Int, Ty::Nil] }),
         ReturnKind::Bool => Some(Ty::Bool),
         ReturnKind::Str => Some(Ty::Str),
         ReturnKind::HashSymStr => {

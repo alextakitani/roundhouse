@@ -18,17 +18,18 @@ use crate::Symbol;
 use crate::dialect::{LibraryClass, MethodReceiver, TestModule};
 use crate::vfs::{FsVfs, MapVfs, Vfs};
 
-use super::controller::ingest_controller;
+use super::controller::ingest_controller_with_nesting;
 use super::expr::ingest_ruby_program;
 use super::fixture::ingest_fixture_file;
 use super::jbuilder::ingest_jbuilder;
 use super::library_class::{
-    ClassKind, ConcernClassMethodSpans, classify_class_file, ingest_concern_class_method_spans,
-    ingest_concern_filters, ingest_concern_model_items, ingest_helper_method_names,
-    ingest_library_classes, ingest_rails_application_singleton_methods,
+    ClassKind, ConcernClassMethodSpans, ConcernEnumDecl, classify_class_file,
+    ingest_concern_class_method_spans, ingest_concern_filters,
+    ingest_concern_model_items_with_constants,
+    ingest_helper_method_names, ingest_library_classes, ingest_rails_application_singleton_methods,
 };
 use super::model::ingest_model_with_enum_constants;
-use super::routes::ingest_routes_with_draws;
+use super::routes::ingest_routes_with_dsl;
 use super::schema::{ingest_migration, ingest_schema};
 use super::structure_sql::ingest_structure_sql;
 use super::test::ingest_test_files;
@@ -230,6 +231,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
         return super::roda_app::ingest_roda_app_with_vfs(vfs, dir);
     }
     super::sources::reset();
+    let _source_root = super::sources::set_root(dir);
     let path_gems = path_gem_dirs(vfs, dir);
     let source_vfs = PathGemVfs { inner: vfs, root: dir, dirs: &path_gems };
     let vfs = &source_vfs;
@@ -240,10 +242,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     // the module. Local rather than a field on `App`: they exist only
     // until the splice folds them into each including model's own
     // `enums` table, and nothing downstream reads them by module.
-    let mut concern_enums: Vec<(
-        crate::ident::ClassId,
-        Vec<(crate::ident::Symbol, Vec<(String, crate::expr::Literal)>)>,
-    )> = Vec::new();
+    let mut concern_enums: Vec<(crate::ident::ClassId, Vec<ConcernEnumDecl>)> = Vec::new();
 
     // The app's inflections come first: everything after this that
     // turns `:leaves` into a class name or `Leaf` into a table name
@@ -257,6 +256,9 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     if vfs.exists(&lock_path) {
         if let Ok(text) = vfs.read_to_string(&lock_path) {
             app.gem_lock = Some(crate::gems::Lockfile::parse(&text));
+            if let Some(lock) = &app.gem_lock {
+                app.gem_boundary = super::rbi::load_gem_boundary(vfs, dir, lock);
+            }
         }
     }
 
@@ -361,6 +363,12 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     };
 
     let mut table_prefixes = super::model::TablePrefixes::new();
+    // Action Text engine `isolate_namespace` → `action_text_` prefix.
+    // Writebook's Markdown model lives under `module ActionText` without
+    // an app-declared `table_name_prefix`, but its schema table is
+    // `action_text_markdowns` (not `markdowns`). Seed the framework
+    // prefix so ordinary model ingest matches the gem.
+    table_prefixes.insert("ActionText".to_string(), "action_text_".to_string());
     // Qualified enum arrays can live in a later file (e.g. a service
     // module). Collect literal inputs before expanding any model DSL.
     let mut enum_constants = super::model::EnumConstants::default();
@@ -424,6 +432,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                     if let Some(maybe_model) =
                         unwrap_or_record(ingest_model_with_enum_constants(
                             &source, &path_str, &app.schema, &table_prefixes, &enum_constants,
+                            &model_bases,
                         ))?
                     {
                         if let Some(model) = maybe_model {
@@ -440,7 +449,9 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                             {
                                 let nested = nested_under(&outer, classes);
                                 let (concern_items, concern_enum_decls) =
-                                    ingest_concern_model_items(&source, &path_str);
+                                    ingest_concern_model_items_with_constants(
+                                        &source, &path_str, &enum_constants,
+                                    );
                                 app.concern_model_items.extend(concern_items.into_iter().filter(
                                     |(id, _)| nested.iter().any(|class| class.name == *id),
                                 ));
@@ -469,7 +480,9 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                         app.concern_filters
                             .extend(ingest_concern_filters(&source, &path_str));
                         let (concern_items, concern_enum_decls) =
-                            ingest_concern_model_items(&source, &path_str);
+                            ingest_concern_model_items_with_constants(
+                                &source, &path_str, &enum_constants,
+                            );
                         app.concern_model_items.extend(concern_items);
                         app.view_visible_controller_methods
                             .extend(ingest_helper_method_names(&source));
@@ -576,6 +589,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
             if super::library_class::has_active_record_base(&source, &model_bases) {
                 match ingest_model_with_enum_constants(
                     &source, &path_str, &app.schema, &table_prefixes, &enum_constants,
+                    &model_bases,
                 ) {
                     Ok(Some(model)) => {
                         let outer = model.name.clone();
@@ -585,7 +599,9 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                         if let Ok(classes) = ingest_library_classes(&source, &path_str) {
                             let nested = nested_under(&outer, classes);
                             let (concern_items, concern_enum_decls) =
-                                ingest_concern_model_items(&source, &path_str);
+                                ingest_concern_model_items_with_constants(
+                                    &source, &path_str, &enum_constants,
+                                );
                             app.concern_model_items.extend(concern_items.into_iter().filter(
                                 |(id, _)| nested.iter().any(|class| class.name == *id),
                             ));
@@ -807,21 +823,35 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                 methods.append(&mut synth);
             }
         }
-        // `config.active_storage.variable_content_types -= %w[…]` — an
-        // initializer trimming the image types a variant may be made
-        // from (campfire drops bmp/ico/psd: loaders it does not trust).
-        // The runtime answers `variable?` from Rails' default list
-        // minus this one, so a bmp avatar falls back to initials here
-        // exactly as it does there. Synthesized as
-        // `active_storage_excluded_content_types` on the reopen, over
-        // the framework default (`[]`) in runtime/ruby/rails.rb.
+        // Active Storage initializer lifts — one walk of
+        // `config/initializers` for the cluster that shares that
+        // directory: variable_content_types trim, video_preview_arguments,
+        // and previewers VideoPreviewer → replacement Const map.
         {
             let init_dir = dir.join("config/initializers");
             let mut excluded: Vec<String> = Vec::new();
+            let mut video_args: Option<String> = None;
+            let mut previewer_replacement: Option<String> = None;
             if vfs.is_dir(&init_dir) {
                 for entry in read_rb_files(vfs, &init_dir)? {
                     if let Ok(bytes) = vfs.read(&entry) {
                         excluded.extend(extract_variable_content_type_exclusions(&bytes));
+                        match extract_video_preview_arguments(&bytes) {
+                            VideoPreviewArgsExtract::Value(a) => video_args = Some(a),
+                            VideoPreviewArgsExtract::Unsupported => {
+                                // A later computed assignment must not leave an
+                                // earlier literal override in effect.
+                                video_args = None;
+                                survey::record(&IngestError::Unsupported {
+                                    file: entry.display().to_string(),
+                                    message: "config.active_storage.video_preview_arguments is not a string-literal concatenation; the emitted app keeps the framework default".to_string(),
+                                });
+                            }
+                            VideoPreviewArgsExtract::Absent => {}
+                        }
+                        if let Some(name) = extract_video_previewer_replacement(&bytes) {
+                            previewer_replacement = Some(name);
+                        }
                     }
                 }
             }
@@ -840,15 +870,39 @@ end
                     methods.append(&mut synth);
                 }
             }
+            // One Rails knob → one Application override. The vf filter
+            // is peeled at `ActiveStorage.video_preview_vf_filter`.
+            if let Some(arguments) = video_args {
+                if let Ok(mut synth) = crate::runtime_src::parse_methods(&format!(
+                    "def active_storage_video_preview_arguments
+  {arguments:?}
+end
+"
+                )) {
+                    methods.append(&mut synth);
+                }
+            }
+            if let Some(replacement) = previewer_replacement {
+                if let Ok(mut synth) = crate::runtime_src::parse_methods(&format!(
+                    "def active_storage_previewers
+  [{replacement}]
+end
+"
+                )) {
+                    methods.append(&mut synth);
+                }
+            }
         }
         // `Vips.block_untrusted(true)` / `Vips.block("<op>", true)` —
         // an initializer setting libvips' loader policy before any
-        // upload is decoded (campfire refuses every unfuzzed loader,
-        // and openslide by name). The image processor applies it at
-        // load (runtime/spinel/facades/active_storage_processor_vips
-        // .rb). Synthesized as `vips_block_untrusted` /
-        // `vips_blocked_operations` on the reopen, over the framework
-        // defaults (false / []) in runtime/ruby/rails.rb.
+        // upload is decoded (any app that stores user uploads; campfire
+        // refuses every unfuzzed loader, and openslide by name). The
+        // image processor applies it at load and wraps find_load so a
+        // blocked loader is not selected (runtime/spinel/facades/
+        // active_storage_processor_vips.rb). Synthesized as
+        // `vips_block_untrusted` / `vips_blocked_operations` on the
+        // reopen, over the framework defaults (false / []) in
+        // runtime/ruby/rails.rb.
         {
             let init_dir = dir.join("config/initializers");
             let mut untrusted = false;
@@ -877,6 +931,29 @@ end
                     .join(", ");
                 if let Ok(mut synth) = crate::runtime_src::parse_methods(&format!(
                     "def vips_blocked_operations\n  [{literal}]\nend\n"
+                )) {
+                    methods.append(&mut synth);
+                }
+            }
+        }
+        // Default page size for `Relation#page`. A `Kaminari.configure`
+        // block's literal `default_per_page = N` is one input spelling;
+        // synthesized as `default_per_page` on the reopen, over the
+        // runtime default of 25 in runtime/ruby/rails.rb.
+        {
+            let init_dir = dir.join("config/initializers");
+            let mut per_page: Option<u64> = None;
+            if vfs.is_dir(&init_dir) {
+                for entry in read_rb_files(vfs, &init_dir)? {
+                    if let Ok(bytes) = vfs.read(&entry) {
+                        let file = entry.display().to_string();
+                        per_page = extract_default_per_page(&bytes, &file).or(per_page);
+                    }
+                }
+            }
+            if let Some(n) = per_page {
+                if let Ok(mut synth) = crate::runtime_src::parse_methods(&format!(
+                    "def default_per_page\n  {n}\nend\n"
                 )) {
                     methods.append(&mut synth);
                 }
@@ -1013,6 +1090,7 @@ end
                 name: crate::ident::ClassId(crate::ident::Symbol::from("Rails::Application")),
                 is_module: false,
                 parent: None,
+                parent_span: Default::default(),
                 includes: Vec::new(),
                 methods,
                 nullable_columns: Vec::new(),
@@ -1089,6 +1167,10 @@ end
         }
     }
 
+    // Each controller's lexical nesting, for resolving its superclass
+    // once every controller is known (see
+    // `qualify_relative_controller_superclasses`).
+    let mut controller_nesting = std::collections::HashMap::new();
     for root in &roots {
         let controllers_dir = dir.join(root).join("controllers");
         if !vfs.is_dir(&controllers_dir) {
@@ -1098,9 +1180,10 @@ end
             let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
             let path_str = entry.display().to_string();
             if let Some(maybe_controller) =
-                unwrap_or_record(ingest_controller(&source, &path_str))?
+                unwrap_or_record(ingest_controller_with_nesting(&source, &path_str))?
             {
-                if let Some(controller) = maybe_controller {
+                if let Some((controller, nesting)) = maybe_controller {
+                    controller_nesting.insert(controller.name.clone(), nesting);
                     // `helper_method :x` exposes controller methods to
                     // templates. The ARG-PURE ones (no ivar reads)
                     // register like app-helper functions — the bare
@@ -1130,12 +1213,13 @@ end
                         app.library_classes.extend(nested_under(&outer, classes));
                     }
                 } else {
-                    // No class in the file — a module: a concern under
-                    // app/controllers/concerns/ (`AccountOwnedConcern`)
-                    // or a mixin like `Authorization`. Ingest as a
-                    // library class so its methods register and
+                    // Not a controller file: a module-only concern under
+                    // app/controllers/concerns/, a mixin like
+                    // `Authorization`, or a concern whose only classes
+                    // are Sorbet value objects (nested `T::Struct`).
+                    // Ingest as library classes so methods register and
                     // `include X` dispatch (ClassInfo.includes) can
-                    // resolve into it, and capture its `included do`
+                    // resolve into them, and capture `included do`
                     // filter declarations for every includer's chain.
                     if let Some(classes) =
                         unwrap_or_record(ingest_library_classes(&source, &path_str))?
@@ -1144,7 +1228,9 @@ end
                         app.concern_filters
                             .extend(ingest_concern_filters(&source, &path_str));
                         let (concern_items, concern_enum_decls) =
-                            ingest_concern_model_items(&source, &path_str);
+                            ingest_concern_model_items_with_constants(
+                                &source, &path_str, &enum_constants,
+                            );
                         app.concern_model_items.extend(concern_items);
                         app.view_visible_controller_methods
                             .extend(ingest_helper_method_names(&source));
@@ -1154,6 +1240,16 @@ end
             }
         }
     }
+
+    let mut model_files = Vec::new();
+    for root in &roots {
+        let models_dir = dir.join(root).join("models");
+        if vfs.is_dir(&models_dir) {
+            model_files.extend(read_rb_files(vfs, &models_dir)?);
+        }
+    }
+    app.generated_helper_methods =
+        super::generated_helpers::ingest_generated_helpers(&app, vfs, dir, &model_files);
 
     let routes_path = dir.join("config/routes.rb");
     if vfs.exists(&routes_path) {
@@ -1182,10 +1278,12 @@ end
                     draw_files.insert(key, (split_source, entry.display().to_string()));
                 }
             }
-            if let Some(routes) = unwrap_or_record(ingest_routes_with_draws(
+            let block_wrappers = mapper_extension_block_methods(&app, vfs, dir);
+            if let Some(routes) = unwrap_or_record(ingest_routes_with_dsl(
                 &source,
                 &routes_path.display().to_string(),
                 &draw_files,
+                &block_wrappers,
             ))? {
                 // `to: redirect("/x")` routes point at actions nobody
                 // wrote, so write them: one controller, one action per
@@ -1196,6 +1294,7 @@ end
                     app.controllers.push(synthesize_redirect_controller(&routes.redirects));
                 }
                 app.routes = routes;
+                synthesize_rails_health_controller(&mut app);
             }
         }
     }
@@ -1572,7 +1671,9 @@ end
         let Ok(entries) = read_rb_files(vfs, &tree) else { continue };
         for entry in entries {
             let Ok(source) = vfs.read(&entry) else { continue };
-            for (class_id, methods) in super::sorbet_sig::ingest_sorbet_signatures(&source) {
+            let (signatures, abstracts) = super::sorbet_sig::ingest_sorbet_declarations(&source);
+            drop_abstract_stubs(&mut app, &abstracts);
+            for (class_id, methods) in signatures {
                 let declared = app.rbs_signatures.entry(class_id).or_default();
                 for (name, ty) in methods {
                     declared.entry(name).or_insert(ty);
@@ -1596,18 +1697,53 @@ end
     // joins `dir`); map-VFS trees pass `""` and register app-relative.
     app.root = dir.display().to_string().trim_end_matches('/').to_string();
 
-    resolve_polymorphic_targets(&mut app);
+    // A module-nested controller's relative superclass
+    // (`module Ns; class XController < BaseController`) names
+    // `Ns::BaseController` under Ruby's lexical lookup. Left bare, the
+    // parent matched no controller, the ancestry walk came back empty,
+    // and the whole filter chain (its own base's before_action AND
+    // ApplicationController's) vanished from the synthesized dispatcher.
+    qualify_relative_controller_superclasses(&mut app, &controller_nesting);
+
+    // `app/models/post/summary.rb` often reopens `class Post` only to
+    // hold `Post::Summary`. That reopen is a namespace, not a class of
+    // its own: kept as a library class, it owns the file
+    // `app/models/post.rb` and the emit writes it over the model. With
+    // the reopen dropped, the nested class keeps its own file, as a
+    // class nested in the model's own file does. This runs after every
+    // walk, because `app/services` and `lib` can hold the same reopen,
+    // and `lib` can hold the model.
+    let model_names: std::collections::HashSet<&str> =
+        app.models.iter().map(|m| m.name.0.as_str()).collect();
+    app.library_classes.retain(|lc| {
+        let bodiless = !lc.is_module
+            && lc.parent.is_none()
+            && lc.includes.is_empty()
+            && lc.methods.is_empty()
+            && lc.class_ivar_initializers.is_empty()
+            && lc.constants.is_empty()
+            && lc.unknown_calls.is_empty()
+            && lc.origin.is_none();
+        !(bodiless && model_names.contains(lc.name.0.as_str()))
+    });
+
     // Before the splice: it (and every later consumer) looks concerns up
     // by ClassId, so the lexical-scope resolution has to have happened.
-    qualify_relative_model_includes(&mut app);
+    qualify_relative_includes(&mut app);
     // Before the concern splices: they read `library_classes`, and this
     // turns `Current`'s metaprogrammed surface into real methods first.
     super::current_attributes::lower_current_attributes(&mut app);
     super::thread_mattr::lower_thread_mattr(&mut app);
     // Alba declarations become ordinary property-reading methods before
     // inference; validate complete original resource bodies, not just IR.
-    // Rejected declarations still fail ingest, but survey must ledger them.
-    super::alba::lower_alba_resources(&mut app, &sources).inspect_err(survey::record)?;
+    // A recorded refusal is not support. Strict mode still fails here.
+    // Survey mode keeps the ledger entry and continues analysis.
+    if let Err(err) = super::alba::lower_alba_resources(&mut app, &sources) {
+        survey::continue_or_fail(err)?;
+    }
+    // graphql-ruby object types: analyzer-only field methods, so
+    // inference carries each type's record class down the schema.
+    super::graphql_ruby::lower_graphql_types(&mut app);
     // After it, not before: `Current`'s own `delegate` reads an
     // ATTRIBUTE's ivar, which that pass has the declarations for. What
     // reaches here is the general shape, whose target is a method.
@@ -1617,28 +1753,31 @@ end
     // later pass reads methods.
     super::channel_callbacks::lower_channel_callbacks(&mut app);
     super::channel_callbacks::lower_channel_names(&mut app);
+    super::on_load_reopen::apply_pending(&mut app);
     splice_concerns_into_models(&mut app);
     splice_concern_class_methods_into_includers(&mut app, &concern_class_method_spans);
     super::model_macros::expand_model_macros(&mut app, &sources)?;
     // After the splice, so a class method a concern contributed gets
     // the same treatment as one written in the model.
     qualify_model_class_method_ar_calls(&mut app);
+    // After the splice too: the inverse `has_many …, as: :owner` may be
+    // declared in a concern's `included do`.
+    resolve_polymorphic_targets(&mut app);
     // `allow_browser` becomes a filter plus the method it runs, on the
     // concern (before the splice carries both to the includer) or on
     // the controller that called it directly.
     super::allow_browser::lower_allow_browser(&mut app);
     super::rate_limit::lower_rate_limit(&mut app);
+    super::invisible_captcha::lower_invisible_captcha(&mut app);
+    super::impersonates::lower_impersonates(&mut app);
     // The real drain, now that every pass re-ingesting synthesized
     // Ruby has run. A synthesized `"<label>"` re-ingest never takes a
     // slot (`sources::register` refuses a label starting with `<`), so
     // this is the same real-file list that Rubydex indexes, and its
     // answers use these `FileId`s.
     app.sources = super::sources::drain();
-    debug_assert_eq!(
-        app.sources.len(),
-        sources.len(),
-        "a pass registered a source after Rubydex took its snapshot"
-    );
+    super::sources::assert_snapshot_matches(&sources, &app.sources);
+    app.source_index_required = !app.sources.is_empty();
     drop(sources);
     splice_concerns_into_controllers(&mut app);
     // After the splice: an action a concern provides is not implicit.
@@ -1646,6 +1785,7 @@ end
     // After the splice: a macro has to resolve against the concern's
     // class-side methods, and its expansion joins the same filter chain.
     super::class_configuration::expand(&mut app, &concern_class_method_spans, &framework_shadow_scopes)?;
+    super::class_attribute::expand(&mut app, &concern_class_method_spans, &framework_shadow_scopes);
     expand_class_body_macros(&mut app);
     // The same idea one base over: `const` / `prop` under a class
     // whose ancestry a sidecar says reaches `T::Props` IS the
@@ -1671,11 +1811,23 @@ end
     // Last: needs every model's complete `enums` table, including the
     // columns an included concern declared.
     map_enum_labels(&mut app);
-    // Last of all: `has_rich_text` can arrive through a concern's
-    // `included do`, so the declaration scan has to run after the
-    // splices — and `ActionText::RichText` has to be in `app.models`
-    // before anything downstream enumerates models.
+    // Last of all: `has_rich_text` / `has_markdown` can arrive through a
+    // concern's `included do`, so the declaration scan has to run after
+    // the splices — and the ActionText record models have to be in
+    // `app.models` before anything downstream enumerates models.
     crate::lower::rich_text::synthesize_record_model(&mut app);
+    crate::lower::plain_text_attr::synthesize_record_model(&mut app);
+    crate::lower::attachment_model::synthesize_attachment_model(&mut app);
+    // Second chance for `on_load(:active_storage_attachment)` includes
+    // whose target was only synthesized above; then splice ONLY those
+    // models so `has_many_attached` from the concern lands — a full
+    // re-splice would duplicate every concern already expanded at the
+    // first pass (doubled scopes, unique-constraint failures at run).
+    let late_on_load = super::on_load_reopen::apply_pending(&mut app);
+    if !late_on_load.is_empty() {
+        splice_concerns_into_models_named(&mut app, &late_on_load);
+    }
+    super::on_load_reopen::drain_pending(&mut app);
     app.const_resolver = crate::timings::phase("rubydex: wait", || const_resolver.finish());
     // Admission needs complete controller permit demand and model DSL,
     // including declarations contributed by either kind of Concern,
@@ -1683,11 +1835,10 @@ end
     super::concern_accessors::validate(&mut app, &concern_class_method_spans, &framework_shadow_scopes)?;
 
     collect_binary_assets(vfs, dir, &mut app);
-
-    debug_assert!(
-        super::sources::drain().is_empty(),
-        "a pass registered a source after ingest drained the registry"
-    );
+    // Generated re-ingest labels never register real sources. No later
+    // pass may append source-backed FileIds beyond the indexed snapshot.
+    let late_sources = super::sources::drain();
+    super::sources::assert_snapshot_matches(&[], &late_sources);
     Ok(app)
 }
 
@@ -1762,10 +1913,30 @@ fn walk_binary_assets<V: Vfs + ?Sized>(vfs: &V, root: &Path, dir: &Path, app: &m
 /// Strict targets get the DSL items the same way; module
 /// methods-via-include remain their separate, ledger-visible gap.
 fn splice_concerns_into_models(app: &mut App) {
+    splice_concerns_into_models_named(app, &[]);
+}
+
+/// Splice concern `included do` bodies into models.
+///
+/// When `only` is empty, every model is visited (the first pass). When
+/// non-empty, only models whose [`ClassId`] name is listed — the late
+/// `on_load(:active_storage_attachment)` path after Attachment /
+/// Markdown synthesis, which must not re-expand includes already
+/// spliced on the first pass.
+fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol]) {
     use crate::dialect::ModelBodyItem;
     use crate::expr::ExprNode;
 
     for model in &mut app.models {
+        if !only.is_empty() && !only.iter().any(|n| n == &model.name.0) {
+            continue;
+        }
+        // Concerns already spliced into this model. A spliced item may
+        // itself be an `include` (a concern's `included do include
+        // Other end`), whose own items are spliced in turn; a concern
+        // is spliced once, so an include cycle terminates.
+        let mut spliced: std::collections::HashSet<crate::ident::ClassId> =
+            std::collections::HashSet::new();
         let mut i = 0;
         while i < model.body.len() {
             // `include Attachment, Broadcasts, Mentionee` is one
@@ -1800,6 +1971,7 @@ fn splice_concerns_into_models(app: &mut App) {
             let model_name = model.name.clone();
             let items: Vec<ModelBodyItem> = concern_ids
                 .iter()
+                .filter(|id| spliced.insert((*id).clone()))
                 .filter_map(|id| app.concern_model_items.get(id).map(|items| (id, items)))
                 .flat_map(|(id, items)| {
                     items.iter().map(|item| rehome_default_fk(item, id, &model_name))
@@ -1809,9 +1981,8 @@ fn splice_concerns_into_models(app: &mut App) {
                 i += 1;
                 continue;
             }
-            let n = items.len();
             model.body.splice(i + 1..i + 1, items);
-            i += n + 1;
+            i += 1;
         }
     }
 }
@@ -1826,9 +1997,11 @@ fn splice_concerns_into_models(app: &mut App) {
 /// `user_id`. The emitted query said `WHERE webhooks.user::bot_id = 5`
 /// and sqlite answered "unrecognized token".
 ///
-/// Only a key that still EQUALS the concern-derived default is moved.
-/// An explicit `foreign_key:` differs from it and is left exactly as
-/// written; if it happens to coincide, the two names are equal anyway.
+/// Only a DEFAULTED key is moved. An explicit `foreign_key:` is left
+/// exactly as written, even when its name matches the concern-derived
+/// default (`foreign_key: :remarkable_id` inside `Remarkable`). With
+/// `as:`, the key belongs to the polymorphic interface, even when its
+/// name matches too (`as: :notifiable` inside `Notifiable`).
 /// `belongs_to` is untouched — its key derives from the TARGET, which
 /// the splice does not change.
 fn rehome_default_fk(
@@ -1844,7 +2017,8 @@ fn rehome_default_fk(
     let model_default =
         crate::ident::Symbol::from(format!("{}_id", crate::naming::snake_case(crate::naming::demodulize(model.0.as_str()))));
     match assoc {
-        Association::HasMany { foreign_key, .. } | Association::HasOne { foreign_key, .. } => {
+        Association::HasMany { foreign_key, foreign_key_explicit: false, as_interface: None, .. }
+        | Association::HasOne { foreign_key, foreign_key_explicit: false, as_interface: None, .. } => {
             if *foreign_key == concern_default {
                 *foreign_key = model_default;
             }
@@ -2150,6 +2324,34 @@ fn synthesize_template_only_actions(app: &mut App) {
 /// emits) and the reference becomes `IntervalHelper::TIME_INTERVALS`,
 /// which is what Ruby's lexical lookup means and what every strict
 /// target can resolve.
+/// A `sig { abstract… }` method is a declaration: its `def` is an empty stub
+/// and the includer supplies the real one. Spliced into the includer, the
+/// stub answered `nil` ahead of the implementation the includer inherits
+/// (a concern declaring `abstract.returns(ActionController::Parameters)
+/// def params; end` made every includer's `params` nil). The sig stays in
+/// `rbs_signatures` as the module's declaration; only the empty body goes.
+fn drop_abstract_stubs(
+    app: &mut App,
+    abstracts: &HashMap<crate::ident::ClassId, std::collections::HashSet<crate::ident::Symbol>>,
+) {
+    for lc in &mut app.library_classes {
+        let Some(names) = abstracts.get(&lc.name) else { continue };
+        lc.methods.retain(|m| {
+            !(matches!(m.receiver, crate::dialect::MethodReceiver::Instance)
+                && names.contains(&m.name)
+                && is_empty_body(&m.body))
+        });
+    }
+}
+
+fn is_empty_body(body: &crate::expr::Expr) -> bool {
+    match &*body.node {
+        crate::expr::ExprNode::Seq { exprs } => exprs.is_empty(),
+        crate::expr::ExprNode::Lit { value: crate::expr::Literal::Nil } => true,
+        _ => false,
+    }
+}
+
 fn splice_concerns_into_controllers(app: &mut App) {
     use crate::dialect::{Action, ControllerBodyItem, MethodReceiver, RenderTarget};
     use crate::ty::{Row, Ty};
@@ -2353,6 +2555,23 @@ fn splice_concerns_into_controllers(app: &mut App) {
         }
         filters.extend(methods);
         controller.body = filters;
+    }
+    // The `sig` above a module's `def` describes the COPY as well: the
+    // includer's method is that `def`, and inference over the copy would
+    // otherwise replace the declared return with whatever the body
+    // happens to end in.
+    for (controller, origins) in &spliced_origin {
+        for (name, module) in origins {
+            let Some(sig) = app.rbs_signatures.get(module).and_then(|m| m.get(name)).cloned()
+            else {
+                continue;
+            };
+            app.rbs_signatures
+                .entry(controller.clone())
+                .or_default()
+                .entry(name.clone())
+                .or_insert(sig);
+        }
     }
     app.concern_spliced_actions = spliced_origin;
 }
@@ -2702,12 +2921,34 @@ fn report_unrecognized_controller_macros(app: &App) {
         return;
     }
     for controller in &app.controllers {
+        // `sources::drain` already ran; use the App snapshot via the
+        // canonical FileId helper (thread-local `sources::path_of` misses).
+        let file_of = |file_id: crate::span::FileId| {
+            crate::ide::source(app, file_id)
+                .map(|s| s.path.clone())
+                .unwrap_or_else(|| controller.name.0.as_str().to_string())
+        };
         for item in &controller.body {
             let ControllerBodyItem::Unknown { expr, .. } = item else { continue };
             let ExprNode::Send { recv: None, method, block: None, .. } = &*expr.node else {
                 continue;
             };
             if CONSUMED_CONTROLLER_MACROS.contains(&method.as_str()) {
+                continue;
+            }
+            // `const` / `prop` belong to a lowered `T::Struct` (or a
+            // gem base the sidecar expands). On a real controller they
+            // are leftover Sorbet props with no runtime in the emitted
+            // tree — name that, rather than the generic "macro not
+            // recognized" bucket that also covers unmodeled app DSL.
+            if matches!(method.as_str(), "const" | "prop") {
+                survey::record(&IngestError::Unsupported {
+                    file: file_of(expr.span.file),
+                    message: format!(
+                        "Sorbet `{}` outside a lowered T::Struct (its effect is dropped from the output)",
+                        method.as_str()
+                    ),
+                });
                 continue;
             }
             // `before_action -> { … }, only: […]` (233 controllers) and
@@ -2722,8 +2963,7 @@ fn report_unrecognized_controller_macros(app: &App) {
             if super::controller::lambda_filter_target(expr).is_some() {
                 continue;
             }
-            let file = super::sources::path_of(expr.span.file)
-                .unwrap_or_else(|| controller.name.0.as_str().to_string());
+            let file = file_of(expr.span.file);
             if REFINEMENT_MACROS.contains(&method.as_str()) {
                 // `using SomeRefinement` — name the refinement in the
                 // ledger so the gap is actionable, rather than folding
@@ -2745,6 +2985,11 @@ fn report_unrecognized_controller_macros(app: &App) {
                         "refinement activated: `using {refinement}` (not modeled)"
                     ),
                 });
+                continue;
+            }
+            if survey::recorded().iter().any(|gap| {
+                gap.contains("class configuration") && gap.contains(method.as_str())
+            }) {
                 continue;
             }
             survey::record(&IngestError::Unsupported {
@@ -2846,6 +3091,42 @@ fn expand_class_body_macros(app: &mut App) {
                 expanded.push(item);
                 continue;
             };
+            // A reader beside the writer is the normal shape
+            // (`def options; @options || {}; end`). The writer still
+            // only stores the keyword rest, so the call is consumed.
+            // An attached block never reaches this arm.
+            // A refused concern is not executed. A method whose body is
+            // only the keyword-rest store is still consumed: the other
+            // statements stay unexpanded.
+            let another_unreadable = controller.body.iter().any(|other| {
+                let ControllerBodyItem::Unknown { expr: other_expr, .. } = other else {
+                    return false;
+                };
+                let ExprNode::Send { recv: None, method: other_method, args, block: None, .. } =
+                    &*other_expr.node
+                else {
+                    return false;
+                };
+                other_method == method && stored_options_init(other_expr, &macro_def).is_none() && !args.is_empty()
+            });
+            if method_stores_keyword_rest(&macro_def) && !another_unreadable {
+                if let Some(init) = stored_options_init(expr, &macro_def) {
+                    survey::record(&IngestError::Unsupported {
+                        file: controller.name.0.as_str().to_string(),
+                        message: format!(
+                            "class configuration call stored: `{}`",
+                            method.as_str()
+                        ),
+                    });
+                    expanded.push(ControllerBodyItem::ClassIvarInit {
+                        expr: init,
+                        carrier: module,
+                        leading_comments: leading_comments.clone(),
+                        leading_blank_line: *leading_blank_line,
+                    });
+                    continue;
+                }
+            }
             let body = substitute_params(&macro_def, args);
             match filters_from_macro_body(&body, &module) {
                 Some(filters) => {
@@ -2900,6 +3181,67 @@ fn expand_class_body_macros(app: &mut App) {
 /// The empty Hash is what makes the bare call mean what Ruby means:
 /// `skip_before_action :require_authentication, **{}` is an UNSCOPED
 /// skip, so the filter comes off every action rather than none.
+fn stored_options_init(
+    expr: &crate::expr::Expr,
+    method: &crate::dialect::MethodDef,
+) -> Option<crate::expr::Expr> {
+    use crate::expr::{Expr, ExprNode, LValue, Literal};
+    let body = match &*method.body.node {
+        ExprNode::Seq { exprs } if exprs.len() == 1 => &*exprs[0].node,
+        other => other,
+    };
+    let ExprNode::Assign { target: LValue::Ivar { name }, .. } = body else {
+        return None;
+    };
+    let ExprNode::Send { args, .. } = &*expr.node else { return None };
+    let value = match args.as_slice() {
+        [] => Expr::new(expr.span, ExprNode::Hash { entries: vec![], kwargs: false }),
+        [hash] => {
+            let readable = match &*hash.node {
+                ExprNode::Hash { entries, .. } => entries.iter().all(|(key, value)| {
+                    matches!(&*key.node, ExprNode::Lit { value: Literal::Sym { .. } })
+                        && matches!(
+                            &*value.node,
+                            ExprNode::Lit { .. } | ExprNode::Lambda { .. } | ExprNode::Array { .. }
+                        )
+                }),
+                ExprNode::KeywordSplat { value } => matches!(&*value.node, ExprNode::Hash { .. }),
+                _ => false,
+            };
+            if !readable {
+                return None;
+            }
+            let mut value = hash.clone();
+            if let ExprNode::KeywordSplat { value: inner } = &*value.node {
+                value = inner.clone();
+            }
+            value
+        }
+        _ => return None,
+    };
+    Some(Expr::new(
+        expr.span,
+        ExprNode::Assign {
+            target: LValue::Ivar { name: name.clone() },
+            value,
+        },
+    ))
+}
+
+fn method_stores_keyword_rest(method: &crate::dialect::MethodDef) -> bool {
+    use crate::expr::{ExprNode, LValue};
+    let [param] = method.params.as_slice() else { return false };
+    if method.block_param.is_some() || method.has_anonymous_block {
+        return false;
+    }
+    let body = match &*method.body.node {
+        ExprNode::Seq { exprs } if exprs.len() == 1 => &*exprs[0].node,
+        other => other,
+    };
+    matches!(body, ExprNode::Assign { target: LValue::Ivar { .. }, value }
+        if matches!(&*value.node, ExprNode::Var { name, .. } if name == &param.name))
+}
+
 fn substitute_params(
     macro_def: &crate::dialect::MethodDef,
     args: &[crate::expr::Expr],
@@ -2917,11 +3259,82 @@ fn substitute_params(
     }
 
     let span = macro_def.body.span;
+    // `options = actions.extract_options!` on the `*actions` parameter:
+    // the trailing Hash of the call is the options, everything before it
+    // the actions. Bound here because after substitution the receiver is
+    // an Array literal and `actions` below must not still hold the Hash.
+    let mut body = macro_def.body.clone();
+    let mut extracted: Vec<(crate::ident::Symbol, crate::expr::Expr)> = Vec::new();
+    if let (ExprNode::Seq { exprs }, Some((rest_index, rest))) = (
+        &mut *body.node,
+        macro_def.params.iter().enumerate().find(|(_, p)| p.rest),
+    ) {
+        let taken = match exprs.first().map(|e| &*e.node) {
+            Some(ExprNode::Assign {
+                target: crate::expr::LValue::Var { name, .. },
+                value,
+            }) => match &*value.node {
+                ExprNode::Send { recv: Some(r), method, args: a, block: None, .. }
+                    if method.as_str() == "extract_options!"
+                        && a.is_empty()
+                        && matches!(&*r.node, ExprNode::Var { name: n, .. } if n == &rest.name) =>
+                {
+                    Some(name.clone())
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        // `*%i[a b]` spreads its elements; any other splat's actions are
+        // unknown here, so the statement stays and the macro is refused
+        // rather than expanded with those actions missing.
+        let spread: Option<Vec<crate::expr::Expr>> = args
+            .get(rest_index..)
+            .unwrap_or(&[])
+            .iter()
+            .map(|a| match &*a.node {
+                ExprNode::Splat { value } => match &*value.node {
+                    ExprNode::Array { elements, .. } => Some(elements.clone()),
+                    _ => None,
+                },
+                _ => Some(vec![a.clone()]),
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(|groups| groups.concat());
+        if let (Some(options_name), Some(mut positional)) = (taken, spread) {
+            exprs.remove(0);
+            let options = match positional.last().map(|a| match &*a.node {
+                ExprNode::KeywordSplat { value } => matches!(&*value.node, ExprNode::Hash { .. }),
+                ExprNode::Hash { .. } => true,
+                _ => false,
+            }) {
+                Some(true) => {
+                    let last = positional.pop().expect("checked");
+                    match &*last.node {
+                        ExprNode::KeywordSplat { value } => value.clone(),
+                        _ => last,
+                    }
+                }
+                _ => crate::expr::Expr::new(span, ExprNode::Hash { entries: vec![], kwargs: false }),
+            };
+            extracted.push((options_name, options));
+            extracted.push((
+                rest.name.clone(),
+                crate::expr::Expr::new(
+                    span,
+                    ExprNode::Array { elements: positional, style: Default::default() },
+                ),
+            ));
+        }
+    }
     let bindings: Vec<(crate::ident::Symbol, crate::expr::Expr)> = macro_def
         .params
         .iter()
         .enumerate()
         .map(|(i, p)| {
+            if let Some((_, v)) = extracted.iter().find(|(n, _)| n == &p.name) {
+                return (p.name.clone(), v.clone());
+            }
             let value = match args.get(i) {
                 Some(a) => match &*a.node {
                     ExprNode::KeywordSplat { value } => value.clone(),
@@ -2940,9 +3353,43 @@ fn substitute_params(
             (p.name.clone(), value)
         })
         .collect();
-    let mut body = macro_def.body.clone();
+    let mut bindings = bindings;
+    let extra: Vec<_> = extracted
+        .into_iter()
+        .filter(|(n, _)| !bindings.iter().any(|(b, _)| b == n))
+        .collect();
+    bindings.extend(extra);
     replace(&mut body, &bindings);
+    fold_literal_hash_reads(&mut body);
     body
+}
+
+/// `{only: [:a]}[:if]` → the value, or nil for an absent key — what the
+/// read means once `options` is bound to the call's literal Hash.
+fn fold_literal_hash_reads(expr: &mut crate::expr::Expr) {
+    use crate::expr::{ExprNode, Literal};
+    expr.node.for_each_child_mut(&mut |c| fold_literal_hash_reads(c));
+    let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*expr.node else {
+        return;
+    };
+    let (ExprNode::Hash { entries, .. }, [key]) = (&*r.node, args.as_slice()) else { return };
+    let ExprNode::Lit { value: Literal::Sym { value: k } } = &*key.node else { return };
+    if method.as_str() != "[]" {
+        return;
+    }
+    // A computed or `**` key might be this one: leave the read, and the
+    // filter it feeds is refused instead of losing its guard.
+    if entries.iter().any(|(ek, _)| !matches!(&*ek.node, ExprNode::Lit { .. })) {
+        return;
+    }
+    // A repeated key reads its last value, as in Ruby.
+    let found = entries.iter().rev().find_map(|(ek, ev)| match &*ek.node {
+        ExprNode::Lit { value: Literal::Sym { value } } if value == k => Some(ev.clone()),
+        _ => None,
+    });
+    *expr = found.unwrap_or_else(|| {
+        crate::expr::Expr::new(expr.span, ExprNode::Lit { value: Literal::Nil })
+    });
 }
 
 /// Every filter the macro body declares, or None if any statement in it
@@ -2989,10 +3436,18 @@ fn filter_from_send(
         ExprNode::Lit { value: Literal::Sym { value } } => Some(value.clone()),
         _ => None,
     };
-    let sym_list = |e: &crate::expr::Expr| -> Vec<crate::ident::Symbol> {
+    // `only:` / `except:` actions, a Symbol or String each as Rails takes
+    // them. None when any is something else: dropping it would narrow
+    // the list, or empty it into an unscoped filter.
+    let action_of = |e: &crate::expr::Expr| match &*e.node {
+        ExprNode::Lit { value: Literal::Sym { value } } => Some(value.clone()),
+        ExprNode::Lit { value: Literal::Str { value } } => Some(crate::ident::Symbol::from(value.as_str())),
+        _ => None,
+    };
+    let sym_list = |e: &crate::expr::Expr| -> Option<Vec<crate::ident::Symbol>> {
         match &*e.node {
-            ExprNode::Array { elements, .. } => elements.iter().filter_map(&sym_of).collect(),
-            _ => sym_of(e).into_iter().collect(),
+            ExprNode::Array { elements, .. } => elements.iter().map(&action_of).collect(),
+            _ => action_of(e).map(|a| vec![a]),
         }
     };
 
@@ -3018,13 +3473,17 @@ fn filter_from_send(
         };
         for (key, value) in entries {
             match sym_of(key).as_ref().map(|k| k.as_str().to_string()).as_deref() {
-                Some("only") => only = sym_list(value),
-                Some("except") => except = sym_list(value),
+                Some("only") => only = sym_list(value)?,
+                Some("except") => except = sym_list(value)?,
                 // if:/unless: guards on a macro-expanded filter would
                 // need the predicate to resolve in the INCLUDER; not
                 // modeled, and silently dropping a guard changes when a
                 // filter fires.
-                Some("if") | Some("unless") => return None,
+                Some("if") | Some("unless")
+                    if !matches!(&*value.node, ExprNode::Lit { value: Literal::Nil }) =>
+                {
+                    return None
+                }
                 _ => {}
             }
         }
@@ -3062,10 +3521,7 @@ fn filter_from_send(
 /// whole before any label can be mapped.
 fn fold_concern_enums_into_models(
     app: &mut App,
-    concern_enums: &[(
-        crate::ident::ClassId,
-        Vec<(crate::ident::Symbol, Vec<(String, crate::expr::Literal)>)>,
-    )],
+    concern_enums: &[(crate::ident::ClassId, Vec<ConcernEnumDecl>)],
 ) {
     if concern_enums.is_empty() {
         return;
@@ -3076,8 +3532,17 @@ fn fold_concern_enums_into_models(
             if !includes.contains(module) {
                 continue;
             }
-            for (column, mapping) in decls {
-                model.enums.entry(column.clone()).or_insert_with(|| mapping.clone());
+            for decl in decls {
+                model
+                    .enums
+                    .entry(decl.column.clone())
+                    .or_insert_with(|| decl.mapping.clone());
+                if let Some(d) = &decl.default {
+                    model
+                        .enum_defaults
+                        .entry(decl.column.clone())
+                        .or_insert_with(|| d.clone());
+                }
             }
         }
     }
@@ -3174,25 +3639,77 @@ fn map_enum_labels(app: &mut App) {
     crate::lower::for_each_hook_body(app, &mut |expr| map_const_receiver_sites(expr, &tables));
 }
 
-/// Resolve a model's `include <Const>` against Ruby's lexical scope:
-/// inside `class User`, `include Avatar` names `User::Avatar` when such
-/// a module exists, and only falls back to a top-level `Avatar`.
+/// Resolve a controller's relative superclass against Ruby's lexical
+/// scope. The superclass expression is evaluated in the nesting around
+/// the `class` keyword, so `module Ns; class XController <
+/// BaseController` tries `Ns::BaseController` before a top-level
+/// `BaseController`, while a top-level `class Ns::XController <
+/// BaseController` has only the top level in scope: the `Ns::` prefix
+/// names the class without opening `Ns`. Hence `nesting` (recorded at
+/// ingest, innermost first), never the segments of the class's name.
+///
+/// Rewrites only when a candidate names an ingested controller, so
+/// `ApplicationController` inside `module Ns` stays top-level. A
+/// superclass written qualified (`Admin::BaseController`) or rooted
+/// (`::BaseController`, recorded with an empty nesting) is left alone.
+fn qualify_relative_controller_superclasses(
+    app: &mut App,
+    nesting: &std::collections::HashMap<crate::ident::ClassId, Vec<String>>,
+) {
+    let known: std::collections::HashSet<crate::ident::ClassId> =
+        app.controllers.iter().map(|c| c.name.clone()).collect();
+    for controller in &mut app.controllers {
+        let Some(parent) = controller.parent.clone() else { continue };
+        let raw = parent.0.as_str();
+        if raw.contains("::") {
+            continue;
+        }
+        for scope in nesting.get(&controller.name).into_iter().flatten() {
+            let id = crate::ident::ClassId(crate::ident::Symbol::from(format!("{scope}::{raw}")));
+            // `module Admin; class NotesController < NotesController`
+            // names the top-level one: a class is never its own
+            // superclass.
+            if id == controller.name {
+                continue;
+            }
+            if known.contains(&id) {
+                controller.parent = Some(id);
+                break;
+            }
+        }
+    }
+}
+
+/// Resolve an `include <Const>` against Ruby's lexical scope.
+///
+/// Inside `class User`, `include Avatar` names `User::Avatar` when such
+/// a module exists, and only falls back to a top-level `Avatar`. The
+/// same walk covers a namespaced owner: in `module Auth; class
+/// SessionsController`, `include Concerns::RequireClient` names
+/// `Auth::SessionsController::Concerns::RequireClient`, then
+/// `Auth::Concerns::RequireClient`, then `Concerns::RequireClient`,
+/// innermost first, the way `Module.nesting` is consulted.
 ///
 /// Campfire keeps every model concern that way —
 /// `app/models/user/{avatar,bannable,bot,mentionable,role,transferable}.rb`
 /// each declare `module User::Avatar` and friends — so the unqualified
 /// ClassId matched no ingested module and the whole mixed-in surface
 /// (`ban`, `create_bot!`, `active_bots`, `from_avatar_token`) dispatched
-/// into nothing.
+/// into nothing. Shopify's customer-authentication controllers keep
+/// theirs one namespace up (`Auth::Concerns::RequireClient`, included
+/// as `Concerns::RequireClient`), so every ivar those concerns write
+/// (`@client_id`, `@redirect_uri`) read as `has no known type` in the
+/// includer.
 ///
 /// Rewrites the IR node rather than resolving at each consumer:
-/// `model_includes` (analyze), `splice_concerns_into_models` above, and
-/// every emitter that re-emits the line then read one qualified path.
-/// Narrow trigger — only when `<Model>::<Const>` actually names an
-/// ingested module, so apps whose concerns live at the top level
+/// `model_includes` / `controller_includes` (analyze),
+/// `splice_concerns_into_models` above, and every emitter that
+/// re-emits the line then read one qualified path. Narrow trigger —
+/// only when some `<scope>::<Const>` actually names an ingested module,
+/// so apps whose concerns live at the top level
 /// (`app/models/concerns/…`) are untouched.
-fn qualify_relative_model_includes(app: &mut App) {
-    use crate::dialect::ModelBodyItem;
+fn qualify_relative_includes(app: &mut App) {
+    use crate::dialect::{ControllerBodyItem, ModelBodyItem};
     use crate::expr::ExprNode;
 
     let known: std::collections::HashSet<crate::ident::ClassId> = app
@@ -3202,27 +3719,58 @@ fn qualify_relative_model_includes(app: &mut App) {
         .chain(app.concern_model_items.keys().cloned())
         .collect();
 
+    /// `path` as written inside `owner`, when a nesting scope above it
+    /// (innermost first) defines it. `None` leaves the node alone.
+    fn resolve(
+        owner: &str,
+        path: &[crate::ident::Symbol],
+        known: &std::collections::HashSet<crate::ident::ClassId>,
+    ) -> Option<Vec<crate::ident::Symbol>> {
+        let scope: Vec<&str> = owner.split("::").collect();
+        let tail = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+        for depth in (1..=scope.len()).rev() {
+            let candidate = format!("{}::{tail}", scope[..depth].join("::"));
+            if known.contains(&crate::ident::ClassId(crate::ident::Symbol::from(
+                candidate.as_str(),
+            ))) {
+                return Some(candidate.split("::").map(crate::ident::Symbol::from).collect());
+            }
+        }
+        None
+    }
+
+    fn rewrite_include(
+        expr: &mut crate::expr::Expr,
+        owner: &str,
+        known: &std::collections::HashSet<crate::ident::ClassId>,
+    ) {
+        let ExprNode::Send { recv: None, method, args, .. } = &mut *expr.node else {
+            return;
+        };
+        if method.as_str() != "include" {
+            return;
+        }
+        for arg in args.iter_mut() {
+            let ExprNode::Const { path } = &mut *arg.node else { continue };
+            if let Some(qualified) = resolve(owner, path, known) {
+                *path = qualified;
+            }
+        }
+    }
+
     for model in &mut app.models {
         let model_name = model.name.0.as_str().to_string();
         for item in &mut model.body {
             let ModelBodyItem::Unknown { expr, .. } = item else { continue };
-            let ExprNode::Send { recv: None, method, args, .. } = &mut *expr.node else {
-                continue;
-            };
-            if method.as_str() != "include" {
-                continue;
-            }
-            for arg in args.iter_mut() {
-                let ExprNode::Const { path } = &mut *arg.node else { continue };
-                let [segment] = &path[..] else { continue };
-                let qualified = crate::ident::ClassId(crate::ident::Symbol::from(format!(
-                    "{model_name}::{}",
-                    segment.as_str()
-                )));
-                if known.contains(&qualified) {
-                    *path = vec![crate::ident::Symbol::from(model_name.as_str()), segment.clone()];
-                }
-            }
+            rewrite_include(expr, &model_name, &known);
+        }
+    }
+
+    for controller in &mut app.controllers {
+        let name = controller.name.0.as_str().to_string();
+        for item in &mut controller.body {
+            let ControllerBodyItem::Unknown { expr, .. } = item else { continue };
+            rewrite_include(expr, &name, &known);
         }
     }
 
@@ -3236,15 +3784,11 @@ fn qualify_relative_model_includes(app: &mut App) {
     for lc in &mut app.library_classes {
         let owner = lc.name.0.as_str().to_string();
         for inc in &mut lc.includes {
-            if inc.0.as_str().contains("::") {
-                continue;
-            }
-            let qualified = crate::ident::ClassId(crate::ident::Symbol::from(format!(
-                "{owner}::{}",
-                inc.0.as_str()
-            )));
-            if known.contains(&qualified) {
-                *inc = qualified;
+            let path: Vec<crate::ident::Symbol> =
+                inc.0.as_str().split("::").map(crate::ident::Symbol::from).collect();
+            if let Some(qualified) = resolve(&owner, &path, &known) {
+                let joined = qualified.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+                *inc = crate::ident::ClassId(crate::ident::Symbol::from(joined));
             }
         }
     }
@@ -3302,6 +3846,9 @@ fn resolve_polymorphic_targets(app: &mut App) {
             else {
                 continue;
             };
+            if !polymorphic_targets.is_empty() {
+                continue;
+            }
             if let Some(targets) = implementors.get(name) {
                 *polymorphic_targets = targets.clone();
             } else if let Some((_, found)) =
@@ -3726,7 +4273,7 @@ fn walk_erb<V: Vfs + ?Sized>(
             // so the hole is visible to `--continue` and the LSP/MCP.
             // Moving one of these into `ViewEngine::from_extension` (above)
             // is the whole walker-side change to support a new engine.
-            Some("slim" | "ruby" | "rabl") => {
+            Some("ruby" | "rabl") => {
                 record_skipped_view(&path, ext.expect("matched a Some arm"));
             }
             _ => {}
@@ -4458,15 +5005,37 @@ fn extract_autoload_path_roots(source: &[u8]) -> Vec<String> {
     roots
 }
 
+/// `get "up" => "rails/health#show"` — every `rails new` app's health
+/// check (what a Kamal proxy probes) — names Rails' OWN
+/// `Rails::HealthController`, which no app tree holds: the route
+/// dispatched to nothing and `/up` answered 404. Written here as the
+/// controller Rails ships (8.1: `render html:` of the green page; the
+/// `rescue_from` → red 500 half needs a boot failure, which a one-shot
+/// process reports by not answering at all). Synthesized only when a
+/// route targets it and the app doesn't define its own. A namespaced
+/// class, so only the targets that emit one receive it
+/// (`project::target_files` drops it, with a warning, for the rest).
+fn synthesize_rails_health_controller(app: &mut crate::App) {
+    use super::routes::RAILS_HEALTH_CONTROLLER;
+    let routed = crate::lower::routes::flatten_routes(app)
+        .iter()
+        .any(|r| r.controller.0.as_str() == RAILS_HEALTH_CONTROLLER);
+    if !routed || app.controllers.iter().any(|c| c.name.0.as_str() == RAILS_HEALTH_CONTROLLER) {
+        return;
+    }
+    let src = "class Rails::HealthController < ActionController::Base\n  def show\n    render html: \"<!DOCTYPE html><html><body style=\\\"background-color: green\\\"></body></html>\".html_safe\n  end\nend\n";
+    if let Ok(Some(controller)) = super::controller::ingest_controller(src.as_bytes(), "<rails/health>") {
+        app.controllers.push(controller);
+    }
+}
+
 /// The controller the `to: redirect(...)` routes dispatch to: one
 /// action per redirect, each answering the location Rails' routing
-/// redirect would.
-///
-/// One deliberate divergence, and it is the reason the routing form
-/// exists at all: Rails' `redirect("/x")` carries the request's query
-/// string over to the target. A `redirect_to "/x"` does not, and
-/// nothing in the synthesized action can see the query string to pass
-/// on.
+/// redirect would. The options form (`redirect(path: "/x")`) also
+/// carries the request's query over, read off the action's `request`;
+/// the positional `redirect("/x")` does not, in Rails either. How the
+/// query is joined to the path is the one deliberate divergence; see
+/// the comment in the body.
 fn synthesize_redirect_controller(
     redirects: &[crate::dialect::RedirectRoute],
 ) -> crate::dialect::Controller {
@@ -4479,11 +5048,63 @@ fn synthesize_redirect_controller(
         .map(|redirect| {
             // Built from Ruby source so the action body is ingested the
             // way a hand-written `redirect_to` would be.
-            let src = format!(
-                "def __redirect\n  redirect_to({}, status: :{})\nend\n",
-                redirect_location_source(&redirect.location),
-                redirect_status_symbol(redirect.status),
-            );
+            let location = if let Some(expression) = redirect.location.strip_prefix('\u{0}') {
+                expression.to_string()
+            } else if redirect.location_is_expression {
+                redirect.location.clone()
+            } else if redirect.keep_query {
+                // The options form keeps the request query, read off the
+                // action's own `query_string` (set by every target's
+                // dispatcher from the raw request query). An empty query
+                // leaves the location unchanged; a path that already has a
+                // `?` is joined with `&`; the query goes ahead of a
+                // fragment, so `/login#step` plus `x=1` is `/login?x=1#step`.
+                //
+                // A deliberate divergence from Rails, which appends
+                // `"?" + query` and nothing else (MEASURED, 8.1.4 and
+                // main): `/a?b=1` plus `x=1` is `/a?b=1?x=1`, where `b` reads
+                // as "1?x=1", and `/a#top` plus `x=1` is `/a#top?x=1`, where
+                // the query sits inside the fragment and never reaches the
+                // server. Neither is a URL the route's author could have
+                // meant. Rails also re-encodes the query from the parsed
+                // params (keys sorted, a space as `+`); this passes it
+                // through as received.
+                //
+                // Only `path:` keeps the query, and its location is a
+                // string literal, so the separator and the fragment are
+                // decided here. A `%{name}` cannot bring a `?` or `#` of
+                // its own: `redirect_location_source` path-escapes it.
+                // Uses the controller attribute rather than
+                // `request.query_string` so C# and Elixir (which do not
+                // yet wire a full Request receiver) still preserve the
+                // query.
+                let (path, fragment) = redirect.location.split_once('#').unwrap_or((&redirect.location, ""));
+                let separator = if path.contains('?') { '&' } else { '?' };
+                let fragment = if fragment.is_empty() {
+                    String::new()
+                } else {
+                    format!(" + {}", redirect_location_source(&format!("#{fragment}")))
+                };
+                format!(
+                    "q = query_string\n    q == \"\" ? {} : {} + q{fragment}",
+                    redirect_location_source(&redirect.location),
+                    redirect_location_source(&format!("{path}{separator}")),
+                )
+            } else {
+                redirect_location_source(&redirect.location)
+            };
+            let src = if location.contains('\n') || location.contains(';') {
+                format!(
+                    "def __redirect\n  location = begin\n    {location}\n  end\n  redirect_to(location, status: :{})\nend\n",
+                    redirect_status_symbol(redirect.status),
+                )
+            } else {
+                format!(
+                    "def __redirect\n  redirect_to({}, status: :{})\nend\n",
+                    location,
+                    redirect_status_symbol(redirect.status),
+                )
+            };
             let body = crate::runtime_src::parse_methods(&src)
                 .ok()
                 .and_then(|m| m.into_iter().next())
@@ -4526,6 +5147,7 @@ fn synthesize_redirect_controller(
         // otherwise start challenging a redirect Rails answers
         // unconditionally.
         parent: Some(crate::ident::ClassId(Symbol::from("ActionController::Base"))),
+        parent_span: Default::default(),
         body,
         layout: crate::dialect::LayoutDecl::default(),
         sibling_classes: Vec::new(),
@@ -4534,8 +5156,11 @@ fn synthesize_redirect_controller(
 
 /// A routing redirect's target as a Ruby string literal. Rails'
 /// `redirect("/~%{username}")` fills each `%{name}` from the matched
-/// path parameters, so the placeholder becomes `#{params[:name]}`.
-/// (Rails also URI-escapes the value; the emitted action does not.)
+/// path parameters, path-escaped as Rails does
+/// (`Journey::Router::Utils.escape_path`), so the placeholder becomes
+/// `#{ActionDispatch::Router.escape_path(params[:name].to_s)}`. The
+/// router decodes a capture (`Router.decode_capture`), so a `#` or `?`
+/// in it is escaped back and stays in the path.
 fn redirect_location_source(location: &str) -> String {
     let mut out = String::from("\"");
     let mut rest = location;
@@ -4544,7 +5169,7 @@ fn redirect_location_source(location: &str) -> String {
             if let Some(close) = after.find('}') {
                 let name = &after[..close];
                 if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                    out.push_str(&format!("#{{params[:{name}]}}"));
+                    out.push_str(&format!("#{{ActionDispatch::Router.escape_path(params[:{name}].to_s)}}"));
                     rest = &after[close + 1..];
                     continue;
                 }
@@ -5374,6 +5999,203 @@ fn quoted_after_key_label(text: &str) -> Option<String> {
     Some(inner[..end].to_string())
 }
 
+/// Result of scanning an initializer for `video_preview_arguments`.
+enum VideoPreviewArgsExtract {
+    Absent,
+    Value(String),
+    /// Assignment present but not a pure string-literal concatenation.
+    Unsupported,
+}
+
+/// `config.active_storage.video_preview_arguments = "…" \ "…"` —
+/// concatenated quoted string literals after the `=` (double or single),
+/// the way campfire tip writes the `-vf … -frames:v 1 -f image2` argv.
+/// Returns the joined runtime string. Computed RHS forms (`+ ENV…`) are
+/// `Unsupported` rather than a wrong joined literal.
+fn extract_video_preview_arguments(source: &[u8]) -> VideoPreviewArgsExtract {
+    let source = String::from_utf8_lossy(source);
+    let mut lines = source.lines().peekable();
+    while let Some(line) = lines.next() {
+        let t = line.trim_start();
+        if t.starts_with('#') {
+            continue;
+        }
+        let Some(idx) = t.find("active_storage.video_preview_arguments") else {
+            continue;
+        };
+        let rest = t[idx + "active_storage.video_preview_arguments".len()..].trim_start();
+        let Some(rest) = rest.strip_prefix('=') else {
+            continue;
+        };
+        let mut text = rest.to_string();
+        // Line continuations (`\`), RHS starting on the next line, and
+        // further quoted pieces until a blank / next config assignment.
+        while text.trim_end().ends_with('\\')
+            || ruby_string_literals_unclosed(&text)
+            || (!text.contains('"') && !text.contains('\'') && lines.peek().is_some())
+        {
+            let Some(next) = lines.next() else { break };
+            let n = next.trim();
+            if n.is_empty() || n.starts_with("config.") {
+                break;
+            }
+            text.push(' ');
+            text.push_str(n);
+        }
+        if !rhs_is_only_string_literals_and_continuations(&text) {
+            return VideoPreviewArgsExtract::Unsupported;
+        }
+        let out = join_ruby_string_literals(&text);
+        if !out.is_empty() {
+            return VideoPreviewArgsExtract::Value(out);
+        }
+        // Recognized the assignment but found no quoted pieces.
+        return VideoPreviewArgsExtract::Unsupported;
+    }
+    VideoPreviewArgsExtract::Absent
+}
+
+/// True when `text` is only `'…'` / `"…"` literals, whitespace, and `\`.
+fn rhs_is_only_string_literals_and_continuations(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let mut saw_literal = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() || b == b'\\' {
+            i += 1;
+            continue;
+        }
+        if b != b'"' && b != b'\'' {
+            return false;
+        }
+        saw_literal = true;
+        let q = b;
+        i += 1;
+        while i < bytes.len() {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == q {
+                i += 1;
+                break;
+            }
+            i += 1;
+        }
+    }
+    saw_literal
+}
+
+/// True when `text` ends inside an unclosed `'…'` or `"…"` literal.
+fn ruby_string_literals_unclosed(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let mut open: Option<u8> = None;
+    while i < bytes.len() {
+        if let Some(q) = open {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == q {
+                open = None;
+            }
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'"' || bytes[i] == b'\'' {
+            open = Some(bytes[i]);
+        }
+        i += 1;
+    }
+    open.is_some()
+}
+
+/// Join adjacent `'…'` / `"…"` literals in an RHS.
+/// Double-quoted: `\\X` → `X`. Single-quoted: only `\\` → `\` and
+/// `\'` → `'`; other backslashes (e.g. `\,` in ffmpeg filters) stay.
+fn join_ruby_string_literals(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let q = bytes[i];
+        if q != b'"' && q != b'\'' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        while i < bytes.len() {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                let next = bytes[i + 1];
+                if q == b'\'' {
+                    if next == b'\\' || next == b'\'' {
+                        out.push(next as char);
+                        i += 2;
+                        continue;
+                    }
+                    out.push('\\');
+                    out.push(next as char);
+                    i += 2;
+                    continue;
+                }
+                out.push(next as char);
+                i += 2;
+                continue;
+            }
+            if bytes[i] == q {
+                i += 1;
+                break;
+            }
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Replacement Const from
+/// `config.active_storage.previewers = ….map` that swaps
+/// `ActiveStorage::Previewer::VideoPreviewer` for another class
+/// (`previewer == …VideoPreviewer ? Replacement : previewer`).
+/// Returns the replacement's written name (e.g. `TimeLimitedVideoPreviewer`).
+/// Full-line comments are stripped so a commented-out swap cannot match;
+/// the assignment + `.map` form is required (not a bare class mention).
+fn extract_video_previewer_replacement(source: &[u8]) -> Option<String> {
+    let source = String::from_utf8_lossy(source);
+    let active: String = source
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let Some(assign_at) = active.find("active_storage.previewers") else {
+        return None;
+    };
+    let after_name = active[assign_at + "active_storage.previewers".len()..].trim_start();
+    let Some(after_eq) = after_name.strip_prefix('=') else {
+        return None;
+    };
+    if !after_eq.contains(".map") {
+        return None;
+    }
+    let marker = "ActiveStorage::Previewer::VideoPreviewer";
+    let Some(idx) = after_eq.find(marker) else {
+        return None;
+    };
+    let after = after_eq[idx + marker.len()..].trim_start();
+    let after = after.strip_prefix('?')?.trim_start();
+    // `? TimeLimitedVideoPreviewer : previewer` or multiline.
+    let name: String = after
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == ':' || *c == '_')
+        .collect();
+    if name.is_empty() || name == "previewer" {
+        return None;
+    }
+    Some(name)
+}
+
 /// The MIME types a `config.active_storage.variable_content_types -=
 /// %w[…]` line subtracts, in source order. Line-scanned like the
 /// other config reads; the `%w[` literal may start on the next line
@@ -5410,6 +6232,8 @@ fn extract_variable_content_type_exclusions(source: &[u8]) -> Vec<String> {
 /// "<name>", true))` from an initializer. Line-shaped like the
 /// content-type trim above: the two calls are one statement each, and
 /// only the `true` arms are policy (`false` is libvips' default).
+/// Parens are optional (`Vips.block_untrusted true`); a `#` comment
+/// does not count. Named blocks accept double or single quotes.
 fn extract_vips_loader_policy(source: &[u8]) -> (bool, Vec<String>) {
     let source = String::from_utf8_lossy(source);
     let mut untrusted = false;
@@ -5439,6 +6263,85 @@ fn extract_vips_loader_policy(source: &[u8]) -> (bool, Vec<String>) {
         }
     }
     (untrusted, blocked)
+}
+
+/// `<param>.default_per_page = N` inside a `Kaminari.configure do
+/// |<param>| … end` block (top level or under `to_prepare`), the last
+/// one winning as it does when Ruby runs the block. `Kaminari.configure`
+/// is an input spelling of the default page size, not the feature name.
+/// Read off the parse rather than the lines, so an assignment in another
+/// config block of the same file (`Rails.application.configure do
+/// |config|`) is not mistaken for this default.
+///
+/// A value that is not a positive Integer literal (a constant, an ENV
+/// read) is recognized but not evaluated: it is a survey gap, and this
+/// file contributes no page size rather than a guessed one.
+fn extract_default_per_page(source: &[u8], file: &str) -> Option<u64> {
+    let src = String::from_utf8_lossy(source);
+    // Cheap skip before parsing: this runs over every initializer, and
+    // most never name Kaminari.
+    if !src.contains("Kaminari") {
+        return None;
+    }
+    let result = super::prism::parse(source, file);
+    let root = result.node();
+    let program = root.as_program_node()?;
+    let mut found = None;
+    for stmt in initializer_statements(&program) {
+        let Some(call) = stmt.as_call_node() else { continue };
+        if super::util::constant_id_str(&call.name()) != "configure" {
+            continue;
+        }
+        let Some(recv) = call.receiver() else { continue };
+        if !matches!(constant_text(&recv, &src).as_deref(), Some("Kaminari" | "::Kaminari")) {
+            continue;
+        }
+        let Some(block) = call.block().and_then(|b| b.as_block_node()) else { continue };
+        let Some(param) = block
+            .parameters()
+            .and_then(|p| p.as_block_parameters_node())
+            .and_then(|p| p.parameters())
+            .and_then(|p| p.requireds().iter().next())
+            .and_then(|p| p.as_required_parameter_node())
+        else {
+            continue;
+        };
+        let param = super::util::constant_id_str(&param.name());
+        let Some(body) = block.body().and_then(|b| b.as_statements_node()) else { continue };
+        for inner in body.body().iter() {
+            let Some(assign) = inner.as_call_node() else { continue };
+            if super::util::constant_id_str(&assign.name()) != "default_per_page=" {
+                continue;
+            }
+            let on_param = assign
+                .receiver()
+                .and_then(|r| r.as_local_variable_read_node())
+                .is_some_and(|r| super::util::constant_id_str(&r.name()) == param);
+            if !on_param {
+                continue;
+            }
+            let Some(args) = assign.arguments() else { continue };
+            let args: Vec<_> = args.arguments().iter().collect();
+            let [value] = args.as_slice() else { continue };
+            let literal = value
+                .as_integer_node()
+                .and_then(|i| super::util::integer_i64(&i.value()))
+                .and_then(|n| u64::try_from(n).ok())
+                .filter(|&n| n > 0);
+            if literal.is_none() {
+                let loc = value.location();
+                survey::record(&IngestError::Unsupported {
+                    file: file.to_string(),
+                    message: format!(
+                        "default_per_page is not a positive Integer literal (`{}`); the emitted app does not apply it",
+                        &src[loc.start_offset()..loc.end_offset()]
+                    ),
+                });
+            }
+            found = literal;
+        }
+    }
+    found
 }
 
 fn extract_config_time_zone(source: &[u8]) -> Option<String> {
@@ -5512,6 +6415,20 @@ fn ingest_test_helper_modules<V: Vfs + ?Sized>(
             }
         }
     }
+    // The Rails 8 authentication generator's spelling: the helper file
+    // includes ITSELF, at its foot —
+    //   ActiveSupport.on_load(:action_dispatch_integration_test) do
+    //     include SessionTestHelper
+    //   end
+    // — and `test/test_helper.rb` only `require_relative`s it.
+    for entry in read_rb_files(vfs, &helpers_dir)? {
+        let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
+        for name in on_load_test_includes(&source, &entry.display().to_string()) {
+            if !wanted.contains(&name) {
+                wanted.push(name);
+            }
+        }
+    }
     if wanted.is_empty() {
         return Ok(Vec::new());
     }
@@ -5539,6 +6456,52 @@ fn ingest_test_helper_modules<V: Vfs + ?Sized>(
             .unwrap_or(usize::MAX)
     });
     Ok(out)
+}
+
+/// Modules a file mixes into the test cases through a top-level
+/// `ActiveSupport.on_load(:action_dispatch_integration_test |
+/// :active_support_test_case) do include M end`. Every test module is a
+/// spliced test case here, so both hooks reach the same place.
+fn on_load_test_includes(source: &[u8], file: &str) -> Vec<Symbol> {
+    let result = super::prism::parse(source, file);
+    let root = result.node();
+    let stmts = root
+        .as_program_node()
+        .map(|p| p.statements().body().iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let src = String::from_utf8_lossy(source).into_owned();
+    let text = |loc: ruby_prism::Location<'_>| src[loc.start_offset()..loc.end_offset()].to_string();
+    let mut out = Vec::new();
+    for stmt in stmts {
+        let Some(call) = stmt.as_call_node() else { continue };
+        if super::util::constant_id_str(&call.name()) != "on_load" {
+            continue;
+        }
+        if call.receiver().map(|r| text(r.location())).as_deref() != Some("ActiveSupport") {
+            continue;
+        }
+        let hook = call
+            .arguments()
+            .and_then(|a| a.arguments().iter().next())
+            .and_then(|a| a.as_symbol_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned()));
+        if !matches!(hook.as_deref(), Some("action_dispatch_integration_test" | "active_support_test_case")) {
+            continue;
+        }
+        let Some(block) = call.block().and_then(|b| b.as_block_node()) else { continue };
+        let Some(body) = block.body().and_then(|b| b.as_statements_node()) else { continue };
+        for inner in body.body().iter() {
+            let Some(inc) = inner.as_call_node() else { continue };
+            if inc.receiver().is_some() || super::util::constant_id_str(&inc.name()) != "include" {
+                continue;
+            }
+            for arg in inc.arguments().into_iter().flat_map(|a| a.arguments().iter()) {
+                if arg.as_constant_read_node().is_some() || arg.as_constant_path_node().is_some() {
+                    out.push(Symbol::from(text(arg.location()).trim_start_matches("::")));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Run the app-wide `ActiveSupport::TestCase` setup ahead of a test
@@ -5735,6 +6698,93 @@ fn unqualify_helper_constants(
     }
     e.node
         .for_each_child_mut(&mut |c| unqualify_helper_constants(c, qualified));
+}
+
+/// The block-taking methods an app adds to the routes DSL by prepending
+/// (or including) a module into `ActionDispatch::Routing::Mapper`:
+///
+/// ```ruby
+/// ActionDispatch::Routing::Mapper.prepend(Podding::RoutingAnnotations)
+/// # ... then in routes.rb:
+/// routing_method :main_pod do ... end
+/// ```
+///
+/// Read off the initializers and `lib/` the way Rails loads them: a
+/// top-level `Mapper.prepend(Const)`, with `Const` looked up among the
+/// ingested modules. The methods that take a block are the DSL scopes;
+/// the module's other methods are not.
+fn mapper_extension_block_methods<V: Vfs + ?Sized>(
+    app: &App,
+    vfs: &V,
+    dir: &Path,
+) -> std::collections::HashSet<String> {
+    const TARGET: &str = "Routing::Mapper";
+    let mut modules: Vec<String> = Vec::new();
+    for sub in ["config/initializers", "lib"] {
+        let d = dir.join(sub);
+        if !vfs.is_dir(&d) {
+            continue;
+        }
+        for entry in read_rb_files(vfs, &d).unwrap_or_default() {
+            let Ok(bytes) = vfs.read(&entry) else { continue };
+            // Cheap reject before parsing every initializer and lib file.
+            if !bytes.windows(TARGET.len()).any(|w| w == TARGET.as_bytes()) {
+                continue;
+            }
+            let file = entry.display().to_string();
+            let result = super::prism::parse(&bytes, &file);
+            let src = String::from_utf8_lossy(&bytes).into_owned();
+            let root = result.node();
+            let Some(program) = root.as_program_node() else { continue };
+            for stmt in initializer_statements(&program) {
+                let Some(call) = stmt.as_call_node() else { continue };
+                if !matches!(super::util::constant_id_str(&call.name()), "prepend" | "include") {
+                    continue;
+                }
+                let Some(recv) = call.receiver() else { continue };
+                if constant_text(&recv, &src)
+                    .map(|t| t.trim_start_matches("::") == format!("ActionDispatch::{TARGET}"))
+                    != Some(true)
+                {
+                    continue;
+                }
+                let Some(args) = call.arguments() else { continue };
+                for arg in args.arguments().iter() {
+                    if let Some(name) = constant_text(&arg, &src) {
+                        modules.push(name.trim_start_matches("::").to_string());
+                    }
+                }
+            }
+        }
+    }
+    // The DSL's own scoping macros, which the routes ingest handles
+    // natively; a same-named override in the extension wraps them and
+    // still means the native thing.
+    const NATIVE: [&str; 9] = [
+        "resources", "resource", "collection", "member", "namespace", "scope", "constraints",
+        "concern", "concerns",
+    ];
+    let mut out = std::collections::HashSet::new();
+    for name in modules {
+        // Top-level `Mapper.prepend(Const)` resolves `Const` by its
+        // written name; a suffix match would also pull in unrelated
+        // `Other::Const` modules that share only the final segment.
+        for lc in &app.library_classes {
+            let full = lc.name.0.as_str();
+            if full != name {
+                continue;
+            }
+            for m in &lc.methods {
+                if m.receiver == MethodReceiver::Instance
+                    && m.block_param.is_some()
+                    && !NATIVE.contains(&m.name.as_str())
+                {
+                    out.insert(m.name.as_str().to_string());
+                }
+            }
+        }
+    }
+    out
 }
 
 // Not left on the declaring base: an abstract base's `enum :state` reads through the subclass's own column reader, which has to know the mapping.

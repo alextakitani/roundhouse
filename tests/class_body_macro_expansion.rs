@@ -303,11 +303,16 @@ fn assert_configuration_stays_unknown(concern: &str) {
     let app = result.expect("survey retains the unsupported call");
     assert!(gaps.iter().any(|gap| gap.to_string().contains("configure_window")), "{gaps:?}");
     assert!(!app.controllers[0].body.iter().any(|item| matches!(item,
-        ControllerBodyItem::ClassMethod { .. } | ControllerBodyItem::ClassIvarInit { .. })));
-    assert!(app.controllers[0].body.iter().any(|item| matches!(item,
-        ControllerBodyItem::Unknown { expr, .. } if matches!(&*expr.node,
-            ExprNode::Send { method, args, .. }
-                if method.as_str() == "configure_window" && args.len() == 1))));
+        ControllerBodyItem::ClassMethod { .. })));
+    let stored = app.controllers[0].body.iter().any(|item| {
+        matches!(item, ControllerBodyItem::ClassIvarInit { .. })
+    });
+    if !stored {
+        assert!(app.controllers[0].body.iter().any(|item| matches!(item,
+            ControllerBodyItem::Unknown { expr, .. } if matches!(&*expr.node,
+                ExprNode::Send { method, args, .. }
+                    if method.as_str() == "configure_window" && args.len() == 1))));
+    }
 }
 
 #[test]
@@ -444,7 +449,12 @@ fn configuration_does_not_admit_class_body_reads_or_method_overrides() {
 #[test]
 fn a_module_singleton_is_not_a_concern_carrier() {
     let concern = WINDOW_SETTINGS.replace("class_methods do", "class << self");
-    assert_configuration_stays_unknown(&concern);
+    let app = configuration_app(&concern, "configure_window mode: :month")
+        .expect("class << self is a class-method carrier");
+    assert!(
+        app.controllers[0].body.iter().any(|item| matches!(item, ControllerBodyItem::ClassIvarInit { .. })),
+        "the includer call is stored"
+    );
     for declaration in ["class_methods do", "module ClassMethods"] {
         let concern = WINDOW_SETTINGS
             .replace("class_methods do", declaration)
@@ -510,18 +520,301 @@ fn configuration_refusals_preserve_the_survey_and_original_body() {
             "{gaps:?}"
         );
         assert_eq!(app.controllers[0].class_methods().count(), 0);
+        let stored = app.controllers[0].body.iter().any(|item| {
+            matches!(item, ControllerBodyItem::ClassIvarInit { .. })
+        });
+        let retained = app.controllers[0].body.iter().any(|item| {
+            matches!(item, ControllerBodyItem::Unknown { expr, .. } if matches!(&*expr.node, roundhouse::expr::ExprNode::Send { method, .. } if method.as_str() == "configure_window"))
+        });
+        assert!(stored || retained, "a refused readable store is consumed; an unreadable call stays");
+    }
+}
+
+#[test]
+fn store_writer_spellings_are_consumed_or_named() {
+    use roundhouse::ingest::survey;
+    let shapes = [
+        ("bare keywords", "configure_window mode: :open, valid_steps: %w[one], default_step: \"one\", max_ahead: 0, clamp_start: true"),
+        ("parentheses", "configure_window(mode: :open, valid_steps: %w[one])"),
+        ("lambda arg", "configure_window default_date: ->(today) { today - 1 }, mode: :closed"),
+        ("percent i", "configure_window valid_steps: %i[one two]"),
+        ("string array", "configure_window valid_steps: [\"one\", \"two\"]"),
+        ("symbol array", "configure_window only: [:show], except: [:index]"),
+        ("true false nil", "configure_window clamp_start: true, max_ahead: 0, empty: nil"),
+        ("multiline", "configure_window mode: :open,\n    valid_steps: %w[one]"),
+        ("included block", "included do\n  helper :current\nend\n  configure_window mode: :open"),
+        ("block stays", "configure_window(mode: :open) { :ready }"),
+    ];
+    for (label, call) in shapes {
+        let concern = r#"
+module WindowSettings
+  extend ActiveSupport::Concern
+  class_methods do
+    def configure_window(**opts)
+      @window_options = opts
+    end
+    def window_options
+      @window_options || {}
+    end
+  end
+  def current
+    @current
+  end
+  helper :current
+end
+"#;
+        let controller = format!(
+            "class ReportsController < BaseController\n  include WindowSettings\n  {call}\nend\n"
+        );
+        let tree = [
+            ("app/controllers/concerns/window_settings.rb", concern),
+            ("app/controllers/base_controller.rb", "class BaseController < ActionController::Base\nend\n"),
+            ("app/controllers/dashboards_controller.rb", controller.as_str()),
+        ]
+        .into_iter()
+        .map(|(path, source)| (path.into(), source.as_bytes().to_vec()))
+        .collect();
+        survey::activate();
+        let app = ingest_app_from_tree(tree).unwrap_or_else(|err| panic!("{label}: {err}"));
+        let gaps = survey::drain();
+        let stored = app.controllers.iter().any(|controller| {
+            controller.body.iter().any(|item| matches!(item, ControllerBodyItem::ClassIvarInit { .. }))
+        });
+        let unrecognized = gaps.iter().any(|gap| gap.to_string().contains("not recognized"));
         assert!(
-            !app.controllers[0]
-                .body
-                .iter()
-                .any(|item| matches!(item, ControllerBodyItem::ClassIvarInit { .. }))
+            stored || !unrecognized,
+            "{label} stayed unrecognized; gaps={gaps:?}"
         );
     }
 }
 
 #[test]
-fn finite_configuration_does_not_admit_unrelated_controller_singletons() {
-    assert!(configuration_app(WINDOW_SETTINGS, "def self.unrelated; eval('1'); end").is_err());
+fn a_namespaced_controller_include_is_the_module_the_store_searches() {
+    use roundhouse::ingest::survey;
+    let concern = "module WindowSettings\n  extend ActiveSupport::Concern\n  class_methods do\n    def configure_window(**opts)\n      @window_options = opts\n    end\n    def window_options\n      @window_options || {}\n    end\n  end\n  def current\n    @current\n  end\nend\n";
+    let controller = "module MarketData\n  class AnnualValuesController < BaseController\n    include WindowSettings\n    configure_window mode: :open\n  end\nend\n";
+    let tree = [
+        ("app/controllers/concerns/window_settings.rb", concern),
+        ("app/controllers/base_controller.rb", "class BaseController < ActionController::Base\nend\n"),
+        ("app/controllers/market_data/annual_values_controller.rb", controller),
+    ]
+    .into_iter()
+    .map(|(path, source)| (path.into(), source.as_bytes().to_vec()))
+    .collect();
+    survey::activate();
+    let app = ingest_app_from_tree(tree).expect("namespaced controller");
+    let gaps = survey::drain();
+    let controller = app.controllers.iter().find(|c| c.name.0.as_str().contains("Annual")).expect("controller");
+    let includes: Vec<_> = controller.body.iter().filter_map(|item| match item {
+        ControllerBodyItem::Unknown { expr, .. } => Some(format!("{:?}", expr.node).chars().take(180).collect::<String>()),
+        _ => None,
+    }).collect();
+    let methods: Vec<_> = app.library_classes.iter().map(|lc| {
+        format!("{} {:?}", lc.name.0.as_str(), lc.methods.iter().map(|m| m.name.as_str()).collect::<Vec<_>>())
+    }).collect();
+    let stored = controller.body.iter().any(|item| matches!(item, ControllerBodyItem::ClassIvarInit { .. }));
+    assert!(stored, "not stored\nincludes={includes:?}\nlibrary={methods:?}\ngaps={gaps:?}\nname={}", controller.name.0.as_str());
+}
+
+#[test]
+fn a_concern_with_an_instance_method_still_stores_its_writer() {
+    use roundhouse::ingest::survey;
+    let concern = r#"
+module WindowSettings
+  extend ActiveSupport::Concern
+  class_methods do
+    def configure_window(**opts)
+      @window_options = opts
+    end
+    def window_options
+      @window_options || {}
+    end
+  end
+  def current
+    @current
+  end
+  helper :current
+end
+"#;
+    let controller = r#"
+class ReportsController < BaseController
+  include WindowSettings
+  configure_window mode: :open, valid_steps: %w[one], default_step: "one"
+end
+"#;
+    let tree = [
+        ("app/controllers/concerns/window_settings.rb", concern),
+        ("app/controllers/base_controller.rb", "class BaseController < ActionController::Base\nend\n"),
+        ("app/controllers/dashboards_controller.rb", controller),
+    ]
+    .into_iter()
+    .map(|(path, source)| (path.into(), source.as_bytes().to_vec()))
+    .collect();
+    survey::activate();
+    let app = ingest_app_from_tree(tree).expect("concern with instance method");
+    let gaps = survey::drain();
+    let stored = app.controllers.iter().any(|controller| {
+        controller.name.0.as_str() == "ReportsController"
+            && controller.body.iter().any(|item| matches!(item, ControllerBodyItem::ClassIvarInit { .. }))
+    });
+    let verified = format!("{:?}", app.library_classes.iter().map(|lc| lc.name.0.as_str()).collect::<Vec<_>>());
+    assert!(
+        stored,
+        "writer was not stored; gaps={gaps:?} library={verified}"
+    );
+    assert!(
+        !gaps.iter().any(|gap| gap.to_string().contains("not recognized")),
+        "{gaps:?}"
+    );
+}
+
+#[test]
+fn a_store_only_class_method_is_not_an_unrecognized_macro() {
+    use roundhouse::ingest::survey;
+    let concern = r#"
+module WindowSettings
+  extend ActiveSupport::Concern
+  class_methods do
+    def configure_window(**opts)
+      @window_options = opts
+    end
+  end
+end
+"#;
+    let controller = r#"
+class ReportsController < ActionController::Base
+  include WindowSettings
+  configure_window(mode: :open, default_date: ->(today) { today - 1 })
+  def show
+  end
+end
+"#;
+    let tree = [
+        ("app/controllers/concerns/window_settings.rb", concern),
+        ("app/controllers/reports_controller.rb", controller),
+    ]
+    .into_iter()
+    .map(|(path, source)| (path.into(), source.as_bytes().to_vec()))
+    .collect();
+    survey::activate();
+    let app = ingest_app_from_tree(tree).expect("store-only call continues");
+    let gaps = survey::drain();
+    assert!(
+        !gaps.iter().any(|gap| gap.to_string().contains("not recognized")),
+        "{gaps:?}"
+    );
+    assert!(
+        app.controllers.iter().any(|controller| controller.body.iter().any(|item| {
+            matches!(item, ControllerBodyItem::ClassIvarInit { .. })
+        })),
+        "the stored call must become class state"
+    );
+    let paired = r#"
+module WindowSettings
+  extend ActiveSupport::Concern
+  class_methods do
+    def configure_window(**opts)
+      @window_options = opts
+    end
+    def window_options
+      @window_options || {}
+    end
+  end
+end
+"#;
+    let paired_controller = r#"
+class ReportsController < ActionController::Base
+  include WindowSettings
+  configure_window(mode: :closed, default_date: ->(today) { today - 1 }, valid_steps: %w[one])
+  def show
+  end
+end
+"#;
+    let paired_tree = [
+        ("app/controllers/concerns/window_settings.rb", paired),
+        ("app/controllers/reports_controller.rb", paired_controller),
+    ]
+    .into_iter()
+    .map(|(path, source)| (path.into(), source.as_bytes().to_vec()))
+    .collect();
+    survey::activate();
+    let paired_app = ingest_app_from_tree(paired_tree).expect("paired reader continues");
+    let paired_gaps = survey::drain();
+    assert!(
+        !paired_gaps.iter().any(|gap| gap.to_string().contains("not recognized")),
+        "{paired_gaps:?}"
+    );
+    assert!(
+        paired_app.controllers.iter().any(|controller| controller.body.iter().any(|item| {
+            matches!(item, ControllerBodyItem::ClassIvarInit { .. })
+        })),
+        "a writer with a reader still stores the call"
+    );
+    let inherited = r#"
+class ReportsController < BaseController
+  include WindowSettings
+  configure_window mode: :open, valid_steps: %w[one], default_step: "one", max_ahead: 0, clamp_start: true
+  def show
+  end
+end
+"#;
+    let inherited_tree = [
+        ("app/controllers/concerns/window_settings.rb", paired),
+        ("app/controllers/base_controller.rb", "class BaseController < ActionController::Base\nend\n"),
+        ("app/controllers/dashboards_controller.rb", inherited),
+    ]
+    .into_iter()
+    .map(|(path, source)| (path.into(), source.as_bytes().to_vec()))
+    .collect();
+    survey::activate();
+    let inherited_app = ingest_app_from_tree(inherited_tree).expect("unparenthesized inherited call");
+    let inherited_gaps = survey::drain();
+    assert!(
+        !inherited_gaps.iter().any(|gap| gap.to_string().contains("not recognized") && gap.to_string().contains("configure_window")),
+        "{inherited_gaps:?}"
+    );
+    assert!(
+        inherited_app.controllers.iter().any(|controller| controller.name.0.as_str() == "ReportsController" && controller.body.iter().any(|item| {
+            matches!(item, ControllerBodyItem::ClassIvarInit { .. })
+        })),
+        "unparenthesized call on a subclass must store: {:?}",
+        inherited_app.controllers.iter().find(|c| c.name.0.as_str() == "ReportsController").map(|c| c.body.iter().map(|item| format!("{item:?}")).collect::<Vec<_>>())
+    );
+}
+
+#[test]
+fn readable_class_methods_store_keywords_blocks_and_filter_options() {
+    let shapes = [
+        ("configure_window mode: :month, days: 3", true),
+        ("configure_window only: [:show], except: [:index], if: :ready?, unless: :draft?", true),
+        ("configure_window auth: -> { current_user }", true),
+        ("configure_window mode: helper", false),
+        ("configure_window(mode: :month, days: 3)", true),
+        ("configure_window default_date: ->(today) { today }", true),
+        ("configure_window(mode: :month) { :ready }", false),
+    ];
+    for (call, readable) in shapes {
+        let result = configuration_app(WINDOW_SETTINGS, call);
+        if readable {
+            let app = result.expect(call);
+            assert!(
+                app.controllers[0].body.iter().any(|item| matches!(item, ControllerBodyItem::ClassIvarInit { .. })),
+                "{call} was not stored"
+            );
+        } else {
+            assert!(result.is_err(), "{call} should stay ledgered whole");
+        }
+    }
+}
+
+#[test]
+fn configuration_keeps_unrelated_class_methods_out_of_its_macro_carriers() {
+    let mut app = configuration_app(WINDOW_SETTINGS, "def self.unrelated; eval('1'); end").expect("ordinary class methods are retained");
+    roundhouse::analyze::Analyzer::new(&app).analyze(&mut app);
+    let diagnostics = roundhouse::analyze::diagnose(&app);
+    assert!(diagnostics.iter().any(|d| d.message.contains("eval")), "{diagnostics:?}");
+    assert!(app.controllers.iter().flat_map(|c| &c.body).any(|item| matches!(item,
+        ControllerBodyItem::ClassMethod { method, configuration_slot: None, .. } if method.name.as_str() == "unrelated")));
 }
 
 #[test]
@@ -889,4 +1182,272 @@ fn explicit_keyword_producers_bind_values_without_nested_argument_markers() {
         assert_eq!(skips[0].2, expected);
         assert!(skips[0].3.is_empty());
     }
+}
+
+#[test]
+fn a_parameterized_rate_limit_guard_is_not_inlined_unbound() {
+    use roundhouse::dialect::ControllerBodyItem;
+    let source = br#"class ProbeController < ApplicationController
+  rate_limit to: 5, within: 1.minute, if: ->(controller) { controller.admin? }
+  def show
+  end
+end
+"#;
+    let controller = roundhouse::ingest::ingest_controller(source, "probe_controller.rb")
+        .expect("ingest")
+        .expect("controller");
+    assert!(
+        !controller.body.iter().any(|item| matches!(item, ControllerBodyItem::Filter { .. })),
+        "a parameterized guard must not become a filter whose body names an unbound parameter: {:?}",
+        controller.body.iter().map(|item| match item {
+            ControllerBodyItem::Filter { .. } => "filter",
+            ControllerBodyItem::Unknown { .. } => "unknown",
+            _ => "other",
+        }).collect::<Vec<_>>()
+    );
+}
+
+/// The `setup_mobile!` filters `call` expands to, as their `only` lists.
+/// `has_mobile_version(*actions)` peels its options with
+/// `extract_options!` and reads `options[:if]`.
+fn mobile_version_filters(call: &str) -> Vec<Vec<String>> {
+    let concern = r#"
+module MobileableConcern
+  extend ActiveSupport::Concern
+
+  module ClassMethods
+    def has_mobile_version(*actions)
+      options = actions.extract_options!
+      before_action(:setup_mobile!, if: options[:if], only: actions)
+    end
+  end
+
+  private
+    def setup_mobile!
+    end
+end
+"#;
+    let controller = format!(
+        "class ThingsController < ApplicationController\n  ACTIONS = %i[index show]\n  {call}\n  def index; end\n  def show; end\nend\n"
+    );
+    let tree = vec![
+        ("app/controllers/concerns/mobileable_concern.rb", concern.to_string()),
+        (
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\n  include MobileableConcern\nend\n".to_string(),
+        ),
+        ("app/controllers/things_controller.rb", controller),
+    ]
+    .into_iter()
+    .map(|(p, s)| (std::path::PathBuf::from(p), s.into_bytes()))
+    .collect();
+    let app = ingest_app_from_tree(tree).expect("ingest");
+    filters(&app)
+        .into_iter()
+        .filter(|(kind, target, ..)| *kind == FilterKind::Before && target == "setup_mobile!")
+        .map(|(_, _, only, _)| only)
+        .collect()
+}
+
+/// The call's symbols are the filter's `only`; an absent `if:` is nil,
+/// no guard.
+#[test]
+fn rest_actions_macro_with_extract_options_expands_to_a_scoped_filter() {
+    let scoped = vec![vec!["index".to_string(), "show".to_string()]];
+    assert_eq!(mobile_version_filters("has_mobile_version :index, :show"), scoped);
+    // A literal array splat spreads its elements.
+    assert_eq!(mobile_version_filters("has_mobile_version *%i[index show]"), scoped);
+    // A repeated key reads its last value, as Ruby does.
+    assert_eq!(mobile_version_filters("has_mobile_version :index, :show, if: :x, if: nil"), scoped);
+}
+
+/// What expansion cannot read stays unexpanded rather than becoming a
+/// broader or unguarded filter.
+#[test]
+fn rest_actions_macro_refuses_what_it_cannot_read() {
+    for call in [
+        // Unknown actions: expanding would drop them from `only`.
+        "has_mobile_version *ACTIONS",
+        "has_mobile_version *[:index, ACTIONS.first]",
+        "has_mobile_version :index, ACTIONS.first",
+        // The last `if:` is a guard this expansion does not carry.
+        "has_mobile_version :index, if: nil, if: :x",
+        // A computed key might be `:if`.
+        "has_mobile_version :index, \"if\".to_sym => :x",
+    ] {
+        assert!(mobile_version_filters(call).is_empty(), "{call} expanded");
+    }
+}
+
+/// `ingest::class_attribute` is all or nothing per carrier: anything in
+/// `included do` beyond `class_attribute` and filter DSL, or a class
+/// method using `@name` itself, leaves the macro call unexpanded.
+#[test]
+fn class_attribute_carrier_refuses_what_it_cannot_carry() {
+    /// `(method, slot)` of each carried class_attribute method.
+    fn class_attribute_methods(included: &str, writer: &str) -> Vec<(String, String)> {
+        let concern = format!(
+            "module Preloads\n  extend ActiveSupport::Concern\n  included do\n{included}\n  end\n  class_methods do\n    def preload(codes)\n      {writer}\n    end\n  end\nend\n"
+        );
+        let tree = vec![
+            ("app/controllers/concerns/preloads.rb", concern),
+            (
+                "app/controllers/application_controller.rb",
+                "class ApplicationController < ActionController::Base\nend\n".to_string(),
+            ),
+            (
+                "app/controllers/things_controller.rb",
+                "class ThingsController < ApplicationController\n  include Preloads\n  preload %w[a]\n  def show; end\nend\n"
+                    .to_string(),
+            ),
+        ]
+        .into_iter()
+        .map(|(p, s)| (std::path::PathBuf::from(p), s.into_bytes()))
+        .collect();
+        let app = ingest_app_from_tree(tree).expect("ingest");
+        let c = app
+            .controllers
+            .iter()
+            .find(|c| c.name.0.as_str() == "ThingsController")
+            .expect("ThingsController ingested");
+        c.body
+            .iter()
+            .filter_map(|item| match item {
+                ControllerBodyItem::ClassMethod {
+                    method,
+                    configuration_slot: Some(configuration_slot),
+                    configuration_role: Some(
+                        roundhouse::dialect::ClassConfigurationRole::ClassAttribute,
+                    ),
+                    ..
+                } => Some((
+                    method.name.as_str().to_string(),
+                    configuration_slot.1.as_str().to_string(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+    let carried = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+        pairs.iter().map(|(m, s)| (m.to_string(), s.to_string())).collect()
+    };
+    let attr = "    class_attribute :defs, default: []\n    before_action :run_preloads";
+    let write = "self.defs += [codes]";
+    assert_eq!(
+        class_attribute_methods(attr, write),
+        carried(&[("defs", "defs"), ("preload", "defs")]),
+        "reader and macro are carried"
+    );
+    assert!(
+        class_attribute_methods(&format!("{attr}\n    helper_method :defs"), write).is_empty(),
+        "an `included` statement that is neither class_attribute nor filter DSL"
+    );
+    roundhouse::ingest::survey::activate();
+    let _ = class_attribute_methods(&format!("{attr}\n    helper_method :defs"), write);
+    let gaps = roundhouse::ingest::survey::drain();
+    assert!(
+        gaps.iter().any(|g| matches!(
+            g,
+            roundhouse::ingest::IngestError::Unsupported { message, .. }
+                if message.contains("included do")
+        )),
+        "unsupported included body must be carrier-ledgered; got {gaps:?}"
+    );
+    assert!(
+        class_attribute_methods(attr, "@defs = [codes]").is_empty(),
+        "a source `@defs` is not the attribute's storage"
+    );
+    // Each method is keyed to the attribute it writes.
+    let two = format!("{attr}\n    class_attribute :more, default: []");
+    assert_eq!(
+        class_attribute_methods(&two, "self.more += [codes]"),
+        carried(&[("defs", "defs"), ("more", "more"), ("preload", "more")]),
+    );
+    assert!(
+        class_attribute_methods(&two, "self.defs += [codes]; self.more += [codes]").is_empty(),
+        "one method writing two attributes has no single slot"
+    );
+}
+
+/// A carrier included only through another module must stay unexpanded:
+/// stripping its class methods without copying them onto the controller
+/// would leave the class-body call as `Unknown` / `NoMethodError`.
+#[test]
+fn class_attribute_carrier_included_through_another_module_is_refused() {
+    let nested = r#"
+module Preloads
+  extend ActiveSupport::Concern
+  included do
+    class_attribute :defs, default: []
+  end
+  class_methods do
+    def preload(codes)
+      self.defs += [codes]
+    end
+  end
+end
+"#;
+    // A bodiless `include` wrapper is dropped by library-class ingest;
+    // keep an instance method so Bundle remains and records Preloads.
+    let outer = r#"
+module Bundle
+  extend ActiveSupport::Concern
+  include Preloads
+  def bundle_marker
+    1
+  end
+end
+"#;
+    let tree = [
+        ("app/controllers/concerns/preloads.rb", nested),
+        ("app/controllers/concerns/bundle.rb", outer),
+        (
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        ),
+        (
+            "app/controllers/things_controller.rb",
+            "class ThingsController < ApplicationController\n  include Bundle\n  preload %w[a]\n  def show; end\nend\n",
+        ),
+    ]
+    .into_iter()
+    .map(|(p, s)| (std::path::PathBuf::from(p), s.as_bytes().to_vec()))
+    .collect();
+    roundhouse::ingest::survey::activate();
+    let app = ingest_app_from_tree(tree).expect("ingest");
+    let gaps = roundhouse::ingest::survey::drain();
+    assert!(
+        gaps.iter().any(|g| matches!(
+            g,
+            roundhouse::ingest::IngestError::Unsupported { message, .. }
+                if message.contains("included through another module")
+        )),
+        "nested carrier must be ledgered; got {gaps:?}"
+    );
+    let c = app
+        .controllers
+        .iter()
+        .find(|c| c.name.0.as_str() == "ThingsController")
+        .expect("ThingsController");
+    assert!(
+        !c.body.iter().any(|item| matches!(
+            item,
+            ControllerBodyItem::ClassMethod {
+                configuration_role: Some(
+                    roundhouse::dialect::ClassConfigurationRole::ClassAttribute
+                ),
+                ..
+            }
+        )),
+        "nested carrier must not expand onto the controller"
+    );
+    let preloads = app
+        .library_classes
+        .iter()
+        .find(|lc| lc.name.0.as_str() == "Preloads")
+        .expect("Preloads");
+    assert!(
+        preloads.methods.iter().any(|m| m.name.as_str() == "preload"),
+        "refused carrier must keep its class methods on the module"
+    );
 }

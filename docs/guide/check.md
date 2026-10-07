@@ -62,7 +62,20 @@ their relative precedence is a deterministic approximation, not Rails'
 engine load order. Collisions between non-host roots therefore need
 manual checking.
 Roundhouse does not read an engine's own `config/routes.rb` yet.
-The host's `mount` of the engine remains a dropped route.
+The host's `mount` of the engine is omitted with an error diagnostic at
+its route declaration, while supported sibling routes and other diagnostics
+remain available. Strict transpilation refuses to write that incomplete
+project; `--allow-unsupported` explicitly overrides the error. `--survey`
+(and `check --continue`) also records the omission in its gap ledger, but
+surveying alone does not make the mount supported. Discovering an engine's
+application code does not imply support for its mounted routes.
+Built-in ActiveStorage routes remain supplied separately by the runtime.
+A top-level `mount ActionCable.server => "/cable"` (or the equivalent `at:`
+form) keeps the existing runtime endpoint. Its path is fixed at `/cable`;
+custom paths and nested/constraint-wrapped mounts remain unsupported.
+The existing CRuby/JRuby pruning policy still omits Cable from apps without
+a live broadcast surface; the mount exemption does not change that policy.
+
 
 Routed templates without an explicit controller method participate in
 the shared callback dispatcher. The separate Rails-to-Roda converter
@@ -151,8 +164,10 @@ with an `analysis:` prefix and their source location. A resolved direct
 `alba` dependency adds gem attribution; without that evidence the entry
 names only the Alba-shaped subset. These admission failures remain
 `error[unsupported]` and exit 1: a coverage entry is not executable
-serializer support. Alba declarations rejected during ingest still
-exit 2, but `--continue` prints their partial survey ledger.
+serializer support. An ingest refusal that survey mode records,
+including a rejected Alba declaration, does not abort `--continue`:
+analysis continues and the exit code comes from later findings.
+Strict mode still stops at the first refusal and exits 2.
 
 Without it (the default, also spelled `--strict`), ingest stops at the
 first unrecognized construct and exits 2. That is the right mode for an
@@ -229,10 +244,11 @@ the second is a bug report roundhouse wants.
 `gradual_untyped` and `unresolved_type` are the coverage ledger: a call
 resolved to an RBS `untyped` (the gradual escape hatch) or to nothing
 at all. There are hundreds on any real app; they are neither errors in
-your code nor, individually, interesting. `missing_preload` is the one
+your code nor, individually, interesting. `missing_preload` is a
 warning that *is* a finding about your app: a static N+1, naming the
 association read inside the loop, the query that built the relation,
-and the `.includes` that fixes it.
+and the `.includes` that fixes it. `graphql_nullable_field` is the
+other (see [graphql-ruby types](#graphql-ruby-types)).
 
 **`note[…] — likely roundhouse coverage, not an app error`** — a
 diagnostic that would have been an error, downgraded because roundhouse
@@ -242,6 +258,10 @@ from seeing a definition, and *(the `X` gem is in the Gemfile and
 roundhouse does not model it)* means the receiver comes from a gem the
 census lists as unknown. Skip these on a first read. They exist so the
 error count above means "findings", not "shadows of gaps".
+
+Unresolved source constants keep their error severity even when the
+gem census identifies a likely owner: their emitted expression is a
+refusal stub. Gem context is added without certifying runtime support.
 
 **The survey report** — printed only with `--continue`: every construct
 ingest skipped, bucketed by kind, most frequent first, with the files
@@ -258,6 +278,66 @@ and those failures are labelled as notes rather than counted as
 errors — so on an app with a long unknown list, the census is the
 first thing to read: it says how much of the error count is even
 reachable today.
+
+## graphql-ruby types
+
+A class descending from `GraphQL::Schema::Object` is read for its
+`field` declarations. Each field gets the value graphql-ruby would
+resolve: the type's own method of that name if it defines one,
+otherwise `object.<name>` (or `object.<method:>`). The class a type's
+`object` holds is inferred from the schema's `query`/`mutation` roots
+down, with nothing written down: a `field :posted_by, UserType,
+method: :user` on a type whose object is a `Link` makes `UserType`'s
+object a `User`. Then `check` reports inside those classes as it
+does inside controllers:
+
+- a field neither the type nor its object can answer is
+  `send_dispatch_failed` at the `field` line (graphql-ruby's "Failed
+  to implement" at request time);
+- a field declared `null: false` whose value can be nil is
+  `warning[graphql_nullable_field]`. A required `belongs_to` counts as
+  non-nil only when its column is NOT NULL *and* a foreign key
+  constrains it: then a stored row's association always loads;
+- a type method's body is checked like an action's.
+
+A method an included app module defines counts as the type's own. A
+type that includes a module the app does not define, or one computed
+at load time (`include Resolvers.for(:product)`), may have methods out
+of sight, so a field with none visible is skipped rather than read off
+`object`.
+
+A field's `argument`s reach its method as graphql-ruby passes them,
+as keywords typed from the declaration: `String` and `ID` a String,
+`Int` an Integer, `Float`, `Boolean`, the ISO8601 date types, a list,
+an enum as its value's name, an input object as its class (read by
+method or by key), nilable unless `required: true`. So a parameter is
+typed as the request delivers it, not as its default. A method whose
+parameters do not match its arguments (one no argument fills, an
+argument with no parameter) is counted under *take arguments* and not
+checked. A `resolver:`/`mutation:` class is followed through its
+`resolve` with its class-body arguments, or, for search_object,
+through its `scope { … }` block.
+
+What is not modeled is skipped, not guessed, and reports nothing:
+connections, `hash_key:`/`dig:`, a field block holding more than
+`argument`s, interfaces and unions, and a type nothing reachable from a
+root constructs. The methods and signatures this adds are for the
+analyzer only; the transpiled output never contains them.
+
+Because a skipped field reports nothing, a quiet run proves only what
+was followed. `check` prints the denominator beside the gem census:
+
+```text
+roundhouse-check: graphql: 10 object type(s), 38 field(s): 1 checked, 9 on types nothing reaches, 2 take arguments, 26 skipped (computed include 26)
+```
+
+*Checked* fields had their value typed on a type the roots reach. *On
+types nothing reaches* had a value, but no followed field constructs
+their type, often because the field that would is skipped. *Take
+arguments* resolve through a method whose parameters do not match
+the declared arguments. *Skipped* lists
+the rest by reason, most frequent first; on a large schema it is the
+list of what to model next.
 
 ## Exit status
 

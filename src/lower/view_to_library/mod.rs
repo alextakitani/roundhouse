@@ -35,6 +35,11 @@ pub(crate) mod turbo_drive;
 pub(crate) mod turbo_frames;
 pub(crate) mod attr_parts;
 
+/// Largest `cached: true` collection that skips the store (`length > N`
+/// takes the concat-cache path). Named for the exclusive bound: length
+/// 8 is uncached, 9 is the first cached size.
+pub const MAX_UNCACHED_COLLECTION_LENGTH: i64 = 8;
+
 use crate::App;
 use crate::dialect::{AccessorKind, LibraryClass, MethodDef, MethodReceiver, Param, View};
 use crate::effect::EffectSet;
@@ -63,20 +68,33 @@ pub fn lower_views_to_library_classes(
     app: &App,
     extras: Vec<(ClassId, crate::analyze::ClassInfo)>,
 ) -> Vec<LibraryClass> {
-    // Build LibraryClasses (with method signatures populated) but
-    // *skip* the per-view internal body-typing pass — we'll do it
-    // below with the merged registry.
-    //
-    // Only ERB (html-format) views go through this path. Jbuilder
-    // (json-format) views are lowered by `jbuilder_to_library`,
-    // which produces `<name>_json` methods on the same view module.
     let vctx = ViewLowerCtx::new(app);
-    let mut lcs: Vec<LibraryClass> = views
+    let mut lcs = preliminary_view_classes(views, &vctx);
+    type_view_library_classes(&mut lcs, app, extras);
+    lcs
+}
+
+/// Untyped view classes used only to seed model/controller registries
+/// with `Views::*` method signatures. Body typing happens later in
+/// [`type_view_library_classes`]. Callers that already built a
+/// [`ViewLowerCtx`] should use this instead of a second `ViewLowerCtx::new`
+/// plus a typed `lower` walk — signatures do not need typed bodies.
+pub fn preliminary_view_classes(views: &[View], vctx: &ViewLowerCtx<'_>) -> Vec<LibraryClass> {
+    views
         .iter()
         .filter(|v| crate::lower::view::lowers_through_view_path(v))
         .map(|v| vctx.lower_untyped(v))
-        .collect();
+        .collect()
+}
 
+/// Type untyped view LibraryClasses against a merged extras registry.
+/// Mutates `lcs` in place so a preliminary untyped pass can be reused
+/// instead of constructing the classes a second time.
+pub fn type_view_library_classes(
+    lcs: &mut Vec<LibraryClass>,
+    app: &App,
+    extras: Vec<(ClassId, crate::analyze::ClassInfo)>,
+) {
     // Merge: caller extras + framework runtime stubs + view modules
     // themselves (so cross-view dispatch like Views::Articles.article
     // resolves from one view to another).
@@ -87,7 +105,7 @@ pub fn lower_views_to_library_classes(
     }
     insert_framework_stubs(&mut classes);
     insert_route_helper_stubs(&mut classes, app);
-    for lc in &lcs {
+    for lc in lcs.iter() {
         let info = classes.entry(lc.name.clone()).or_default();
         for m in &lc.methods {
             if let Some(sig) = &m.signature {
@@ -127,16 +145,15 @@ pub fn lower_views_to_library_classes(
     // defines. Here, after every pass that pattern-matches the bare
     // shape in URL position, is the last moment the two spellings can
     // be made one.
-    crate::lower::route_helper_receiver::qualify_lcs(&mut lcs, app);
+    crate::lower::route_helper_receiver::qualify_lcs(lcs, app);
 
     let empty_ivars: std::collections::HashMap<Symbol, crate::ty::Ty> =
         std::collections::HashMap::new();
-    for lc in &mut lcs {
+    for lc in lcs.iter_mut() {
         for method in &mut lc.methods {
             crate::lower::typing::type_method_body(method, &classes, &empty_ivars);
         }
     }
-    lcs
 }
 
 /// Migration entry point: lower views to `LibraryFunction`s, the
@@ -815,6 +832,7 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
         name: module_id,
         is_module: true,
         parent: None,
+        parent_span: Default::default(),
         includes: Vec::new(),
         methods: vec![method],
         nullable_columns: Vec::new(),
@@ -1048,7 +1066,7 @@ pub fn insert_db_stub(
     // BYTES (an HMAC key is bytes), which is why it types Str and not
     // some digest-shaped wrapper.
     let mut digest_info = crate::analyze::ClassInfo::default();
-    for name in ["hmac_sha1_hex", "hmac_sha256_hex"] {
+    for name in ["hmac_sha1_hex", "hmac_sha256_hex", "hmac_sha256"] {
         digest_info.class_methods.insert(
             Symbol::from(name),
             fn_sig(
@@ -1057,6 +1075,17 @@ pub fn insert_db_stub(
             ),
         );
     }
+    digest_info.class_methods.insert(
+        Symbol::from("secure_random_bytes"),
+        fn_sig(vec![(Symbol::from("n"), Ty::Int)], Ty::Str),
+    );
+    digest_info.class_methods.insert(
+        Symbol::from("secure_compare"),
+        fn_sig(
+            vec![(Symbol::from("a"), Ty::Str), (Symbol::from("b"), Ty::Str)],
+            Ty::Bool,
+        ),
+    );
     digest_info.class_methods.insert(
         Symbol::from("pbkdf2_sha256"),
         fn_sig(
@@ -1407,6 +1436,26 @@ pub(crate) fn insert_framework_stubs(
     // pre-seed; runtime/ruby/active_record/connection.rb calls Db
     // directly).
     insert_db_stub(classes);
+
+    // ActiveRecord — the module functions a lowered app body calls
+    // (runtime/ruby/active_record/base.rb). `lower_bound` is the run
+    // lookup in the `includes(:assoc)` distribute the Arel visitor
+    // emits; the controller body is re-typed after that rewrite, and an
+    // unresolved call there would erase the run bounds' Integer to
+    // untyped — which the strict targets then index wrongly.
+    if !classes.contains_key(&ClassId(Symbol::from("ActiveRecord"))) {
+        use crate::lower::typing::fn_sig;
+        let int_array = || crate::ty::Ty::Array { elem: Box::new(crate::ty::Ty::Int) };
+        let mut ar = crate::analyze::ClassInfo::default();
+        ar.class_methods.insert(
+            Symbol::from("lower_bound"),
+            fn_sig(
+                vec![(Symbol::from("sorted"), int_array()), (Symbol::from("value"), crate::ty::Ty::Int)],
+                crate::ty::Ty::Int,
+            ),
+        );
+        classes.insert(ClassId(Symbol::from("ActiveRecord")), ar);
+    }
 
     // Params — narrowing accessors over the recursive request-params
     // tree (runtime/ruby/params.rb). The synthesized `<Resource>Params.
@@ -2488,35 +2537,14 @@ pub(crate) fn action_view_ivar_map(
 /// no-recv/no-arg Send (`action_name`) or a Var (`action_name` already
 /// lowered to a local). Used to surface controller-context helpers
 /// (action_name/controller_name) as view params only when actually used.
-/// True when the view body holds a `url_for` options hash — a Hash
-/// literal whose keys are all Symbols and include both `controller` and
-/// `action` (`{controller: controller_name, action: action_name, page:
-/// @page + 1}`), the shape `lower_url_option_helpers` resolves.
+/// True when the view body holds a `url_for` options hash in a URL
+/// argument (`link_to "Next", {controller: controller_name, action:
+/// action_name, page: @page + 1}`), the shape `lower_url_option_helpers`
+/// resolves. Same collector, so the two cannot disagree.
 pub(crate) fn view_uses_url_options_hash(body: &Expr) -> bool {
-    fn walk(e: &Expr) -> bool {
-        if let ExprNode::Hash { entries, .. } = &*e.node {
-            let keys: Option<Vec<&str>> = entries
-                .iter()
-                .map(|(k, _)| match &*k.node {
-                    ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str()),
-                    _ => None,
-                })
-                .collect();
-            if let Some(keys) = keys {
-                if keys.contains(&"controller") && keys.contains(&"action") {
-                    return true;
-                }
-            }
-        }
-        let mut found = false;
-        e.node.for_each_child(&mut |c| {
-            if !found && walk(c) {
-                found = true;
-            }
-        });
-        found
-    }
-    walk(body)
+    let mut sets = Vec::new();
+    crate::lower::routes_to_library::collect_url_option_key_sets(body, &mut sets);
+    !sets.is_empty()
 }
 
 pub(crate) fn view_uses_bare_name(body: &Expr, name: &str) -> bool {
@@ -3343,7 +3371,12 @@ pub(crate) fn build_view_signature_from(
     })
 }
 
-pub(crate) fn infer_view_arg(stem: &str, dir: &str, is_partial: bool, _known_models: &[String]) -> String {
+pub(crate) fn infer_view_arg(stem: &str, dir: &str, is_partial: bool, known_models: &[String]) -> String {
+    // A hyphenated directory (`product-item`) is no identifier.
+    infer_view_arg_raw(stem, dir, is_partial, known_models).replace('-', "_")
+}
+
+fn infer_view_arg_raw(stem: &str, dir: &str, is_partial: bool, _known_models: &[String]) -> String {
     if dir.is_empty() {
         return String::new();
     }
@@ -3565,6 +3598,8 @@ fn rewrite_defined_to_nil_check(expr: &mut Expr) {
         | ExprNode::Retry
         | ExprNode::Redo
         | ExprNode::ForwardArgs
+        | ExprNode::ForwardKeywords
+        | ExprNode::Defined { .. }
         | ExprNode::SelfRef => {}
         ExprNode::Hash { entries, .. } => {
             for (k, v) in entries {
@@ -3631,6 +3666,23 @@ fn rewrite_defined_to_nil_check(expr: &mut Expr) {
                 }
                 rewrite_defined_to_nil_check(&mut arm.body);
             }
+        }
+        ExprNode::CaseMatch { scrutinee, arms, else_body } => {
+            rewrite_defined_to_nil_check(scrutinee);
+            for arm in arms {
+                arm.pattern.for_each_expr_mut(&mut |e| rewrite_defined_to_nil_check(e));
+                if let Some((_, g)) = arm.guard.as_mut() {
+                    rewrite_defined_to_nil_check(g);
+                }
+                rewrite_defined_to_nil_check(&mut arm.body);
+            }
+            if let Some(e) = else_body {
+                rewrite_defined_to_nil_check(e);
+            }
+        }
+        ExprNode::MatchPredicate { value, pattern } | ExprNode::MatchRequired { value, pattern } => {
+            rewrite_defined_to_nil_check(value);
+            pattern.for_each_expr_mut(&mut |e| rewrite_defined_to_nil_check(e));
         }
         ExprNode::Seq { exprs } => {
             for e in exprs {
@@ -4428,6 +4480,13 @@ pub(super) fn todo_io_append(tag: &str, span: crate::span::Span) -> Expr {
              runs no side effect in the emitted view"
         ),
     ));
+    noop_io_append()
+}
+
+/// `io << ""` — a statement that keeps an arm non-empty while rendering
+/// nothing. The catch-all's body without its ledger line, for statements
+/// that genuinely have nothing to drop (a bare literal).
+pub(super) fn noop_io_append() -> Expr {
     send(
         Some(var_ref(Symbol::from("io"))),
         "<<",
@@ -4447,6 +4506,12 @@ mod tests {
     fn module_id_for_articles_dir() {
         let id = view_module_id("articles");
         assert_eq!(id.0.as_str(), "Views::Articles");
+    }
+
+    #[test]
+    fn a_hyphenated_view_directory_yields_a_valid_constant_and_local() {
+        assert_eq!(view_module_id("product-item").0.as_str(), "Views::ProductItem");
+        assert_eq!(infer_view_arg("_default", "product-item", true, &[]), "product_item");
     }
 
     #[test]

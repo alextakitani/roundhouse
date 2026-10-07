@@ -38,10 +38,72 @@ pub fn diagnose(app: &App) -> Vec<Diagnostic> {
 /// skins that state the denominator (#64: "0 findings" must be
 /// distinguishable from "couldn't check").
 pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
-    let mut out = Vec::new();
+    let mut out = app.routes.diagnostics.clone();
     // Only validated synthesized Alba serializers, with per-constructor
     // evidence; this does not widen the general library diagnostic policy.
     out.extend(super::alba::diagnose(app));
+    // graphql-ruby object types: their bodies, and each `null: false`
+    // field's resolved value.
+    out.extend(super::graphql::diagnose(app, diagnose_expr));
+    out.extend(super::enum_raw_input::diagnose(app));
+    // Rubydex's unresolved constants emit refusal stubs. Collect those
+    // annotations from support methods/defaults/constants as well, so
+    // an emitted raise cannot be hidden by the library diagnostic policy.
+    // Restore the nominal-class operator refusal widened by the fork.
+    // Primitive/nullable arithmetic keeps the existing library policy.
+    fn nominal_class_operand(ty: &Ty) -> bool {
+        match ty {
+            Ty::Class { .. } => true,
+            Ty::Union { variants } => !variants.is_empty() && variants.iter().all(nominal_class_operand),
+            _ => false,
+        }
+    }
+    fn collect_constants(expr: &Expr, out: &mut Vec<Diagnostic>) {
+        if let Some(kind @ DiagnosticKind::IncompatibleBinop { op, lhs_ty, .. }) = &expr.diagnostic {
+            if nominal_class_operand(lhs_ty) {
+            out.push(Diagnostic {
+                span: expr.span,
+                severity: Diagnostic::default_severity(kind),
+                kind: kind.clone(),
+                message: format!("`{op}` with incompatible operand types"),
+            });
+            }
+        }
+        if matches!(&expr.diagnostic,
+            Some(DiagnosticKind::Unsupported { .. }))
+        {
+            if let Some(DiagnosticKind::Unsupported { target, construct, detail }) = &expr.diagnostic {
+                out.push(Diagnostic::unsupported(expr.span, target.clone(), construct.as_str(), detail.clone()));
+            }
+        }
+        expr.node.for_each_child(&mut |child| collect_constants(child, out));
+    }
+    // Declaration DSL arguments are handled by the class-body ledger;
+    // this pass covers executable support methods and initializers.
+    for class in app.library_classes.iter().chain(app.rails_application.iter()) {
+        for method in &class.methods {
+            collect_constants(&method.body, &mut out);
+            for param in &method.params {
+                if let Some(default) = &param.default { collect_constants(default, &mut out); }
+            }
+        }
+        for (_, value) in &class.constants { collect_constants(value, &mut out); }
+        for call in &class.unknown_calls { collect_constants(call, &mut out); }
+    }
+    // The analyzer resolves model include identities against the registry.
+    // Collect that edge's refusal; declaration-marker arguments are metadata
+    // handled by the shared model lowerer, rather than executable reads.
+    for model in &app.models {
+        for item in &model.body {
+            if let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item {
+                if let Some(DiagnosticKind::Unsupported { construct, detail, .. }) = &expr.diagnostic {
+                    if construct.as_str() == "include" {
+                        out.push(Diagnostic::unsupported(expr.span, None, "include", detail.clone()));
+                    }
+                }
+            }
+        }
+    }
     // A filter's return value is Rails' to discard (`around_action
     // :switch_locale` → `I18n.with_locale(locale, &action)`): nothing
     // escapes from its tail, so an `untyped` there is not a gradual
@@ -75,10 +137,16 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     for view in &app.views {
         diagnose_expr(&view.body, &mut out);
     }
+    for class in &app.library_classes {
+        for initializer in &class.class_ivar_initializers {
+            diagnose_expr(initializer, &mut out);
+        }
+    }
     if let Some(seeds) = &app.seeds {
         diagnose_expr(seeds, &mut out);
     }
     out.extend(super::forwarding::diagnose(app));
+    out.extend(super::filter_targets::diagnose(app));
 
     // Static N+1 pass (#64): missing-preload warnings over the typed
     // query chains, same-procedure and through the controller→view
@@ -217,6 +285,11 @@ fn diagnose_expr_in(expr: &Expr, out: &mut Vec<Diagnostic>, value_used: bool) {
                     reason.as_str()
                 )
             }
+            // Produced by `filter_targets::diagnose` as a returned list,
+            // never as an `Expr.diagnostic` annotation.
+            DiagnosticKind::UndefinedFilterTarget { .. } => Diagnostic::stub_text(kind),
+            // Produced by `graphql::diagnose` as a returned list.
+            DiagnosticKind::GraphqlNullableField { .. } => Diagnostic::stub_text(kind),
         };
         out.push(Diagnostic {
             span: expr.span,
@@ -236,7 +309,10 @@ fn diagnose_expr_in(expr: &Expr, out: &mut Vec<Diagnostic>, value_used: bool) {
     // an argument-packet marker, not a value escaping the type system.
     if value_used
         && matches!(expr.ty.as_ref(), Some(Ty::Untyped))
-        && !matches!(&*expr.node, ExprNode::Seq { .. } | ExprNode::ForwardArgs)
+        && !matches!(
+            &*expr.node,
+            ExprNode::Seq { .. } | ExprNode::ForwardArgs | ExprNode::ForwardKeywords
+        )
     {
         let kind = DiagnosticKind::GradualUntyped {
             expr_kind: crate::ident::Symbol::new(expr_kind_label(expr)),
@@ -298,7 +374,10 @@ fn diagnose_expr_in(expr: &Expr, out: &mut Vec<Diagnostic>, value_used: bool) {
     // is itself unresolved is reported on the receiver node when we
     // recurse, so the outer send is skipped here to avoid double-counting
     // the same root cause.
-    if is_unknown_ty(expr.ty.as_ref())
+    //
+    // A node the compiler synthesized (an `attr_writer`'s `value`) has no
+    // source position: there is nothing for the author to look at or fix.
+    if is_unknown_ty(expr.ty.as_ref()) && !expr.span.is_synthetic()
         && !matches!(expr.diagnostic, Some(DiagnosticKind::Unsupported { .. }))
     {
         let report = matches!(
@@ -378,6 +457,23 @@ fn diagnose_expr_in(expr: &Expr, out: &mut Vec<Diagnostic>, value_used: bool) {
                 }
                 diagnose_expr(&arm.body, out);
             }
+        }
+        ExprNode::CaseMatch { scrutinee, arms, else_body } => {
+            diagnose_expr(scrutinee, out);
+            for arm in arms {
+                arm.pattern.for_each_expr(&mut |e| diagnose_expr(e, out));
+                if let Some((_, g)) = &arm.guard {
+                    diagnose_expr(g, out);
+                }
+                diagnose_expr(&arm.body, out);
+            }
+            if let Some(e) = else_body {
+                diagnose_expr(e, out);
+            }
+        }
+        ExprNode::MatchPredicate { value, pattern } | ExprNode::MatchRequired { value, pattern } => {
+            diagnose_expr(value, out);
+            pattern.for_each_expr(&mut |e| diagnose_expr(e, out));
         }
         ExprNode::Let { value, body, .. } => {
             diagnose_expr(value, out);
@@ -472,6 +568,8 @@ fn diagnose_expr_in(expr: &Expr, out: &mut Vec<Diagnostic>, value_used: bool) {
         | ExprNode::Retry
         | ExprNode::Redo
         | ExprNode::ForwardArgs
+        | ExprNode::ForwardKeywords
+        | ExprNode::Defined { .. }
         | ExprNode::SelfRef => {}
     }
 }

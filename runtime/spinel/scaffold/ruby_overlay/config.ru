@@ -13,8 +13,32 @@
 require "rack"
 require_relative "main"
 require_relative "cable"
+require_relative "runtime/gzip_cache"
 
 Main.configure_default_adapter!
+
+# Every WebSocket client holds a socket, and all of them live in this
+# process. At the soft RLIMIT_NOFILE most environments start with — 1024,
+# including Docker's default (soft 1024, hard 524288) — the 1,000-client tier
+# stops at ~991 connections: accept() fails with EMFILE and nothing else is
+# served. Raise the soft limit to the hard one, as Go's runtime does at
+# startup and as the once-campfire Ruby port's server does. A runtime that
+# cannot (or a hard limit already reached) keeps what it has.
+begin
+  soft, hard = Process.getrlimit(:NOFILE)
+  Process.setrlimit(:NOFILE, hard, hard) if soft < hard
+rescue NotImplementedError, Errno::EPERM, Errno::EINVAL
+end
+
+# Serving, so WAL checkpoints move off the request path: each process
+# that serves runs them on a background thread instead of inside some
+# request's COMMIT (Db.checkpoint_in_background!).
+Db.checkpoint_in_background!
+
+# And jobs run off it: `perform_later` queues the work for a drain
+# thread in each serving process instead of running it inside the
+# request (ActiveJob.drain_in_background!).
+ActiveJob.drain_in_background!
 
 # Register the Cable registry as the broadcasts transport: every
 # `Broadcasts.record` call from model callbacks now also fans out
@@ -52,6 +76,15 @@ end)
 # `Main.dispatch_core_inner` instead, where it also covers the CGI and
 # future spinel serving shapes.
 
+# Campfire's own config.ru is `use Rack::Deflater` then `run` the app.
+# GzipCache is that plus a body cache: the same identity HTML is not
+# deflated on every wrk GET. HTML only — Static sits outside this
+# lambda, so CSS/JS stay identity. NOT around the whole app: the
+# hijack tuple `[-1, {}, []]` has no skip, so gzip wraps only run_rack.
+gzip = GzipCache.wrap(lambda { |env|
+  Db.with_connection { Main.run_rack(env) }
+})
+
 app = lambda do |env|
   # WebSocket upgrade: `/cable`. Cable hijacks the socket out of Puma
   # and hands it to the reactor thread, which owns every connection
@@ -84,8 +117,9 @@ app = lambda do |env|
   # Lease one pooled DB connection for the whole request so concurrent
   # Puma worker threads each read/write through their own handle rather
   # than serializing on a single shared one. `run_rack` reads the Rack
-  # env directly and returns the response tuple.
-  Db.with_connection { Main.run_rack(env) }
+  # env directly and returns the response tuple. Gzip sits on this path
+  # only — see gzip above.
+  gzip.call(env)
 end
 
 run app

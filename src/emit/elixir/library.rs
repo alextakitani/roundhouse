@@ -439,6 +439,8 @@ pub(super) fn references_var(e: &Expr, name: &str) -> bool {
         | ExprNode::Retry
         | ExprNode::Redo
         | ExprNode::ForwardArgs
+        | ExprNode::ForwardKeywords
+        | ExprNode::Defined { .. }
         | ExprNode::SelfRef => false,
         ExprNode::Send { recv, method, args, block, .. } => {
             (recv.is_none() && args.is_empty() && method.as_str() == name)
@@ -479,6 +481,30 @@ pub(super) fn references_var(e: &Expr, name: &str) -> bool {
                         || references_var(&a.body, name)
                 })
         }
+        // A pattern's OWN bindings shadow `name` for its guard and
+        // body: `in name` rebinds `name` to the matched value, so a
+        // read of `name` past that point is the new local, not the
+        // outer one this search is for — checking `bound_names` first
+        // is what keeps `CaseMatch` from over-reporting a capture a
+        // real Elixir closure would never need.
+        ExprNode::CaseMatch { scrutinee, arms, else_body } => {
+            references_var(scrutinee, name)
+                || arms.iter().any(|a| {
+                    let mut pattern_hit = false;
+                    a.pattern.for_each_expr(&mut |e| pattern_hit |= references_var(e, name));
+                    let mut bound = Vec::new();
+                    a.pattern.bound_names(&mut bound);
+                    let shadowed = bound.iter().any(|n| n.as_str() == name);
+                    let guard_hit = a.guard.as_ref().is_some_and(|(_, g)| references_var(g, name));
+                    pattern_hit || (!shadowed && (guard_hit || references_var(&a.body, name)))
+                })
+                || opt(else_body, name)
+        }
+        ExprNode::MatchPredicate { value, pattern } | ExprNode::MatchRequired { value, pattern } => {
+            let mut pattern_hit = false;
+            pattern.for_each_expr(&mut |e| pattern_hit |= references_var(e, name));
+            references_var(value, name) || pattern_hit
+        }
         ExprNode::Seq { exprs } => exprs.iter().any(|x| references_var(x, name)),
         ExprNode::Assign { target, value } | ExprNode::OpAssign { target, value, .. } => {
             lvalue(target, name) || references_var(value, name)
@@ -516,20 +542,51 @@ pub(super) fn references_var(e: &Expr, name: &str) -> bool {
 }
 
 /// Map a Ruby method name to a legal Elixir function name. `?`/`!`
-/// suffixes are valid in Elixir and pass through. The indexing
-/// operators `[]`/`[]=` (illegal as Elixir function names) become
-/// `get`/`put`; a writer `foo=` becomes `set_foo`.
+/// suffixes are valid in Elixir and pass through when they *terminate*
+/// the name. The indexing operators `[]`/`[]=` (illegal as Elixir
+/// function names) become `get`/`put`; a writer `foo=` becomes
+/// `set_foo`.
+///
+/// While→recursion helpers append `__loop` to the Ruby name
+/// (`header_key_ok?` → `header_key_ok?__loop`). Elixir identifiers may
+/// *end* in `?`/`!` but cannot continue after them — `?_` is a
+/// character literal — so mid-name `?`/`!` become `_p`/`_b` before the
+/// suffix.
 pub(super) fn elixir_fn_name(name: &str) -> String {
+    // Indexing operators and their while→recursion helpers (`[]__loop`,
+    // `[]=__loop`) are illegal Elixir identifiers — map to get/put.
+    if let Some(rest) = name.strip_prefix("[]=__") {
+        return format!("put__{rest}");
+    }
+    if let Some(rest) = name.strip_prefix("[]__") {
+        return format!("get__{rest}");
+    }
     match name {
         "[]" => return "get".to_string(),
         "[]=" => return "put".to_string(),
         _ => {}
     }
     if let Some(base) = name.strip_suffix('=') {
-        format!("set_{base}")
-    } else {
-        name.to_string()
+        // `foo=` writer — but not `foo?=` / mangled forms.
+        if !base.ends_with(['?', '!']) {
+            return format!("set_{base}");
+        }
     }
+    // `pred?__loop` / `bang!__loop`: rewrite the mid-name punct so the
+    // identifier stays legal (`pred_p__loop` / `bang_b__loop`). A
+    // trailing `?`/`!` (end of name) falls through to the catch-all and
+    // is preserved.
+    let mut out = String::with_capacity(name.len() + 2);
+    let chars: Vec<char> = name.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        let next = chars.get(i + 1).copied();
+        match c {
+            '?' if next.is_some() => out.push_str("_p"),
+            '!' if next.is_some() => out.push_str("_b"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -581,5 +638,16 @@ mod tests {
             parenthesized: false,
         });
         assert!(references_var(&bare, "notice"));
+    }
+
+    #[test]
+    fn elixir_fn_name_rewrites_mid_pred_before_loop_suffix() {
+        // Trailing `?`/`!` stay; mid-name (before `__loop`) cannot.
+        assert_eq!(elixir_fn_name("header_key_ok?"), "header_key_ok?");
+        assert_eq!(elixir_fn_name("header_key_ok?__loop"), "header_key_ok_p__loop");
+        assert_eq!(elixir_fn_name("bang!__loop"), "bang_b__loop");
+        assert_eq!(elixir_fn_name("[]__loop"), "get__loop");
+        assert_eq!(elixir_fn_name("[]=__loop"), "put__loop");
+        assert_eq!(elixir_fn_name("title="), "set_title");
     }
 }

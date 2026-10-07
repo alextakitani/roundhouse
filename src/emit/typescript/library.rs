@@ -216,6 +216,7 @@ fn synthesize_module_lc(
         name: module_id,
         is_module: true,
         parent: None,
+        parent_span: Default::default(),
         includes: Vec::new(),
         methods,
         nullable_columns: Vec::new(),
@@ -498,6 +499,7 @@ fn collect_imports_for_function(
         )),
         is_module: true,
         parent: None,
+        parent_span: Default::default(),
         includes: Vec::new(),
         nullable_columns: Vec::new(),
         methods: vec![crate::dialect::MethodDef {
@@ -1441,6 +1443,23 @@ fn collect_class_refs(e: &Expr, out: &mut BTreeSet<String>) {
                 collect_class_refs(&arm.body, out);
             }
         }
+        ExprNode::CaseMatch { scrutinee, arms, else_body } => {
+            collect_class_refs(scrutinee, out);
+            for arm in arms {
+                arm.pattern.for_each_expr(&mut |e| collect_class_refs(e, out));
+                if let Some((_, g)) = &arm.guard {
+                    collect_class_refs(g, out);
+                }
+                collect_class_refs(&arm.body, out);
+            }
+            if let Some(e) = else_body {
+                collect_class_refs(e, out);
+            }
+        }
+        ExprNode::MatchPredicate { value, pattern } | ExprNode::MatchRequired { value, pattern } => {
+            collect_class_refs(value, out);
+            pattern.for_each_expr(&mut |e| collect_class_refs(e, out));
+        }
         ExprNode::Seq { exprs } => {
             for e in exprs {
                 collect_class_refs(e, out);
@@ -1510,6 +1529,8 @@ fn collect_class_refs(e: &Expr, out: &mut BTreeSet<String>) {
         | ExprNode::Retry
         | ExprNode::Redo
         | ExprNode::ForwardArgs
+        | ExprNode::ForwardKeywords
+        | ExprNode::Defined { .. }
         | ExprNode::SelfRef => {}
     }
 }
@@ -1694,6 +1715,27 @@ fn rewrite_free(e: &Expr) -> Expr {
                 body: rewrite_free(&arm.body),
             }).collect(),
         },
+        // Pattern cloned rather than deep-rewritten, same shortcut
+        // `Case` above takes for `Pattern` — this pass only injects
+        // self-ref onto bare Sends, which a pattern's embedded exprs
+        // (a `Value` test, a narrowing `constant`) don't need.
+        ExprNode::CaseMatch { scrutinee, arms, else_body } => ExprNode::CaseMatch {
+            scrutinee: rewrite_free(scrutinee),
+            arms: arms.iter().map(|arm| crate::expr::MatchArm {
+                pattern: arm.pattern.clone(),
+                guard: arm.guard.as_ref().map(|(k, g)| (*k, rewrite_free(g))),
+                body: rewrite_free(&arm.body),
+            }).collect(),
+            else_body: else_body.as_ref().map(rewrite_free),
+        },
+        ExprNode::MatchPredicate { value, pattern } => ExprNode::MatchPredicate {
+            value: rewrite_free(value),
+            pattern: pattern.clone(),
+        },
+        ExprNode::MatchRequired { value, pattern } => ExprNode::MatchRequired {
+            value: rewrite_free(value),
+            pattern: pattern.clone(),
+        },
         ExprNode::Let { id, name, value, body } => ExprNode::Let {
             id: *id,
             name: name.clone(),
@@ -1736,6 +1778,8 @@ fn rewrite_free(e: &Expr) -> Expr {
         | ExprNode::Retry
         | ExprNode::Redo
         | ExprNode::ForwardArgs
+        | ExprNode::ForwardKeywords
+        | ExprNode::Defined { .. }
         | ExprNode::SelfRef => (*e.node).clone(),
     };
     Expr {
@@ -1960,6 +2004,29 @@ fn rewrite(e: &Expr, super_method: Option<&str>) -> Expr {
                 })
                 .collect(),
         },
+        // Pattern cloned rather than deep-rewritten — same shortcut as
+        // `Case` above; see the `rewrite_free` twin of this function
+        // for why that's safe here.
+        ExprNode::CaseMatch { scrutinee, arms, else_body } => ExprNode::CaseMatch {
+            scrutinee: rewrite(scrutinee, super_method),
+            arms: arms
+                .iter()
+                .map(|arm| crate::expr::MatchArm {
+                    pattern: arm.pattern.clone(),
+                    guard: arm.guard.as_ref().map(|(k, g)| (*k, rewrite(g, super_method))),
+                    body: rewrite(&arm.body, super_method),
+                })
+                .collect(),
+            else_body: else_body.as_ref().map(|e| rewrite(e, super_method)),
+        },
+        ExprNode::MatchPredicate { value, pattern } => ExprNode::MatchPredicate {
+            value: rewrite(value, super_method),
+            pattern: pattern.clone(),
+        },
+        ExprNode::MatchRequired { value, pattern } => ExprNode::MatchRequired {
+            value: rewrite(value, super_method),
+            pattern: pattern.clone(),
+        },
         ExprNode::Let { id, name, value, body } => ExprNode::Let {
             id: *id,
             name: name.clone(),
@@ -2004,6 +2071,8 @@ fn rewrite(e: &Expr, super_method: Option<&str>) -> Expr {
         | ExprNode::Retry
         | ExprNode::Redo
         | ExprNode::ForwardArgs
+        | ExprNode::ForwardKeywords
+        | ExprNode::Defined { .. }
         | ExprNode::SelfRef => (*e.node).clone(),
     };
 

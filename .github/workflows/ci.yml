@@ -5,9 +5,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-    # Drafts run fixture + unit only. Ready PRs use selected coverage.
-    # Label/draft/head transitions cancel superseded PR runs via concurrency.
-    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, labeled, unlabeled]
+    # Draft and ready PRs share path/label selection. Draft transitions do
+    # not change coverage and must not replace an otherwise useful run.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   workflow_call:
     inputs:
       full:
@@ -26,15 +26,21 @@ on:
         value: ${{ jobs.compact-required.outputs.passed == 'true' && jobs.assemble-site.outputs.ready == 'true' }}
 
 # Separate from the full-ci caller's lock: workflow_call inherits its context.
+# Push-to-main is Ruby+Spinel, not the extra-language matrix; cancel
+# superseded SHAs so merge trains do not stack. Scheduled/manual full-ci
+# is the extra-SDK ledger and keeps its own lock.
 concurrency:
   group: validation-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  # CI selects the latest patch on this MRI line. The local minimum lives in
+  # .ruby-version; keep both anchors aligned. Exact repro pins remain separate.
+  MRI_RUBY: '3.4'
   # The Rails apps the /ide/ + /playground/ demos ship (in-browser). Pinned
   # so the page — and any blog post's claims about it — stay stable against
   # upstream churn; bump deliberately. Each bundle embeds the app's LICENSE
@@ -63,8 +69,11 @@ jobs:
       spinel-revision: ${{ steps.plan.outputs.spinel-revision }}
       spinel-tests: ${{ steps.plan.outputs.spinel-tests }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
+          # Merge-commit parents are enough to identify the PR tree. Named
+          # bases that are not a parent (stale event SHA, push before) are
+          # fetched by the planner, not by cloning full history.
           fetch-depth: 2
       - name: Select required coverage from the event's actual tree
         id: plan
@@ -76,7 +85,7 @@ jobs:
         run: python3 scripts/ci-plan.py plan
 
   writebook-inventory:
-    needs: [unit, plan]
+    needs: plan
     if: ${{ contains(fromJSON(needs.plan.outputs.jobs), 'writebook-inventory') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -84,7 +93,7 @@ jobs:
       contents: read
       actions: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@v2
       - name: Fetch pinned Writebook source
@@ -105,9 +114,7 @@ jobs:
         env:
           WRITEBOOK_ROOT: /tmp/writebook
           WRITEBOOK_INVENTORY_REPORT: writebook-inventory-current.json
-        run: |
-          cargo build --locked --release --bin roundhouse
-          cargo test --locked --test writebook --release -- --ignored --nocapture
+        run: cargo test --locked --release --bin roundhouse --test writebook -- --ignored --nocapture
       - name: Save complete check report
         id: report
         if: always() && (steps.reuse.outcome != 'success' || steps.reuse.outputs.hit != 'true')
@@ -151,42 +158,116 @@ jobs:
           if-no-files-found: error
 
   # -------------------------------------------------------------------
-  # Generate the real-blog fixture once, upload as artifact. Every
-  # downstream test job downloads + extracts it — pay the Ruby/Rails
-  # install cost once per CI run instead of in each of seven jobs.
+  # Share both fixtures through this run's artifact. First-attempt PRs
+  # may reuse a daily source snapshot; main/scheduled/manual/rerun builds
+  # always generate freshly. Store guide tests execute on either path.
   # -------------------------------------------------------------------
   generate-fixture:
     needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      BUNDLE_JOBS: '4'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
+      - name: Isolate fixture gems
+        # Runner paths are available in steps, not in job-level env expressions.
+        run: |
+          echo "GEM_HOME=$RUNNER_TEMP/fixture-gems" >> "$GITHUB_ENV"
+          echo "GEM_PATH=$RUNNER_TEMP/fixture-gems" >> "$GITHUB_ENV"
       - name: Set up Ruby
         uses: ruby/setup-ruby@v1
         with:
-          ruby-version: "3.4"
+          ruby-version: ${{ env.MRI_RUBY }}
+      - name: Identify fixture inputs
+        id: gems
+        env:
+          FIXTURE_RECIPE: ${{ hashFiles('bin/rh', 'scripts/create-blog', 'scripts/create-store', 'scripts/test-store', '.github/workflows/ci.yml') }}
+        run: |
+          echo "$GEM_HOME/bin" >> "$GITHUB_PATH"
+          platform="${ImageOS}-$(ruby -e 'print "#{RUBY_ENGINE}-#{RUBY_VERSION}-#{RUBY_PLATFORM}"')"
+          echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+          tools="$(ruby -rbundler -e 'print "#{Gem::VERSION}-#{Bundler::VERSION}"')"
+          echo "platform=${platform}-${ImageVersion}-${tools}" >> "$GITHUB_OUTPUT"
+          echo "fixture-key=fixture-source-v1-${RUNNER_OS}-${RUNNER_ARCH}-${platform}-${ImageVersion}-${tools}-$(date -u +%F)-${FIXTURE_RECIPE}" >> "$GITHUB_OUTPUT"
+      - name: Restore fixture source snapshot
+        id: fixture-cache
+        if: github.event_name == 'pull_request' && github.run_attempt == 1
+        continue-on-error: true
+        uses: actions/cache/restore@v6
+        with:
+          path: real-blog.tar.gz
+          key: ${{ steps.gems.outputs.fixture-key }}
+      - name: Select fresh generation or restored source
+        id: fixture
+        env:
+          RESTORED: ${{ steps.fixture-cache.outcome == 'success' && steps.fixture-cache.outputs.cache-hit == 'true' }}
+        run: |
+          if [ "$RESTORED" = true ]; then
+            tar -xzf real-blog.tar.gz
+            echo "generate=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "generate=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Cache installed fixture gems
+        # Weekly keys refresh dependencies only within the same runner
+        # image version, Ruby patch/platform and RubyGems/Bundler. Generation
+        # checks for the latest Rails release, even on a gem-cache hit.
+        continue-on-error: true
+        uses: actions/cache@v6
+        with:
+          # Downloaded .gem archives and documentation are not needed to use
+          # installed gems; omitting them keeps cache transfers smaller.
+          path: |
+            ${{ env.GEM_HOME }}/bin
+            ${{ env.GEM_HOME }}/build_info
+            ${{ env.GEM_HOME }}/extensions
+            ${{ env.GEM_HOME }}/gems
+            ${{ env.GEM_HOME }}/plugins
+            ${{ env.GEM_HOME }}/specifications
+          key: fixture-gems-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.gems.outputs.platform }}-${{ steps.gems.outputs.week }}
+          restore-keys: fixture-gems-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.gems.outputs.platform }}-
       - name: Install Rails
-        run: gem install rails
+        if: steps.fixture.outputs.generate == 'true'
+        run: gem install rails --no-document
       - name: Generate fixtures/real-blog
+        if: steps.fixture.outputs.generate == 'true'
         run: bin/rh fixture
       # The Rails Guides store rides the same artifact: the /ide/
       # default app and a picker entry, so build-site and
       # browser-smoke-ide bundle it without a second Rails install.
       - name: Generate fixtures/store by following the guide
+        if: steps.fixture.outputs.generate == 'true'
         run: cd fixtures && ../scripts/create-store store
+      - name: Run guide tests on restored store
+        # create-store runs these on fresh builds; a source hit is not a
+        # test receipt. Install its locked bundle without updating the lock.
+        if: steps.fixture.outputs.generate == 'false'
+        run: scripts/test-store
       - name: Pack fixtures
+        if: steps.fixture.outputs.generate == 'true'
         run: |
-          tar --exclude='./fixtures/real-blog/tmp' \
-              --exclude='./fixtures/real-blog/log' \
-              --exclude='./fixtures/store/tmp' \
-              --exclude='./fixtures/store/log' \
-              --exclude='./fixtures/store/storage' \
+          tar --exclude='fixtures/real-blog/tmp' \
+              --exclude='fixtures/real-blog/log' \
+              --exclude='fixtures/store/tmp' \
+              --exclude='fixtures/store/log' \
+              --exclude='fixtures/store/storage' \
               -czf real-blog.tar.gz fixtures/real-blog fixtures/store
+      - name: Save fresh fixture source snapshot
+        # Main/full cycles never restore, but can seed the default-branch
+        # cache for PRs. Never save failed generation or guide-test results.
+        if: success() && steps.fixture.outputs.generate == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          path: real-blog.tar.gz
+          key: ${{ steps.gems.outputs.fixture-key }}
       - name: Upload fixture
         uses: actions/upload-artifact@v7
         with:
           name: real-blog-fixture
           path: real-blog.tar.gz
+          compression-level: 0
           retention-days: 1
 
   # -------------------------------------------------------------------
@@ -203,7 +284,7 @@ jobs:
   # goes red it is the analyzer's next entry, not noise.
   # -------------------------------------------------------------------
   store-check:
-    needs: [generate-fixture, unit, plan]
+    needs: [generate-fixture, plan]
     if: ${{ contains(fromJSON(needs.plan.outputs.jobs), 'store-check') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -211,7 +292,7 @@ jobs:
       contents: read
       actions: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@v2
       # generate-fixture already builds the store and runs the guide's
@@ -228,16 +309,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/ci-reuse.py probe --job store-check --input fixtures/store
+      # Debug, not release: the analyzer claim is the same IR. On PR
+      # 37439350975 this job spent 95s of 113s compiling a release
+      # binary for a check that finishes in seconds.
       - name: cargo build
         id: build
         if: steps.reuse.outcome != 'success' || steps.reuse.outputs.hit != 'true'
-        run: cargo build --locked --release --bin roundhouse
+        run: cargo build --locked --bin roundhouse
       - name: The analyzer reports no errors, no warnings and no ingest gaps on the store
         id: check
         if: steps.reuse.outcome != 'success' || steps.reuse.outputs.hit != 'true'
         run: |
           set -euo pipefail
-          target/release/roundhouse check --continue fixtures/store 2>&1 | tee /tmp/store-check.txt
+          target/debug/roundhouse check --continue fixtures/store 2>&1 | tee /tmp/store-check.txt
           grep -E "^roundhouse-check: .* 0 error\(s\), 0 warning\(s\), 0 gap-attributed note\(s\), 0 survey gap\(s\)" /tmp/store-check.txt
       - name: Record actual successful execution
         id: execution
@@ -258,16 +342,15 @@ jobs:
   # Build the in-browser compiler wasm (roundhouse_wasm.wasm) from source
   # and upload it as an artifact for build-site. Runs in PARALLEL with
   # generate-fixture — they're independent (the wasm embeds the compiler;
-  # the fixture is runtime input fed in the browser), so this multi-minute
-  # LTO build hides behind work build-site already waits on, adding ~0 to
-  # the critical path to deploy. Rebuilds via the in-repo vendored
+  # the fixture is runtime input fed in the browser). Neither producer
+  # waits for unit tests. Rebuilds via the in-repo vendored
   # ruby-rbs-sys (wasm/vendor/ — wasm32 build support upstream-pending as
   # ruby/rbs#2992), so the 3.8 MB binary is NOT committed and the published
   # demos (/playground/, /studio/) always track main. The only external
   # need is the WASI SDK (a manual tarball, cached here).
   # -------------------------------------------------------------------
   build-wasm:
-    needs: [unit, plan]
+    needs: plan
     if: ${{ contains(fromJSON(needs.plan.outputs.jobs), 'build-wasm') }}
     runs-on: ubuntu-latest
     # The job normally finishes in a few minutes; a hung apt install
@@ -277,7 +360,7 @@ jobs:
     env:
       WASI_SDK_VERSION: "33.0"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rust
         with:
           targets: wasm32-wasip1
@@ -289,7 +372,7 @@ jobs:
           "$GITHUB_WORKSPACE/scripts/ci-apt-install" libclang-dev
       - name: Cache WASI SDK
         id: wasi-sdk
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: /opt/wasi-sdk
           key: wasi-sdk-${{ env.WASI_SDK_VERSION }}-x86_64-linux
@@ -328,7 +411,7 @@ jobs:
   # A failed lookup falls back to fresh master and cannot save a checkpoint.
   # -------------------------------------------------------------------
   build-spinel:
-    needs: [unit, plan]
+    needs: plan
     if: ${{ contains(fromJSON(needs.plan.outputs.jobs), 'build-spinel') }}
     outputs:
       artifact-id: ${{ steps.toolchain.outputs.artifact-id }}
@@ -350,8 +433,9 @@ jobs:
       # Preprocess each time: Spinel uses conditional __has_include headers.
       SCCACHE_DIRECT: "false"
       SCCACHE_IDLE_TIMEOUT: "0"
+      MAKEFLAGS: "-j4"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: matz/spinel
           ref: ${{ needs.plan.outputs.spinel-revision }}
@@ -458,8 +542,20 @@ jobs:
     needs: generate-fixture
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      # A failed shard must not cancel coverage or diagnostic output from others.
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        shard: [0, 1, 2, 3]
+    env:
+      # Share first-party split DWARF instead of copying it into every test
+      # executable. Integration sidecars are freed with their finished batch;
+      # shared library/bin sidecars stay. Code stays unoptimized.
+      # Test-profile-only, Linux-job-only: dev, release and other hosts unchanged.
+      CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: unpacked
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@v2
       - uses: actions/download-artifact@v8
@@ -485,21 +581,64 @@ jobs:
       # on the same one.
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.4'
-      - name: Install the gem the overlay escape surface uses
-        run: gem install rails-html-sanitizer --no-document
-      # The native Date reference uses ActiveRecord against in-memory
-      # SQLite. Fixture generation ships source, not its installed gems.
-      - name: Install ActiveRecord for the native Date reference
-        run: gem install activerecord -v '~> 8.1.0' --no-document
-      # `tests/emit_and_run.rs` and `tests/relation_runtime_cruby.rs`
-      # run the emitted Ruby tree, whose database layer is the sqlite3
-      # gem. The second skipped without it and passed: before this step
-      # the unit job ran it as a no-op. The first refuses to skip.
-      - name: Install the gem the emitted Ruby tree runs on
-        run: gem install sqlite3 --no-document
-      - name: cargo test
-        run: cargo test --all-targets
+          ruby-version: ${{ env.MRI_RUBY }}
+      # libvips42: `tests/vips_loader_policy.rs` boots an emitted variant
+      # app and asks `Vips.vips_foreign_find_load` after the app's loader
+      # policy. CRuby binds through FFI, so the library is enough; headers
+      # are the compiled Spinel job.
+      - name: System libvips for the emitted ruby-vips processor
+        run: |
+          "$GITHUB_WORKSPACE/scripts/ci-apt-install" libvips42
+      # One gem process: three sequential `gem install` steps were paying
+      # RubyGems startup separately for the same default gem path.
+      #
+      # rails-html-sanitizer — `tests/overlay_sanitize_autolink.rs` shells
+      # out to ruby and loads the CRuby overlay's escape surface. Without
+      # the gem the overlay falls back to the shared scanner (which refuses
+      # markup by design) and the test fails naming this step.
+      # setup-ruby, not the runner's system ruby: `gem install` against
+      # system ruby is a Gem::FilePermissionError, and the test asserts
+      # EXACT sanitizer output, so the ruby it runs on is part of the
+      # assertion. 3.4 is the version campfire-conformance pins.
+      #
+      # activerecord — the native Date reference uses ActiveRecord against
+      # in-memory SQLite. Fixture generation ships source, not its gems.
+      #
+      # sqlite3 — `tests/emit_and_run.rs` and `tests/relation_runtime_cruby.rs`
+      # run the emitted Ruby tree. The second skipped without the gem and
+      # passed: before this install the unit job ran it as a no-op.
+      #
+      # bcrypt — Campfire launcher regressions
+      # (`tests/ci_campfire_optimization_test.py`) preload
+      # `scripts/campfire-test-bcrypt.rb`. A runner without the gem fails
+      # those tests; a dev box that has it hides the gap.
+      #
+      # rack — the built-in Cable mount control sends real Rack requests.
+      #
+      # ruby-vips — pairs with libvips42 above; without the gem the vips
+      # loader test dies on `cannot load such file -- vips`.
+      - name: Install gems used by emitted Ruby and Campfire harness tests
+        run: |
+          gem install --no-document rails-html-sanitizer sqlite3 bcrypt rack ruby-vips
+          gem install --no-document activerecord -v '~> 8.1.0'
+      # Bounded build → run → free waves: every --all-targets identity still
+      # goes through Cargo (lib, bins, each integration target). Finished
+      # integration executables and their own split-DWARF sidecars are freed
+      # after a successful batch so peak disk stays near one wave instead of
+      # all hundreds at once. Shared libraries, package binaries (including
+      # CARGO_BIN_EXE helpers), and fingerprints stay for later batches and
+      # the independent debug bench gate. No test result is cached or skipped.
+      - name: Build and run all test targets in batches
+        run: |
+          python3 scripts/ci-resources.py --out "$RUNNER_TEMP/unit-resources/tests" -- \
+            python3 scripts/ci-unit-tests.py --shard-index ${{ strategy.job-index }} --shard-count ${{ strategy.job-total }}
+      - name: Upload test build timings
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: unit-build-timings-${{ matrix.shard }}
+          path: target/cargo-timings/
+          if-no-files-found: ignore
       # scripts/bench emits nine of its lanes with `cargo run --bin
       # emit_preview` — the DEBUG profile — and nothing else in CI did:
       # the site job and bin/rh run `--release`, whose frames are a
@@ -508,11 +647,62 @@ jobs:
       # off the published bench page. This is the harness's own shape,
       # run here so the next one fails a PR instead of a nightly.
       - name: Emit every bench lane in the debug profile (scripts/bench's shape)
+        if: matrix.shard == 0
+        run: |
+          python3 scripts/ci-resources.py --out "$RUNNER_TEMP/unit-resources/bench" -- \
+            bash -euo pipefail -c '
+              test -x target/debug/emit_preview
+              for target in typescript crystal rust python elixir go kotlin swift csharp; do
+                target/debug/emit_preview --target "$target" fixtures/real-blog >/dev/null
+              done
+            '
+      - name: Upload unit resource samples
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: unit-resources-${{ matrix.shard }}
+          path: ${{ runner.temp }}/unit-resources/
+          if-no-files-found: ignore
+
+  # Only selected consumers need this compiler. Produce it without waiting
+  # for fixtures/tests; their success remains independently required at the gate.
+  build-roundhouse:
+    needs: plan
+    if: ${{ contains(fromJSON(needs.plan.outputs.jobs), 'build-roundhouse') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      roundhouse-bin-artifact-id: ${{ steps.roundhouse-bin.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@v2
+      # Keep the historical dev profile for Campfire, not a release substitute.
+      # Consumers must set ROUNDHOUSE_BIN so the harness does not rebuild it.
+      - name: Stage current-run debug roundhouse binary
         run: |
           set -euo pipefail
-          for target in typescript crystal rust python elixir go kotlin swift csharp; do
-            cargo run --quiet --bin emit_preview -- --target "$target" fixtures/real-blog >/dev/null
-          done
+          cargo build --locked --bin roundhouse
+          test -x target/debug/roundhouse
+          mkdir -p roundhouse-debug-bin
+          cp -L target/debug/roundhouse roundhouse-debug-bin/roundhouse
+          chmod +x roundhouse-debug-bin/roundhouse
+          {
+            echo "source_sha=${GITHUB_SHA}"
+            echo "profile=debug"
+            echo "binary=roundhouse"
+            echo "producer_job=build-roundhouse"
+            echo "rustc_host=$(rustc -vV | awk '/^host:/{print $2}')"
+            echo "rustc_release=$(rustc -vV | awk '/^release:/{print $2}')"
+            ./roundhouse-debug-bin/roundhouse --version | sed 's/^/version=/'
+          } | tee roundhouse-debug-bin/identity.txt
+      - name: Upload current-run debug roundhouse binary
+        id: roundhouse-bin
+        uses: actions/upload-artifact@v7
+        with:
+          name: roundhouse-debug-bin
+          path: roundhouse-debug-bin
+          retention-days: 1
 
   # -------------------------------------------------------------------
   # One job per target language. Each generates a project from the
@@ -548,7 +738,7 @@ jobs:
   # NOT from the published archive. Playwright config gates on $CI
   # (GitHub sets it) → fresh server + forbidOnly + github reporter.
   browser-smoke-typescript:
-    needs: [generate-fixture, unit, plan]
+    needs: [generate-fixture, plan]
     if: ${{ contains(fromJSON(needs.plan.outputs.jobs), 'browser-smoke-typescript') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -556,7 +746,7 @@ jobs:
       contents: read
       actions: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Use an explicit browser payload directory
         run: echo "PLAYWRIGHT_BROWSERS_PATH=$RUNNER_TEMP/ci-reuse-browsers" >> "$GITHUB_ENV"
       - uses: ./.github/actions/setup-rust
@@ -567,9 +757,14 @@ jobs:
       - name: Extract fixture
         run: tar -xzf real-blog.tar.gz
       - name: Install Node
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          node-version: '24'
+          # Warm downloads for the generated app, not node_modules or dist.
+          cache: npm
+          cache-dependency-path: |
+            tests/browser_smoke/package-lock.json
+            src/emit/typescript/package.rs
       - name: Install harness deps
         run: npm ci
         working-directory: tests/browser_smoke
@@ -628,7 +823,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           name: roundhouse-wasm
@@ -639,12 +834,12 @@ jobs:
       - name: Extract fixture
         run: tar -xzf real-blog.tar.gz
       - name: Install Node
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          node-version: '24'
       - name: Cache Mastodon source bundle
         id: mastodon-src
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: wasm/ide/app-src.json
           key: mastodon-app-src-${{ env.MASTODON_SHA }}-v2
@@ -661,7 +856,7 @@ jobs:
       # switch (blog + lobsters + mastodon). Mirrors the build-site assembly.
       - name: Cache lobsters source bundle
         id: lobsters-src
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: /tmp/app-lobsters.json
           key: lobsters-app-src-${{ env.RUBY_BENCH_SHA }}-v1
@@ -677,7 +872,7 @@ jobs:
             --open app/controllers/stories_controller.rb
       - name: Cache campfire source bundle
         id: campfire-src
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: /tmp/app-campfire.json
           key: campfire-app-src-${{ env.CAMPFIRE_SHA }}-v1
@@ -774,17 +969,25 @@ jobs:
   # rewiring of the test_helper.
   framework-tests-spinel:
     # Re-enabled 2026-06-17 (5/5 green on matz/spinel master). Advisory.
-    needs: [build-spinel, plan]
-    if: ${{ !cancelled() && contains(fromJSON(needs.plan.outputs.jobs), 'framework-tests-spinel') && needs.build-spinel.outputs.artifact-id != '' }}
+    # Needs the real-blog fixture: date_columns_spinel overlays it.
+    needs: [generate-fixture, build-spinel, plan]
+    if: ${{ !cancelled() && contains(fromJSON(needs.plan.outputs.jobs), 'framework-tests-spinel') && needs.generate-fixture.result == 'success' && needs.build-spinel.outputs.artifact-id != '' }}
     outputs: &advisory-outputs
       execution: ${{ steps.result.outputs.status }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     continue-on-error: true
+    env:
+      MAKEFLAGS: "-j4"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v8
+        with:
+          name: real-blog-fixture
+      - name: Extract fixture
+        run: tar -xzf real-blog.tar.gz
       - uses: actions/download-artifact@v8
         with:
           name: spinel-dist
@@ -793,7 +996,7 @@ jobs:
         run: |
           chmod +x spinel-dist/spinel spinel-dist/spin spinel-dist/spinel_rbs_extract
           echo "$PWD/spinel-dist" >> $GITHUB_PATH
-      # Full runs select all five suites; targeted runs select their owners.
+      # Full runs select all native suites; targeted runs select their owners.
       # Continue after a failing suite without losing its failure status.
       - name: Run selected native framework checks
         env:
@@ -834,7 +1037,8 @@ jobs:
   #
   # Cheap, unlike its lobsters sibling: `campfire-suite` runs the EMIT's
   # own tests, so it needs no Rails bundle and no mise-pinned ruby — just
-  # cargo, ruby, the sqlite3 gem, and the sqlite3 CLI.
+  # the shared debug roundhouse binary (#317), ruby, the sqlite3 gem, and
+  # the sqlite3 CLI.
   # campfire-compare: REAL Rails campfire vs the CRuby-emit lane — the
   # only job that boots Rails campfire. Both lanes start from the same
   # seeded rows and take the same cable walk (sign in through the real
@@ -849,8 +1053,10 @@ jobs:
   # walk against the compiled binary and stay advisory, because spinel
   # is tracked unpinned.
   campfire-compare:
-    needs: [unit, plan]
-    if: ${{ contains(fromJSON(needs.plan.outputs.jobs), 'campfire-compare') }}
+    needs: [build-roundhouse, plan]
+    # Require the producer's debug binary artifact id so a missing
+    # upload cannot skip into a green compact gate (#317).
+    if: ${{ contains(fromJSON(needs.plan.outputs.jobs), 'campfire-compare') && needs.build-roundhouse.outputs.roundhouse-bin-artifact-id != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     services:
@@ -862,12 +1068,29 @@ jobs:
       # so the prepared-tree cache carries the gems with it.
       BUNDLE_PATH: vendor/bundle
     steps:
-      - uses: actions/checkout@v5
-      - uses: ./.github/actions/setup-rust
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@v7
+      # No setup-rust: emission uses the current-run debug binary.
+      - uses: actions/download-artifact@v8
+        with:
+          name: roundhouse-debug-bin
+          path: roundhouse-debug-bin
+      - name: Stage shared debug roundhouse binary
+        run: |
+          set -euo pipefail
+          chmod +x roundhouse-debug-bin/roundhouse
+          test -x roundhouse-debug-bin/roundhouse
+          test -f roundhouse-debug-bin/identity.txt
+          echo "=== producer identity ==="
+          cat roundhouse-debug-bin/identity.txt
+          echo "=== consumer probe ==="
+          ./roundhouse-debug-bin/roundhouse --version
+          grep -q "source_sha=${GITHUB_SHA}" roundhouse-debug-bin/identity.txt
+          grep -q 'profile=debug' roundhouse-debug-bin/identity.txt
+          echo "ROUNDHOUSE_BIN=${GITHUB_WORKSPACE}/roundhouse-debug-bin/roundhouse" >> "$GITHUB_ENV"
+          echo "ROUNDHOUSE_BIN_TRACE=1" >> "$GITHUB_ENV"
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.4'
+          ruby-version: ${{ env.MRI_RUBY }}
       - name: Fetch pinned once-campfire
         run: |
           curl -fsSL "https://codeload.github.com/basecamp/once-campfire/tar.gz/${CAMPFIRE_SHA}" -o /tmp/campfire.tar.gz
@@ -879,13 +1102,14 @@ jobs:
       # app's own hardening line.
       # CRuby binds libvips through FFI; only compiled Spinel needs headers.
       - name: System libvips
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libvips42 sqlite3
+        run: |
+          "$GITHUB_WORKSPACE/scripts/ci-apt-install" libvips42 sqlite3
       - name: Cache the prepared oracle
         id: oracle
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: build/campfire-oracle
-          key: campfire-oracle-${{ env.CAMPFIRE_SHA }}-ruby34-v1
+          key: campfire-oracle-${{ env.CAMPFIRE_SHA }}-ruby${{ env.MRI_RUBY }}-v1
       - name: Prepare the Rails oracle (cache miss)
         if: steps.oracle.outputs.cache-hit != 'true'
         run: scripts/campfire-oracle prepare --app /tmp/campfire
@@ -944,8 +1168,10 @@ jobs:
     outputs:
       artifact-id: ${{ steps.binary.outputs.artifact-id }}
       execution: ${{ steps.result.outputs.status }}
+    env:
+      MAKEFLAGS: "-j4"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@v2
       - uses: actions/download-artifact@v8
@@ -957,7 +1183,8 @@ jobs:
           chmod +x spinel-dist/spinel spinel-dist/spin spinel-dist/spinel_rbs_extract
           echo "$PWD/spinel-dist" >> $GITHUB_PATH
       - name: System libvips + libsqlite3-dev + libjemalloc-dev
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libvips-dev libsqlite3-dev libjemalloc-dev
+        run: |
+          "$GITHUB_WORKSPACE/scripts/ci-apt-install" libvips-dev libsqlite3-dev libjemalloc-dev
       - name: Fetch pinned once-campfire
         run: |
           curl -fsSL "https://codeload.github.com/basecamp/once-campfire/tar.gz/${CAMPFIRE_SHA}" -o /tmp/campfire.tar.gz
@@ -1081,7 +1308,7 @@ jobs:
       verify-gen: ${{ steps.result.outputs.verify-gen }}
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 3
       matrix:
         include:
           - gc: default
@@ -1096,13 +1323,14 @@ jobs:
         ports: ['6379:6379']
     env:
       BUNDLE_PATH: vendor/bundle
+      MAKEFLAGS: "-j4"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@v2
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.4'
+          ruby-version: ${{ env.MRI_RUBY }}
       - uses: actions/download-artifact@v8
         with:
           name: spinel-dist
@@ -1124,17 +1352,18 @@ jobs:
         # this program's allocator and `spin build` links `-ljemalloc`.
         # The DEV package, not libjemalloc2: the runtime library LD_PRELOAD
         # uses cannot be linked against.
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libvips-dev libsqlite3-dev libjemalloc-dev sqlite3
+        run: |
+          "$GITHUB_WORKSPACE/scripts/ci-apt-install" libvips-dev libsqlite3-dev libjemalloc-dev sqlite3
       - name: Fetch pinned once-campfire
         run: |
           curl -fsSL "https://codeload.github.com/basecamp/once-campfire/tar.gz/${CAMPFIRE_SHA}" -o /tmp/campfire.tar.gz
           mkdir -p /tmp/campfire && tar -xzf /tmp/campfire.tar.gz -C /tmp/campfire --strip-components=1
       - name: Cache the prepared oracle
         id: oracle
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: build/campfire-oracle
-          key: campfire-oracle-${{ env.CAMPFIRE_SHA }}-ruby34-v1
+          key: campfire-oracle-${{ env.CAMPFIRE_SHA }}-ruby${{ env.MRI_RUBY }}-v1
       - name: Prepare the Rails oracle (cache miss)
         if: steps.oracle.outputs.cache-hit != 'true'
         run: scripts/campfire-oracle prepare --app /tmp/campfire
@@ -1166,13 +1395,14 @@ jobs:
         ports: ['6379:6379']
     env:
       BUNDLE_PATH: vendor/bundle
+      MAKEFLAGS: "-j4"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@v2
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.4'
+          ruby-version: ${{ env.MRI_RUBY }}
       - uses: actions/download-artifact@v8
         with:
           name: spinel-dist
@@ -1182,17 +1412,18 @@ jobs:
           chmod +x spinel-dist/spinel spinel-dist/spin spinel-dist/spinel_rbs_extract
           echo "$PWD/spinel-dist" >> $GITHUB_PATH
       - name: System libvips + libsqlite3-dev + libjemalloc-dev
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libvips-dev libsqlite3-dev libjemalloc-dev sqlite3
+        run: |
+          "$GITHUB_WORKSPACE/scripts/ci-apt-install" libvips-dev libsqlite3-dev libjemalloc-dev sqlite3
       - name: Fetch pinned once-campfire
         run: |
           curl -fsSL "https://codeload.github.com/basecamp/once-campfire/tar.gz/${CAMPFIRE_SHA}" -o /tmp/campfire.tar.gz
           mkdir -p /tmp/campfire && tar -xzf /tmp/campfire.tar.gz -C /tmp/campfire --strip-components=1
       - name: Cache the prepared oracle
         id: oracle
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: build/campfire-oracle
-          key: campfire-oracle-${{ env.CAMPFIRE_SHA }}-ruby34-v1
+          key: campfire-oracle-${{ env.CAMPFIRE_SHA }}-ruby${{ env.MRI_RUBY }}-v1
       - name: Prepare the Rails oracle (cache miss)
         if: steps.oracle.outputs.cache-hit != 'true'
         run: scripts/campfire-oracle prepare --app /tmp/campfire
@@ -1201,17 +1432,36 @@ jobs:
       - *advisory-result
 
   campfire-conformance:
-    needs: [unit, plan]
-    if: ${{ contains(fromJSON(needs.plan.outputs.jobs), 'campfire-conformance') }}
+    needs: [build-roundhouse, plan]
+    # Require the producer's debug binary artifact id so a missing
+    # upload cannot skip into a green compact gate (#317).
+    if: ${{ contains(fromJSON(needs.plan.outputs.jobs), 'campfire-conformance') && needs.build-roundhouse.outputs.roundhouse-bin-artifact-id != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
-      - uses: ./.github/actions/setup-rust
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@v7
+      # No setup-rust: strict-emit and campfire-suite use the shared debug binary.
+      - uses: actions/download-artifact@v8
+        with:
+          name: roundhouse-debug-bin
+          path: roundhouse-debug-bin
+      - name: Stage shared debug roundhouse binary
+        run: |
+          set -euo pipefail
+          chmod +x roundhouse-debug-bin/roundhouse
+          test -x roundhouse-debug-bin/roundhouse
+          test -f roundhouse-debug-bin/identity.txt
+          echo "=== producer identity ==="
+          cat roundhouse-debug-bin/identity.txt
+          echo "=== consumer probe ==="
+          ./roundhouse-debug-bin/roundhouse --version
+          grep -q "source_sha=${GITHUB_SHA}" roundhouse-debug-bin/identity.txt
+          grep -q 'profile=debug' roundhouse-debug-bin/identity.txt
+          echo "ROUNDHOUSE_BIN=${GITHUB_WORKSPACE}/roundhouse-debug-bin/roundhouse" >> "$GITHUB_ENV"
+          echo "ROUNDHOUSE_BIN_TRACE=1" >> "$GITHUB_ENV"
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.4'
+          ruby-version: ${{ env.MRI_RUBY }}
       # Two gems, from two different places, both needed by a bare
       # `ruby -Itest` — which is how the suite runs each file, so they
       # have to land on the DEFAULT gem path; a bundler-cached
@@ -1340,14 +1590,17 @@ jobs:
       # (rubys/roundhouse#71). This step is the run the ledger's
       # "zero errors" invariant is actually about.
       #
-      # Same profile as the suite's own `cargo run`, so the build is
-      # shared rather than paid twice.
+      # Same debug binary as the suite (ROUNDHOUSE_BIN from build-roundhouse), so the
+      # compiler is shared rather than paid twice (#317).
       - name: Enforce the strict-emit ceiling
         env:
           CEILING_ERRORS: 0
         run: |
           set -uo pipefail
-          cargo run --quiet --bin roundhouse -- \
+          test -n "${ROUNDHOUSE_BIN:-}"
+          test -x "$ROUNDHOUSE_BIN"
+          # Never cargo run: prove the producer binary is the one that emits.
+          "$ROUNDHOUSE_BIN" \
             --target spinel /tmp/campfire -o /tmp/campfire-spinel \
             > /tmp/campfire-strict.log 2>&1
           errors=$(grep -c 'error\[' /tmp/campfire-strict.log || true)
@@ -1589,7 +1842,7 @@ jobs:
       # failed.
       - name: Upload the tally
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: campfire-conformance-tally
           path: /tmp/campfire-tally.txt
@@ -1654,8 +1907,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     continue-on-error: true
+    env:
+      MAKEFLAGS: "-j4"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@v2
       - uses: actions/download-artifact@v8
@@ -1679,11 +1934,18 @@ jobs:
           "$GITHUB_WORKSPACE/scripts/ci-apt-install" libsqlite3-dev libjemalloc-dev
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.4'
+          ruby-version: ${{ env.MRI_RUBY }}
           bundler-cache: true
           working-directory: ./runtime/spinel/scaffold
       - name: cargo test --test spinel_toolchain -- --ignored
         run: cargo test --test spinel_toolchain -- --ignored --nocapture
+      # fixtures/tiny-api, the API-only app (#321): `spin build` of the
+      # app entry, HTTP requests to the binary, and the model script
+      # compiled natively. Filtered by name, so the ignored test named
+      # after an open issue (#163) is not selected.
+      - name: cargo test --test tiny_api spinel_gate_ -- --ignored
+        if: ${{ !cancelled() }}
+        run: cargo test --test tiny_api spinel_gate_ -- --ignored --nocapture
 
       # On failure, capture spinel's actual generated C for the failing
       # controller test. The failure is at RUNTIME (the C compiles under
@@ -1746,7 +2008,7 @@ jobs:
   # below: two setup-ruby steps / an extra build-spinel dependency don't
   # fit this shape.
   compare:
-    needs: [generate-fixture, unit, plan]
+    needs: [generate-fixture, plan]
     if: ${{ contains(fromJSON(needs.plan.outputs.jobs), 'compare') }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -1759,7 +2021,7 @@ jobs:
       matrix:
         target: [rust, typescript]
     steps: &compare-steps
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@v2
       - uses: actions/download-artifact@v8
@@ -1777,13 +2039,13 @@ jobs:
           crystal: latest
       - name: Install JDK (Kotlin)
         if: matrix.target == 'kotlin'
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '21'
       - name: Install Gradle (Kotlin)
         if: matrix.target == 'kotlin'
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v5
         with:
           gradle-version: '9.5.1'
       - name: Install Swift
@@ -1795,19 +2057,32 @@ jobs:
         if: matrix.target == 'swift'
         run: |
           "$GITHUB_WORKSPACE/scripts/ci-apt-install" libsqlite3-dev
+      - &swiftpm-cache
+        name: Cache SwiftPM checkouts
+        if: matrix.target == 'swift'
+        uses: actions/cache@v6
+        with:
+          # Cloned Hummingbird/NIO trees. Object files stay per-package in
+          # .build/; sharing those across emit dirs is not reliable.
+          path: |
+            ~/.cache/org.swift.swiftpm
+            ~/.swiftpm
+          key: swiftpm-${{ runner.os }}-${{ runner.arch }}-swift6.1-${{ hashFiles('src/emit/swift/package.rs') }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-${{ runner.arch }}-swift6.1-
       - name: Install .NET (C#)
         if: matrix.target == 'csharp'
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: '10.0.x'
       - name: Install Node (TypeScript)
         if: matrix.target == 'typescript'
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          node-version: '24'
       - name: Install Go
         if: matrix.target == 'go'
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version: '1.24'
           cache: false
@@ -1819,16 +2094,18 @@ jobs:
           otp-version: '27'
       - name: Install Python
         if: matrix.target == 'python'
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: '3.14'
       - name: Install uv (Python)
         if: matrix.target == 'python'
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@v10.2.0
+        with:
+          cache-dependency-glob: src/emit/python/pyproject.rs
       # setup-ruby LAST — see the job comment (MRI 3.4 must win PATH).
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.4'
+          ruby-version: ${{ env.MRI_RUBY }}
           bundler-cache: true
           working-directory: ./fixtures/real-blog
       # Not separate jobs: each target's framework-tests and toolchain suites ride the compare job that already installs its toolchain (#273).
@@ -1858,7 +2135,11 @@ jobs:
         run: cargo test --test framework_tests_kotlin -- --ignored --nocapture
       - name: cargo test --test framework_tests_swift
         if: ${{ !cancelled() && matrix.target == 'swift' }}
-        run: cargo test --test framework_tests_swift -- --ignored --nocapture
+        run: |
+          # scripts/compare then runs emit_preview; compiling it here reuses
+          # the libroundhouse just built for the test harness.
+          cargo build --bin emit_preview --quiet
+          cargo test --test framework_tests_swift -- --ignored --nocapture
       - name: cargo test --test typescript_toolchain real_blog -- --ignored
         if: ${{ !cancelled() && matrix.target == 'typescript' }}
         run: cargo test --test typescript_toolchain real_blog -- --ignored --nocapture
@@ -1890,10 +2171,11 @@ jobs:
         run: scripts/compare ${{ matrix.target }}
 
   # Same commands, distinct result: extra-target failures must not be confused
-  # with the Rust/TypeScript publication floor. Anchors preserve physical job
-  # names used by the existing strict PR-local execution receipts.
+  # with the compact publication floor (Ruby, plus Rust/TypeScript when those
+  # jobs are selected). Anchors preserve physical job names used by the
+  # existing strict PR-local execution receipts.
   compare-extra:
-    needs: [generate-fixture, unit, plan]
+    needs: [generate-fixture, plan]
     if: ${{ contains(fromJSON(needs.plan.outputs.jobs), 'compare-extra') }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -1902,7 +2184,7 @@ jobs:
       actions: read
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 7
       matrix:
         target: ${{ fromJSON(needs.plan.outputs.extra-compare) }}
     steps: *compare-steps
@@ -1914,12 +2196,12 @@ jobs:
   # for tailwindcss asset compilation; no target compile step
   # (Ruby is interpreted).
   compare-ruby:
-    needs: [generate-fixture, unit, plan]
+    needs: [generate-fixture, plan]
     if: ${{ contains(fromJSON(needs.plan.outputs.jobs), 'compare-ruby') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@v2
       - uses: actions/download-artifact@v8
@@ -1929,23 +2211,28 @@ jobs:
         run: tar -xzf real-blog.tar.gz
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.4'
+          ruby-version: ${{ env.MRI_RUBY }}
           bundler-cache: true
           working-directory: ./fixtures/real-blog
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.4'
+          ruby-version: ${{ env.MRI_RUBY }}
           bundler-cache: true
           working-directory: ./runtime/spinel/scaffold
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          node-version: '24'
       # Not a separate job: framework-tests-ruby needs this same MRI + scaffold bundle (#273).
       - name: cargo test --test framework_tests_ruby -- --ignored
         run: cargo test --test framework_tests_ruby -- --ignored --nocapture
       - name: cargo test --test uuid_key_ruby -- --ignored
         if: ${{ !cancelled() }}
         run: cargo test --test uuid_key_ruby -- --ignored --nocapture
+      # Only the passing CRuby cases: tests named after an open issue are
+      # ignored too, and a blanket --ignored would select them (#321).
+      - name: cargo test --test tiny_api cruby_gate_ -- --ignored
+        if: ${{ !cancelled() }}
+        run: cargo test --test tiny_api cruby_gate_ -- --ignored --nocapture
       - name: scripts/compare ruby
         if: ${{ !cancelled() }}
         run: scripts/compare ruby
@@ -1960,12 +2247,12 @@ jobs:
   # assets aren't built (the DOM diff compares asset tags, not files —
   # see scripts/compare's jruby branch).
   compare-jruby:
-    needs: [generate-fixture, unit, plan]
+    needs: [generate-fixture, plan]
     if: ${{ contains(fromJSON(needs.plan.outputs.jobs), 'compare-jruby') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@v2
       - uses: actions/download-artifact@v8
@@ -1975,20 +2262,37 @@ jobs:
         run: tar -xzf real-blog.tar.gz
       # JRuby 10 requires Java 21+ (it refuses to boot on older JDKs).
       # setup-ruby provisions JRuby but not the JDK, so pin Java first.
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '21'
-      # JRuby provisioning only — no bundler-cache. The committed scaffold
+      # No scaffold bundler-cache. The committed scaffold
       # Gemfile is MRI-only (`gem "sqlite3"`), so it can't be bundled under
       # JRuby; `scripts/compare jruby` resolves the JRuby bundle
       # (jdbc-sqlite3) against the emitted tree's own Gemfile instead.
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: 'jruby-10.0'
+      - name: JDBC statement cleanup and ownership
+        run: |
+          jruby -S gem install jdbc-sqlite3 --no-document
+          jruby tests/support/jdbc_cleanup_failures.rb
+          # These shared ownership cases need no Db.bind_* setters.
+          jruby -r ./runtime/spinel/db_jruby -r ./runtime/spinel/test/statement_cache_cases <<'RUBY'
+          Db.configure(":memory:", pool_size: 1)
+          begin
+            cases = StatementCacheTest.new
+            cases.test_nested_identical_sql
+            cases.test_overlapping_replay_promotions
+            cases.test_lease_cleans_abandoned_replay
+            puts "jdbc ownership: 3 cases passed"
+          ensure
+            Db.close
+          end
+          RUBY
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.4'
+          ruby-version: ${{ env.MRI_RUBY }}
           bundler-cache: true
           working-directory: ./fixtures/real-blog
       - name: scripts/compare jruby
@@ -2012,7 +2316,7 @@ jobs:
     timeout-minutes: 30
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@v2
       - uses: actions/download-artifact@v8
@@ -2033,17 +2337,17 @@ jobs:
           "$GITHUB_WORKSPACE/scripts/ci-apt-install" libsqlite3-dev libjemalloc-dev
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.4'
+          ruby-version: ${{ env.MRI_RUBY }}
           bundler-cache: true
           working-directory: ./fixtures/real-blog
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.4'
+          ruby-version: ${{ env.MRI_RUBY }}
           bundler-cache: true
           working-directory: ./runtime/spinel/scaffold
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          node-version: '24'
       - name: scripts/compare spinel
         run: scripts/compare spinel
       - *advisory-result
@@ -2095,11 +2399,11 @@ jobs:
       actions: read
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 6
       matrix:
         target: ${{ fromJSON(needs.plan.outputs.smoke) }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Use an explicit browser payload directory
         run: echo "PLAYWRIGHT_BROWSERS_PATH=$RUNNER_TEMP/ci-reuse-browsers" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v8
@@ -2119,13 +2423,13 @@ jobs:
           crystal: latest
       - name: Install JDK (Kotlin, JRuby)
         if: matrix.target == 'kotlin' || matrix.target == 'jruby'
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '21'
       - name: Install Gradle (Kotlin)
         if: matrix.target == 'kotlin'
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v5
         with:
           gradle-version: '9.5.1'
       - name: Install Swift
@@ -2137,14 +2441,15 @@ jobs:
         if: matrix.target == 'swift'
         run: |
           "$GITHUB_WORKSPACE/scripts/ci-apt-install" libsqlite3-dev
+      - *swiftpm-cache
       - name: Install .NET (C#)
         if: matrix.target == 'csharp'
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: '10.0.x'
       - name: Install Go
         if: matrix.target == 'go'
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version: '1.24'
           cache: false
@@ -2156,25 +2461,48 @@ jobs:
           otp-version: '27'
       - name: Install Python
         if: matrix.target == 'python'
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: '3.14'
       - name: Install uv (Python)
         if: matrix.target == 'python'
-        uses: astral-sh/setup-uv@v7
-      - name: Install Ruby (MRI 3.4)
+        uses: astral-sh/setup-uv@v10.2.0
+        with:
+          cache-dependency-glob: src/emit/python/pyproject.rs
+      # Use setup-ruby's existing compiled-gem cache and identity, not a second
+      # download-only cache. Smoke still extracts afresh and runs bundle install.
+      - name: Prepare archive bundle cache inputs
+        if: matrix.target == 'ruby' || matrix.target == 'jruby'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/smoke-bundle-source"
+          tar -xzf "browse/$TARGET.tgz" -C "$RUNNER_TEMP/smoke-bundle-source"
+          # JRuby deliberately has no MRI lock; setup-ruby resolves its own.
+          test -f "$RUNNER_TEMP/smoke-bundle-source/$TARGET/Gemfile"
+      - name: Install Ruby (MRI)
         if: matrix.target == 'ruby'
         uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.4'
+          ruby-version: ${{ env.MRI_RUBY }}
+          bundler-cache: true
+          working-directory: ${{ runner.temp }}/smoke-bundle-source/${{ matrix.target }}
       - name: Install JRuby 10
         if: matrix.target == 'jruby'
         uses: ruby/setup-ruby@v1
         with:
           ruby-version: 'jruby-10.0'
-      - uses: actions/setup-node@v5
+          bundler-cache: true
+          working-directory: ${{ runner.temp }}/smoke-bundle-source/${{ matrix.target }}
+      - name: Reuse prepared gems in the fresh README smoke
+        if: matrix.target == 'ruby' || matrix.target == 'jruby'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: echo "BUNDLE_PATH=$RUNNER_TEMP/smoke-bundle-source/$TARGET/vendor/bundle" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          node-version: '24'
       - name: Pre-warm Playwright (chromium + system deps)
         run: |
           cd e2e
@@ -2248,8 +2576,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     continue-on-error: true
+    env:
+      MAKEFLAGS: "-j4"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           name: browse-archives
@@ -2265,9 +2595,9 @@ jobs:
       - name: Install libsqlite3-dev + libjemalloc-dev
         run: |
           "$GITHUB_WORKSPACE/scripts/ci-apt-install" libsqlite3-dev libjemalloc-dev
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          node-version: '24'
       - name: Pre-warm Playwright (chromium + system deps)
         run: |
           cd e2e
@@ -2332,13 +2662,15 @@ jobs:
     # 26 of its 30 minutes on 2026-09-12 (run 34725916085). A publish
     # that times out four minutes short is a flake waiting to happen.
     timeout-minutes: 60
+    env:
+      MAKEFLAGS: "-j4"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@v2
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.4'
+          ruby-version: ${{ env.MRI_RUBY }}
       - uses: actions/download-artifact@v8
         continue-on-error: true
         with:
@@ -2389,6 +2721,14 @@ jobs:
   # sign-in, `/first_run` renders, and `/account/logo` -- a source-path
   # read the sign-in page triggers -- is found. Advisory like every
   # spinel job.
+  #
+  # Hosted rebuild is dominated by compiling pack/ (~95 s). The two apt
+  # layers (~30–38 s, parallel, ~460 MB BuildKit export) are reused for
+  # an eight-hour window via a local BuildKit cache under actions/cache.
+  # A new spin pack still recompiles; the three HTTP checks always run.
+  # A docker-container Buildx builder exports type=local on hosted
+  # runners (default docker driver may not); the image is still loaded
+  # and tagged `campfire` so docker run matches the README install.
   smoke-campfire-docker:
     needs: [build-campfire-archive, plan]
     if: ${{ !cancelled() && contains(fromJSON(needs.plan.outputs.jobs), 'smoke-campfire-docker') && needs.build-campfire-archive.result == 'success' }}
@@ -2397,11 +2737,28 @@ jobs:
     timeout-minutes: 30
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           name: campfire-archive
           path: campfire
+      - name: Campfire Docker apt cache window
+        id: apt-window
+        # UTC epoch / 28800 → eight-hour buckets. Primary key only: a miss
+        # re-resolves Debian packages instead of carrying an older bucket
+        # forward. runner.temp is set via $RUNNER_TEMP (job env cannot use
+        # the runner context).
+        run: |
+          echo "bucket=$(( $(date -u +%s) / 28800 ))" >> "$GITHUB_OUTPUT"
+          echo "CAMPFIRE_DOCKER_CACHE=$RUNNER_TEMP/campfire-docker-buildkit" >> "$GITHUB_ENV"
+      - name: Restore Campfire Docker apt layers
+        id: docker-cache
+        # Fail-open: a cache outage must not skip the README build.
+        continue-on-error: true
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.CAMPFIRE_DOCKER_CACHE }}
+          key: campfire-docker-apt-${{ runner.os }}-${{ runner.arch }}-${{ steps.apt-window.outputs.bucket }}-v1
       - name: Build and run the image
         id: smoke
         run: |
@@ -2412,7 +2769,23 @@ jobs:
           fi
           tar xzf campfire/docker.tgz
           cd campfire-docker
-          docker build -t campfire .
+          cache_args=()
+          if [ -d "$CAMPFIRE_DOCKER_CACHE" ] && [ -n "$(ls -A "$CAMPFIRE_DOCKER_CACHE" 2>/dev/null || true)" ]; then
+            cache_args+=(--cache-from "type=local,src=$CAMPFIRE_DOCKER_CACHE")
+          fi
+          # Export after the build so a later successful save can seed the
+          # next run. mode=max keeps intermediate build-apt when pack/ changes.
+          # ignore-error: cache export must not abort the HTTP checks.
+          mkdir -p "$CAMPFIRE_DOCKER_CACHE"
+          cache_args+=(--cache-to "type=local,dest=$CAMPFIRE_DOCKER_CACHE,mode=max,ignore-error=true")
+          # docker-container builder supports local cache export on the
+          # hosted runner's default daemon. --load tags `campfire` so the
+          # subsequent docker run matches the README install path.
+          if ! docker buildx inspect campfire-docker-cache >/dev/null 2>&1; then
+            docker buildx create --name campfire-docker-cache --driver docker-container >/dev/null
+          fi
+          docker buildx use campfire-docker-cache
+          docker buildx build --load -t campfire "${cache_args[@]}" .
           docker run -d --name campfire -p 3000:3000 campfire
           for i in $(seq 1 30); do
             curl -sf -o /dev/null localhost:3000/first_run && break
@@ -2427,6 +2800,15 @@ jobs:
           docker logs campfire
           docker rm -f campfire >/dev/null
           [ "$root" = 302 ] && [ "$first" = 200 ] && [ "$logo" = 200 ]
+      - name: Save Campfire Docker apt layers
+        # Only after a green smoke, and only when the primary key missed —
+        # an exact hit already holds this window's layers. Fail-open.
+        if: steps.smoke.outcome == 'success' && steps.docker-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.CAMPFIRE_DOCKER_CACHE }}
+          key: campfire-docker-apt-${{ runner.os }}-${{ runner.arch }}-${{ steps.apt-window.outputs.bucket }}-v1
       - name: Record byte-specific archive validation
         if: always()
         env:
@@ -2465,8 +2847,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     continue-on-error: true
+    env:
+      MAKEFLAGS: "-j4"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           name: campfire-archive
@@ -2484,9 +2868,9 @@ jobs:
         # declares image variants), and the package links -lvips.
         run: |
           "$GITHUB_WORKSPACE/scripts/ci-apt-install" libsqlite3-dev libjemalloc-dev libvips-dev
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          node-version: '24'
       - name: Pre-warm Playwright (chromium + system deps)
         run: |
           cd e2e/campfire
@@ -2537,7 +2921,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@v2
       - uses: actions/download-artifact@v8
@@ -2572,13 +2956,18 @@ jobs:
       # and preserves subdirs, so controllers/*.js land at
       # static/assets/controllers/*.js — matching the `controllers/*` pins.
       - name: Install Node
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          node-version: '24'
+          # Also warm the live demo's downloads; always build current output.
+          cache: npm
+          cache-dependency-path: |
+            e2e/package-lock.json
+            src/emit/typescript/package.rs
       - name: Install Ruby (for the turbo-rails / stimulus-rails JS bundles)
         uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.4'
+          ruby-version: ${{ env.MRI_RUBY }}
           bundler-cache: true
           working-directory: ./runtime/spinel/scaffold
       - name: Build static asset graph for archives
@@ -2682,7 +3071,7 @@ jobs:
       - name: Cache Mastodon source bundle
         if: needs.plan.outputs.site == 'true'
         id: mastodon-src-site
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: wasm/ide/app-src.json
           key: mastodon-app-src-${{ env.MASTODON_SHA }}-v2
@@ -2714,7 +3103,7 @@ jobs:
       - name: Cache lobsters source bundle
         if: needs.plan.outputs.site == 'true'
         id: lobsters-src-site
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: /tmp/app-lobsters.json
           key: lobsters-app-src-${{ env.RUBY_BENCH_SHA }}-v1
@@ -2731,7 +3120,7 @@ jobs:
       - name: Cache campfire source bundle
         if: needs.plan.outputs.site == 'true'
         id: campfire-src-site
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: /tmp/app-campfire.json
           key: campfire-app-src-${{ env.CAMPFIRE_SHA }}-v1
@@ -3026,7 +3415,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Collect this run's archive evidence
         continue-on-error: true
         uses: actions/download-artifact@v8
@@ -3060,10 +3449,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.4'
+          ruby-version: ${{ env.MRI_RUBY }}
       - uses: actions/download-artifact@v8
         with:
           name: site-base
@@ -3147,14 +3536,18 @@ jobs:
         run: echo 'ready=true' >> "$GITHUB_OUTPUT"
 
   compact-required:
-    needs: [plan, generate-fixture, unit, store-check, compare, compare-ruby, browser-smoke-typescript, campfire-conformance, campfire-compare]
-    if: always()
+    # compare and browser-smoke-typescript stay in needs so a full/main run
+    # can still require them. Unselected PR skips must not fail this gate.
+    # cancelled() overrides GitHub's implicit success(): evaluate skipped
+    # or failed needs, but do not schedule gates after workflow cancellation.
+    needs: [plan, generate-fixture, unit, build-roundhouse, store-check, compare, compare-ruby, browser-smoke-typescript, campfire-conformance, campfire-compare]
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       passed: ${{ steps.gate.outputs.passed }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Require every selected compact check to succeed
         id: gate
         env:
@@ -3167,14 +3560,15 @@ jobs:
   # Informational validation summary; no branch-protection or merge policy.
   ci-summary:
     name: CI summary
-    needs: [plan, generate-fixture, unit, store-check, compare, compare-ruby, browser-smoke-typescript, campfire-conformance, campfire-compare, compact-required, compare-extra, compare-jruby, build-wasm, browser-smoke-ide, build-site, smoke, writebook-inventory, build-spinel, framework-tests-spinel, build-campfire-compare-spinel, campfire-compare-spinel, campfire-db-differential-spinel, toolchain-spinel, compare-spinel, smoke-spinel, build-campfire-archive, smoke-campfire, smoke-campfire-docker, archive-results, assemble-site]
-    if: always()
+    needs: [plan, generate-fixture, unit, build-roundhouse, store-check, compare, compare-ruby, browser-smoke-typescript, campfire-conformance, campfire-compare, compact-required, compare-extra, compare-jruby, build-wasm, browser-smoke-ide, build-site, smoke, writebook-inventory, build-spinel, framework-tests-spinel, build-campfire-compare-spinel, campfire-compare-spinel, campfire-db-differential-spinel, toolchain-spinel, compare-spinel, smoke-spinel, build-campfire-archive, smoke-campfire, smoke-campfire-docker, archive-results, assemble-site]
+    # Report selected failures and expected skips; stop on workflow cancellation.
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       complete: ${{ steps.gate.outputs.complete }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Report missing, skipped or failed selected checks
         id: gate
         env:

@@ -14,12 +14,26 @@ use crate::{ClassId, Symbol};
 use super::expr::ingest_expr;
 use super::util::{
     class_name_path, collect_comments, constant_id_str, constant_path_of, drain_comments_before,
-    find_all_classes_with_scope, find_first_class, flatten_statements, source_has_blank_line,
+    find_all_classes_with_nesting, flatten_statements, source_has_blank_line,
     symbol_list_style, symbol_list_value, symbol_value,
 };
 use super::{IngestError, IngestResult};
 
 pub fn ingest_controller(source: &[u8], file: &str) -> IngestResult<Option<Controller>> {
+    Ok(ingest_controller_with_nesting(source, file)?.map(|(controller, _)| controller))
+}
+
+/// `ingest_controller`, plus the lexical nesting the superclass is
+/// looked up in (`Module.nesting` at the `class` keyword, innermost
+/// first). `Controller` doesn't carry it, and the name can't stand in
+/// for it: `class Admin::XController < BaseController` at top level
+/// looks up `::BaseController`, while the same class written inside
+/// `module Admin` looks up `Admin::BaseController` first. Empty when
+/// the superclass is rooted (`< ::BaseController`).
+pub(super) fn ingest_controller_with_nesting(
+    source: &[u8],
+    file: &str,
+) -> IngestResult<Option<(Controller, Vec<String>)>> {
     super::sources::register(file, &String::from_utf8_lossy(source));
     let result = super::prism::parse(source, file);
     let root = result.node();
@@ -29,10 +43,13 @@ pub fn ingest_controller(source: &[u8], file: &str) -> IngestResult<Option<Contr
     // is the class whose name ends in `Controller`, not the first
     // class in the file; picking the first ingests an empty error
     // class as the controller and drops every real action (so its
-    // view ivars never resolve). Fall back to the first class when no
-    // name matches the convention.
-    let all_classes = find_all_classes_with_scope(&root);
-    let chosen_idx = all_classes.iter().position(|(_, c)| {
+    // view ivars never resolve). When no name matches, fall back to
+    // the first class that descends from a controller base — so
+    // nested `Admin::Base < ApplicationController` keeps filter
+    // ancestry, while concern-nested `T::Struct` VOs and other plain
+    // objects return `None` for the library/concern path.
+    let all_classes = find_all_classes_with_nesting(&root);
+    let chosen_idx = all_classes.iter().position(|(_, _, c)| {
         class_name_path(c)
             .and_then(|p| p.last().cloned())
             .is_some_and(|last| last.ends_with("Controller"))
@@ -45,9 +62,9 @@ pub fn ingest_controller(source: &[u8], file: &str) -> IngestResult<Option<Contr
     // path below has no principled sibling/controller split), and only
     // the empty-body + explicit-superclass shape; anything richer
     // stays dropped as before.
-    let mut sibling_classes: Vec<(Symbol, Symbol)> = Vec::new();
+    let mut sibling_classes: Vec<crate::dialect::SiblingClass> = Vec::new();
     if chosen_idx.is_some() {
-        for (i, (scope, c)) in all_classes.iter().enumerate() {
+        for (i, (scope, _, c)) in all_classes.iter().enumerate() {
             if Some(i) == chosen_idx || !scope.is_empty() {
                 continue;
             }
@@ -58,15 +75,15 @@ pub fn ingest_controller(source: &[u8], file: &str) -> IngestResult<Option<Contr
                 continue;
             }
             let Some(path) = class_name_path(c) else { continue };
-            let Some(parent_path) =
-                c.superclass().and_then(|n| constant_path_of(&n))
-            else {
+            let Some(super_node) = c.superclass() else { continue };
+            let Some(parent_path) = constant_path_of(&super_node) else {
                 continue;
             };
-            sibling_classes.push((
-                Symbol::from(path.join("::")),
-                Symbol::from(parent_path.join("::")),
-            ));
+            sibling_classes.push(crate::dialect::SiblingClass {
+                name: Symbol::from(path.join("::")),
+                parent: Symbol::from(parent_path.join("::")),
+                parent_span: super::util::node_span(&super_node, file),
+            });
         }
     }
     // Keep the enclosing module scope with the chosen class:
@@ -74,15 +91,20 @@ pub fn ingest_controller(source: &[u8], file: &str) -> IngestResult<Option<Contr
     // `Admin::StatusesController`, not collide with the top-level
     // `StatusesController` (which merges two controllers' actions and
     // poisons both metas' ivar seeding).
-    let (scope, class) = match chosen_idx {
+    let (scope, nesting, class) = match chosen_idx {
         Some(i) => {
-            let (s, c) = all_classes.into_iter().nth(i).expect("chosen index in range");
-            (s, Some(c))
+            let (s, n, c) = all_classes.into_iter().nth(i).expect("chosen index in range");
+            (s, n, Some(c))
         }
-        None => match all_classes.into_iter().next() {
-            Some((s, c)) => (s, Some(c)),
-            None => (Vec::new(), find_first_class(&root)),
-        },
+        None => {
+            match all_classes
+                .into_iter()
+                .find(|(_, _, c)| descends_from_controller(c))
+            {
+                Some((s, n, c)) => (s, n, Some(c)),
+                None => (Vec::new(), Vec::new(), None),
+            }
+        }
     };
     let Some(class) = class else {
         return Ok(None);
@@ -94,13 +116,25 @@ pub fn ingest_controller(source: &[u8], file: &str) -> IngestResult<Option<Contr
         message: "controller class name must be a simple constant or path".into(),
     })?);
 
+    let parent_span = class
+        .superclass()
+        .map(|n| super::util::node_span(&n, file))
+        .unwrap_or_default();
     let parent = class.superclass().and_then(|n| {
         constant_path_of(&n).map(|p| ClassId(Symbol::from(p.join("::"))))
     });
+    // `< ::BaseController` names the top level whatever the nesting;
+    // the path above has already dropped the leading `::`.
+    let rooted = class
+        .superclass()
+        .and_then(|n| n.as_constant_path_node().map(|p| p.parent().is_none()))
+        .unwrap_or(false);
+    let nesting = if rooted { Vec::new() } else { nesting };
 
     let mut comments = collect_comments(&result);
     drain_comments_before(&mut comments, class.location().start_offset());
     let mut body_items: Vec<ControllerBodyItem> = Vec::new();
+    let owner = ClassId(Symbol::from(name_path.join("::")));
     let mut layout = LayoutDecl::Inherit;
     if let Some(class_body) = class.body() {
         let mut prev_end: Option<usize> = None;
@@ -144,6 +178,57 @@ pub fn ingest_controller(source: &[u8], file: &str) -> IngestResult<Option<Contr
                 prev_end = Some(stmt.location().end_offset());
                 continue;
             }
+            // Class-side methods: `def self.x`, and every `def` in a
+            // `class << self`. They are methods of the controller CLASS,
+            // not actions — read as actions (as a `def self.x` used to
+            // be) they became instance methods, and a `class << self`
+            // block reached the expression ingester, which refused it.
+            let class_side = if let Some(def) = stmt.as_def_node() {
+                def.receiver()
+                    .is_some_and(|r| r.as_self_node().is_some())
+                    .then(|| super::library_class::ingest_library_method(&def, &owner, file))
+                    .map(|m| m.map(|m| (vec![m], Vec::new())))
+            } else if let Some(sc) = stmt.as_singleton_class_node() {
+                Some(
+                    super::singleton_class::ingest_singleton_body(&sc, &owner, file, &|def| {
+                        super::library_class::ingest_library_method(def, &owner, file)
+                    })
+                    .map(|b| (b.methods, b.class_body)),
+                )
+            } else {
+                None
+            };
+            if let Some(result) = class_side {
+                match result {
+                    Ok((methods, class_body)) => {
+                        let mut leading = leading;
+                        let mut blank = leading_blank;
+                        let items = methods
+                            .into_iter()
+                            .map(|method| ControllerBodyItem::ClassMethod {
+                                configuration_slot: None,
+                                configuration_role: None,
+                                method,
+                                leading_comments: Vec::new(),
+                                leading_blank_line: false,
+                            })
+                            .chain(class_body.into_iter().map(|expr| ControllerBodyItem::Unknown {
+                                expr,
+                                leading_comments: Vec::new(),
+                                leading_blank_line: false,
+                            }));
+                        for mut item in items {
+                            *item.leading_comments_mut() = std::mem::take(&mut leading);
+                            item.set_leading_blank_line(std::mem::take(&mut blank));
+                            body_items.push(item);
+                        }
+                    }
+                    Err(err) if super::survey::is_active() => super::survey::record(&err),
+                    Err(err) => return Err(err),
+                }
+                prev_end = Some(stmt.location().end_offset());
+                continue;
+            }
             // Survey mode: an unsupported item costs itself, not the whole
             // controller — record the gap and keep walking (same gate as
             // the model walk; see ingest/model.rs). Strict mode aborts.
@@ -183,13 +268,17 @@ pub fn ingest_controller(source: &[u8], file: &str) -> IngestResult<Option<Contr
         }
     }
 
-    Ok(Some(Controller {
-        name: ClassId(Symbol::from(name_path.join("::"))),
-        parent,
-        body: body_items,
-        layout,
-        sibling_classes,
-    }))
+    Ok(Some((
+        Controller {
+            name: ClassId(Symbol::from(name_path.join("::"))),
+            parent,
+            parent_span,
+            body: body_items,
+            layout,
+            sibling_classes,
+        },
+        nesting,
+    )))
 }
 
 /// Recognize a `layout` class-body call. Returns `Some(decl)` if this
@@ -544,14 +633,14 @@ pub const VERIFY_AUTHENTICITY_TOKEN: &str = "verify_authenticity_token";
 /// `protect_from_forgery with: :exception, unless: -> { … }` /
 /// `skip_forgery_protection only: […]` → the filter Rails registers.
 ///
-/// Only the `:exception` strategy is modeled. Rails' bare
-/// `protect_from_forgery` defaults to `:null_session` (the request runs
-/// with an empty session), and `:reset_session` clears it; neither is a
-/// 422, and lowering them as one would turn a request Rails lets through
-/// into a failure. Those forms, a `prepend:` (which moves the callback
-/// to the head of the chain) and a custom `store:` return `None`, so the
-/// call stays a controller-body macro and the unrecognized-macro survey
-/// names it.
+/// `protect_from_forgery` / `skip_forgery_protection` → the filter Rails
+/// registers on `verify_authenticity_token`.
+///
+/// Rails' handler for an unverified request depends on `with:`
+/// (`:exception` 422, `:null_session` empty session, `:reset_session`
+/// wipe). This runtime has one handler — 422 — so every known strategy
+/// registers the same before/skip filter. A `prepend:` or custom
+/// `store:` still returns `None` (unrecognized-macro survey).
 fn parse_forgery_macro(
     call: &ruby_prism::CallNode<'_>,
     protect: bool,
@@ -567,7 +656,7 @@ fn parse_forgery_macro(
     let mut unless_cond: Option<Symbol> = None;
     let mut if_cond_expr: Option<Expr> = None;
     let mut unless_cond_expr: Option<Expr> = None;
-    let mut exception_strategy = false;
+    let mut known_with = true;
 
     for arg in call.arguments().iter().flat_map(|a| a.arguments().iter()) {
         let kh = arg.as_keyword_hash_node()?;
@@ -577,7 +666,10 @@ fn parse_forgery_macro(
             let value = assoc.value();
             match key.as_str() {
                 "with" if protect => {
-                    exception_strategy = symbol_value(&value).as_deref() == Some("exception");
+                    known_with = matches!(
+                        symbol_value(&value).as_deref(),
+                        Some("exception" | "null_session" | "reset_session")
+                    );
                 }
                 "only" => {
                     only = symbol_list_value(&value);
@@ -607,7 +699,7 @@ fn parse_forgery_macro(
             }
         }
     }
-    if protect && !exception_strategy {
+    if protect && !known_with {
         return None;
     }
 
@@ -884,4 +976,16 @@ pub fn render_template_name(args: &[Expr]) -> Option<Symbol> {
         }),
         _ => None,
     }
+}
+
+/// Whether `class`'s superclass names a controller: anything under
+/// `ActionController::` (`Base`, `API`, `Metal`), or a constant whose
+/// last segment ends in `Controller` (`ApplicationController`,
+/// `Admin::SectionController`).
+fn descends_from_controller(class: &ruby_prism::ClassNode<'_>) -> bool {
+    let Some(parent) = class.superclass().and_then(|n| constant_path_of(&n)) else {
+        return false;
+    };
+    parent.first().is_some_and(|s| s == "ActionController")
+        || parent.last().is_some_and(|s| s.ends_with("Controller"))
 }

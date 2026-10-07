@@ -44,6 +44,12 @@ pub struct Model {
     /// the Ruby emitter reproduces the source's superclass verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<ClassId>,
+    /// Span of the superclass constant path (`< ActionController::RoutingError`),
+    /// when the parent was a source Const. Synthetic when the parent was
+    /// synthesized or absent — the ruby-family availability gate skips
+    /// synthetic loci.
+    #[serde(default, skip_serializing_if = "Span::is_synthetic")]
+    pub parent_span: Span,
     pub table: TableRef,
     /// The column named by `self.primary_key = "…"`, when the model
     /// overrides Rails' `id` default. `None` means `id`.
@@ -85,6 +91,20 @@ pub struct Model {
     /// attribute starts at, which Rails prefers over the column default.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub enum_defaults: IndexMap<Symbol, crate::expr::Literal>,
+
+    /// `mattr_*` / `cattr_*` seeds lowered into
+    /// `LibraryClass::class_ivar_initializers` as `@@attr = <expr>`.
+    /// Plain (no `default:`) declarations store `nil` so first read
+    /// matches Rails' `class_variable_set`. Non-nil `default:` / block
+    /// values are also stored here.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub class_attr_defaults: IndexMap<Symbol, crate::expr::Expr>,
+
+    /// An enclosing module (via EnumConstants nesting) defines a `JSON`
+    /// constant that would shadow bare `JSON` in `serialize` coder
+    /// resolution. Fail closed: claim only `::JSON` when set.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lexical_json_shadow: bool,
 
     /// STI subclass class-ids whose rows live in THIS model's table
     /// (stamped by `lower::sti_scope`, which already derives the
@@ -334,11 +354,24 @@ pub enum Association {
         /// ([[feedback_self_describing_ir]]).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         touch: Option<Touch>,
+        /// `belongs_to`/`delegated_type` `foreign_type:` — column that
+        /// stores the associated class name. `None` means `<name>_type`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        foreign_type: Option<Symbol>,
+        /// Associated record's key used for lookup and for delegated
+        /// convenience names (`message_uuid` when `primary_key: :uuid`).
+        /// `None` means `id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        primary_key: Option<Symbol>,
     },
     HasMany {
         name: Symbol,
         target: ClassId,
         foreign_key: Symbol,
+        /// Written as `foreign_key:` rather than defaulted from the
+        /// owner. A Concern splice rehomes only a defaulted key.
+        #[serde(default, skip_serializing_if = "is_false")]
+        foreign_key_explicit: bool,
         through: Option<Symbol>,
         dependent: Dependent,
         /// `has_many :notifications, as: :notifiable` — this side is
@@ -370,10 +403,23 @@ pub enum Association {
         name: Symbol,
         target: ClassId,
         foreign_key: Symbol,
+        /// See `HasMany::foreign_key_explicit`.
+        #[serde(default, skip_serializing_if = "is_false")]
+        foreign_key_explicit: bool,
         dependent: Dependent,
         /// See `HasMany::as_interface`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         as_interface: Option<Symbol>,
+        /// Association scope lambda body, same contract as
+        /// [`HasMany::scope`] (`has_one :x, -> { where(name: "body") }`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<Expr>,
+        /// `autosave: true` — persist a built/assigned child after the
+        /// owner saves. Default false, matching Rails. When true, the
+        /// shared lowerer stashes via the writer and folds an
+        /// `after_save` that stamps the FK (and `as:` type) then saves.
+        #[serde(default, skip_serializing_if = "is_false")]
+        autosave: bool,
     },
     HasAndBelongsToMany {
         name: Symbol,
@@ -445,7 +491,15 @@ pub enum ValidationRule {
     Format { pattern: String },
     Numericality { only_integer: bool, gt: Option<f64>, lt: Option<f64> },
     Inclusion { values: Vec<Literal> },
-    Custom { method: Symbol },
+    Custom {
+        method: Symbol,
+        /// `validate :m, if: :pred` / `unless: :pred` — the instance
+        /// predicate guarding the check (Symbol conditions only).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        if_method: Option<Symbol>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unless_method: Option<Symbol>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -777,6 +831,10 @@ pub struct LibraryClass {
     pub is_module: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<ClassId>,
+    /// Span of the superclass constant path when ingested from source.
+    /// Synthetic for synthesized classes and modules with no parent.
+    #[serde(default, skip_serializing_if = "Span::is_synthetic")]
+    pub parent_span: Span,
     /// `include` directives at the class top level, in source order
     /// (e.g. `Enumerable`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -790,6 +848,10 @@ pub struct LibraryClass {
     /// Ordered, statically resolved class-instance-variable writes.
     /// Unlike instance fields these belong to the receiving class object:
     /// methods inherit, but their initialized values do not.
+    /// Also carries native `@@name = nil` assignments, whose LValue::Var
+    /// retains its sigil and shared inheritance storage. The historical
+    /// field name is kept for IR compatibility; these are modeled class-side
+    /// assignments, never unmodeled DSL calls.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub class_ivar_initializers: Vec<Expr>,
     /// Schema columns this class stores that the DB declares NULLABLE.
@@ -887,6 +949,57 @@ pub enum LibraryClassOrigin {
     },
 }
 
+/// A graphql-ruby object type (a class descending from
+/// `GraphQL::Schema::Object`), as `ingest::graphql_ruby` read it.
+/// Analysis-only: the methods it synthesized onto the library class
+/// (`synthesized`) let inference type each field the way graphql-ruby
+/// resolves it, and leave at the start of lowering, so no emitter
+/// sees them. The class's `field` calls stay in `unknown_calls`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GraphqlObjectType {
+    pub class: ClassId,
+    /// Fields in declaration order, inherited ones first.
+    pub fields: Vec<GraphqlField>,
+    /// Methods this pass added to the library class, by name.
+    pub synthesized: Vec<Symbol>,
+    /// A `resolver:`/`mutation:` class a field resolves through, not
+    /// an object type: no fields of its own, and only its synthesized
+    /// methods are checked (search_object calls the rest).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub resolver: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GraphqlField {
+    /// The Ruby (underscored) field name, as declared.
+    pub name: Symbol,
+    /// The `field` call.
+    pub span: Span,
+    /// `null: true`, or no `null:` (graphql-ruby's default is nullable).
+    pub nullable: bool,
+    /// The declared return type, when it names an object type this
+    /// pass also read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_type: Option<ClassId>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub list: bool,
+    /// The synthesized method holding the value graphql-ruby would
+    /// resolve, or why there is none.
+    pub resolution: GraphqlResolution,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GraphqlResolution {
+    Value { method: Symbol },
+    /// Resolves through the type's own `method`, whose parameters do
+    /// not take the declared arguments (one no argument fills, or an
+    /// argument with no parameter). graphql-ruby's call would fail;
+    /// the method is neither called nor checked.
+    Arguments { method: Symbol },
+    Skipped { reason: String },
+}
+
 fn is_false(b: &bool) -> bool {
     !*b
 }
@@ -947,6 +1060,9 @@ fn is_pure_effects(e: &crate::effect::EffectSet) -> bool {
 pub struct Controller {
     pub name: ClassId,
     pub parent: Option<ClassId>,
+    /// Span of the superclass constant path when ingested from source.
+    #[serde(default, skip_serializing_if = "Span::is_synthetic")]
+    pub parent_span: Span,
     /// Source-ordered class body. Same shape as `Model.body` — the
     /// emitter iterates in order so `private` markers land at the right
     /// position and unknown class-body calls round-trip verbatim.
@@ -959,15 +1075,23 @@ pub struct Controller {
     #[serde(default, skip_serializing_if = "LayoutDecl::is_inherit")]
     pub layout: LayoutDecl,
     /// Empty-bodied top-level classes declared alongside the controller
-    /// in its source file, as (name, parent) pairs — lobsters'
-    /// `login_controller.rb` opens with `class LoginFailedError <
-    /// StandardError; end` and four siblings that the actions
-    /// raise/rescue. Only the empty-body shape is captured (a pure
-    /// declaration); a sibling with real methods stays dropped and
-    /// surfaces through diagnostics as before. The Ruby emit path
-    /// re-declares these ahead of the controller class.
+    /// in its source file — lobsters' `login_controller.rb` opens with
+    /// `class LoginFailedError < StandardError; end` and four siblings
+    /// that the actions raise/rescue. Only the empty-body shape is
+    /// captured; a sibling with real methods stays dropped. The Ruby
+    /// emit path re-declares these ahead of the controller class.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub sibling_classes: Vec<(Symbol, Symbol)>,
+    pub sibling_classes: Vec<SiblingClass>,
+}
+
+/// An empty-bodied class beside a controller (`class X < Parent; end`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SiblingClass {
+    pub name: Symbol,
+    pub parent: Symbol,
+    /// Span of the superclass constant path.
+    #[serde(default, skip_serializing_if = "Span::is_synthetic")]
+    pub parent_span: Span,
 }
 
 /// What `layout` was declared at the controller class level.
@@ -1044,20 +1168,31 @@ impl Controller {
         })
     }
 
+    /// The class-side methods (`def self.x`, `class << self` defs).
     pub fn class_methods(&self) -> impl Iterator<Item = &MethodDef> {
         self.body.iter().filter_map(|item| match item {
             ControllerBodyItem::ClassMethod { method, .. } => Some(method),
             _ => None,
         })
     }
+
+    pub fn class_methods_mut(&mut self) -> impl Iterator<Item = &mut MethodDef> {
+        self.body.iter_mut().filter_map(|item| match item {
+            ControllerBodyItem::ClassMethod { method, .. } => Some(method),
+            _ => None,
+        })
+    }
 }
 
-/// The two method forms admitted by finite class configuration.
+/// The two method forms admitted by finite class configuration, plus
+/// `ClassAttribute`: a Concern class method copied onto its includer
+/// that reads or writes a `class_attribute` (`ingest::class_attribute`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClassConfigurationRole {
     Writer,
     Reader,
+    ClassAttribute,
 }
 
 /// One statement inside a controller class body, in source order.
@@ -1089,8 +1224,10 @@ pub enum ControllerBodyItem {
         method: MethodDef,
         /// Finite macro carrier and storage slot.
         /// Used to infer a shared method contract without sharing values.
-        configuration_slot: (ClassId, Symbol),
-        configuration_role: ClassConfigurationRole,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        configuration_slot: Option<(ClassId, Symbol)>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        configuration_role: Option<ClassConfigurationRole>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         leading_comments: Vec<Comment>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1346,6 +1483,10 @@ pub struct RouteTable {
     /// writes by hand when it wants the same thing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub redirects: Vec<RedirectRoute>,
+    /// Recovered route omissions stay errors in the normal diagnostic stream,
+    /// so callers can inspect supported siblings without claiming full support.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<crate::diagnostic::Diagnostic>,
 }
 
 /// One `to: redirect(...)` route, as the action synthesized for it.
@@ -1354,10 +1495,20 @@ pub struct RedirectRoute {
     /// The action name on the synthesized controller, derived from the
     /// path so the emitted method reads as what it serves.
     pub action: Symbol,
-    /// Where it sends the client: the literal path as written.
+    /// Where it sends the client: the literal path as written, or a
+    /// block expression that evaluates to a string.
     pub location: String,
+    /// Set when `location` is already Ruby source for the redirect
+    /// target, not a literal path containing `%{param}` placeholders.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub location_is_expression: bool,
     /// Rails' `redirect` answers 301 unless the call says otherwise.
     pub status: u16,
+    /// `redirect(path: "/login")`, not `redirect("/login")`. Rails keeps
+    /// the request query string on the options form and drops it on the
+    /// positional form.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_query: bool,
 }
 
 /// A `direct` custom URL helper.
@@ -1434,8 +1585,13 @@ pub enum RouteSpec {
         scope: ResourceScope,
     },
     /// `root "controller#action"` — shorthand for `GET /` routed to the
-    /// given target, with `:root` as the generated name.
-    Root { target: String },
+    /// given target. Helper name defaults to `{prefix}root`; `as:`
+    /// overrides via [`Self::Root::as_name`].
+    Root {
+        target: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        as_name: Option<Symbol>,
+    },
     /// `resources :name [, only: [...]] [, except: [...]] [do ... end]`.
     /// `only` and `except` are empty-on-default (an empty `only` means
     /// "all seven standard actions," matching Rails' behavior). Nested
@@ -1476,6 +1632,12 @@ pub enum RouteSpec {
         /// while the lowered action read a param nothing set.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         param: Option<Symbol>,
+        /// `resources :parts, path: "components"` — the URL segment,
+        /// in place of the name. The opposite of `as:`: only the path
+        /// moves; the helpers (`parts_path`) and the controller
+        /// (`PartsController`) still come from `name`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
     },
     /// `namespace :admin do … end` / `scope … do … end` — a routing
     /// scope wrapping nested entries. `namespace :x` is `scope` with

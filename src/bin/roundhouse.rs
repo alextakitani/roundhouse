@@ -353,10 +353,10 @@ fn run_transpile(
     // walker-found errors would otherwise pass through into target code
     // that fails later in tsc/cargo/runtime with a worse message, so
     // they print and gate here alongside the emit-gap inventory.
-    // (Same Roda exception: analyze never ran, so its diagnostics
-    // would be all noise.)
+    // Roda still reports recovered structural route errors. Its type
+    // analysis never ran, so analyzer-only diagnostics would be noise.
     let mut analyze_diags =
-        if target == BuildTarget::Roda { Vec::new() } else { diagnose(&app) };
+        if target == BuildTarget::Roda { app.routes.diagnostics.clone() } else { diagnose(&app) };
     analyze_diags.extend(lower_diags);
 
     // A residue whose own text says the construct is "unsupported at
@@ -457,6 +457,15 @@ fn run_transpile(
     let errors = diags.iter().filter(|d| d.severity == Severity::Error).count();
     let type_errors = analyze_diags.iter().filter(|d| d.severity == Severity::Error).count();
     if errors + type_errors > 0 {
+        // A project-boundary refusal (`target_files` returned `Err`, e.g.
+        // a Date column on a target without a date-only runtime) fails
+        // with or without the flag, so suggesting it would be false.
+        // Name the refusal instead (issue #303).
+        if let Err(e) = &files_result {
+            return Err(format!(
+                "{errors} unsupported/syntax error(s), {type_errors} type error(s) — {e}"
+            ));
+        }
         return Err(format!(
             "{errors} unsupported/syntax error(s), {type_errors} type error(s) — rerun \
              with --allow-unsupported to write the output anyway"
@@ -472,7 +481,7 @@ fn run_transpile(
     // `String`), so before this they were dropped without a word.
     let assets = project::write_binary_assets(&app.binary_assets, &files, out)?;
     eprintln!(
-        "roundhouse: wrote {} files to {} ({})",
+        "roundhouse: emitted {} files to {} ({})",
         files.len() + assets,
         out.display(),
         target.as_str()

@@ -10,9 +10,10 @@ use crate::dialect::Action;
 use crate::expr::{ArrayStyle, Expr, ExprNode, LValue, Literal};
 use crate::ident::{Symbol, VarId};
 use crate::span::Span;
+use crate::ty::Ty;
 
 use super::params::{ParamsSpec, ParamsSpecs};
-use super::util::map_expr;
+use super::util::{map_expr, map_expr_mut};
 
 // ---------------------------------------------------------------------------
 // Render-template-as-Views-call rewrite. Spinel doesn't have Rails'
@@ -113,6 +114,7 @@ pub(super) fn partial_view_call_with_record(
     ))
 }
 
+/// Lower controller render calls to view invocations or typed inline responses.
 pub(super) fn rewrite_render_to_views(
     expr: &Expr,
     module_name: Option<&str>,
@@ -370,8 +372,9 @@ pub(super) fn rewrite_render_to_views(
                             "plain" => body = Some((v.clone(), Some("text/plain"))),
                             // Inline `render json: <expr>` — the body is
                             // the JSON encoding of the value. Encoding
-                            // happens at runtime (`JsonRender.encode`
-                            // walks as_json/Hash/Array/Time), because the
+                            // happens at runtime (JSON.generate for typed
+                            // primitive collections; JsonRender.encode for
+                            // values needing as_json/Time handling), because the
                             // value's shape is a runtime fact — for what
                             // reaches here. A value typed as a class with
                             // declared readers never does: `as_json_poro`
@@ -596,7 +599,7 @@ pub(super) fn rewrite_render_to_views(
                         value: Expr::new(
                             e.span,
                             ExprNode::Send {
-                                recv: Some(const_path(
+                                recv: Some(typed_exception_const(
                                     &["ActionView", "MissingTemplate"],
                                     e.span,
                                 )),
@@ -838,8 +841,8 @@ fn strip_format_kwarg(arg: &Expr) -> Option<Expr> {
 /// just this entry. The runtime's `render(body, status:, content_type:)`
 /// expects ONE kwargs hash, not multiple.
 /// `ActionController::JsonRender.encode(<value>)` — the runtime JSON
-/// encoder behind inline `render json: <expr>` whose value
-/// `as_json_poro` could not write a serializer for. CRuby answers it via
+/// encoder behind inline `render json: <expr>` whose value neither
+/// `as_json_poro` nor the primitive-collection path handles. CRuby answers it via
 /// the overlay (as_json-aware recursive encode); a strict target whose
 /// app reaches this call surfaces an unresolved-constant gap loudly
 /// rather than silently rendering html.
@@ -890,23 +893,97 @@ fn html_escape_call(value: &Expr) -> Expr {
     )
 }
 
+/// Select the bundled JSON encoder for proven primitive collections; retain
+/// Rails serialization for values requiring custom hooks or temporal conversion.
 fn json_render_encode(value: &Expr) -> Expr {
+    // JSON's bundled encoder already handles primitive collections on every
+    // target. Keep values that need Rails' as_json hooks (including nested
+    // models and Time) on the existing serializer path.
+    let collection = matches!(&*value.node, ExprNode::Hash { .. } | ExprNode::Array { .. })
+        || value.ty.as_ref().is_some_and(json_collection_type);
+    let primitive_collection = collection && json_primitive_value(value);
     let recv = Expr::new(
         value.span,
         ExprNode::Const {
-            path: vec![Symbol::from("ActionController"), Symbol::from("JsonRender")],
+            path: if primitive_collection {
+                vec![Symbol::from("JSON")]
+            } else {
+                vec![Symbol::from("ActionController"), Symbol::from("JsonRender")]
+            },
         },
     );
-    Expr::new(
+    let encoded = Expr::new(
         value.span,
         ExprNode::Send {
             recv: Some(recv),
-            method: Symbol::from("encode"),
+            method: Symbol::from(if primitive_collection { "generate" } else { "encode" }),
             args: vec![value.clone()],
             block: None,
             parenthesized: true,
         },
+    );
+    if !primitive_collection {
+        return encoded;
+    }
+    // Rails escapes HTML entities after JSON generation. Keep that behavior
+    // in shared typed runtime code, without re-escaping the JSON syntax.
+    Expr::new(
+        value.span,
+        ExprNode::Send {
+            recv: Some(Expr::new(
+                value.span,
+                ExprNode::Const { path: vec![Symbol::from("JsonBuilder")] },
+            )),
+            method: Symbol::from("escape_html_entities"),
+            args: vec![encoded],
+            block: None,
+            parenthesized: true,
+        },
     )
+}
+
+/// Recognize collection types, including nonempty unions of only collections.
+fn json_collection_type(ty: &Ty) -> bool {
+    match ty {
+        Ty::Hash { .. } | Ty::Array { .. } | Ty::Record { .. } | Ty::Tuple { .. } => true,
+        Ty::Union { variants } => {
+            !variants.is_empty() && variants.iter().all(json_collection_type)
+        }
+        _ => false,
+    }
+}
+
+/// Prove primitive contents from inferred types or nested literal shapes,
+/// including empty literals whose element types remain unconstrained.
+fn json_primitive_value(value: &Expr) -> bool {
+    if value.ty.as_ref().is_some_and(json_primitive_type) {
+        return true;
+    }
+    // Empty literals have unconstrained element types. Their source shape
+    // still proves they contain no value requiring an as_json hook, also
+    // when nested inside another literal collection.
+    match &*value.node {
+        ExprNode::Array { elements, .. } => elements.iter().all(json_primitive_value),
+        ExprNode::Hash { entries, .. } => entries.iter().all(|(key, value)| {
+            matches!(key.ty.as_ref(), Some(Ty::Str | Ty::Sym)) && json_primitive_value(value)
+        }),
+        _ => false,
+    }
+}
+
+/// Accept only scalar JSON values and recursively primitive, closed collections.
+fn json_primitive_type(ty: &Ty) -> bool {
+    match ty {
+        Ty::Str | Ty::Sym | Ty::Int | Ty::Float | Ty::Bool | Ty::Nil | Ty::Bottom => true,
+        Ty::Array { elem } => json_primitive_type(elem),
+        Ty::Hash { key, value } => {
+            matches!(key.as_ref(), Ty::Str | Ty::Sym | Ty::Bottom)
+                && json_primitive_type(value)
+        }
+        Ty::Record { row } => row.rest.is_none() && row.fields.values().all(json_primitive_type),
+        Ty::Tuple { elems } | Ty::Union { variants: elems } => elems.iter().all(json_primitive_type),
+        _ => false,
+    }
 }
 
 /// Add `key: value` to the trailing kwargs hash — unless the call site
@@ -2231,9 +2308,15 @@ pub fn rewrite_route_helpers(
 ) -> Expr {
     let expr = &strip_url_helpers_receiver(expr);
     map_expr(expr, &|e| match &*e.node {
+        // `controller_path` is ActionController::Base's underscored
+        // namespace path (`"admin/users"`), never a route helper — the
+        // `_path` suffix alone would otherwise steal bare calls into
+        // `RouteHelpers.controller_path` and leave the synthesized
+        // Base override unreachable.
         ExprNode::Send { recv: None, method, args, block, parenthesized }
             if (method.as_str().ends_with("_path")
                 || method.as_str().ends_with("_url"))
+                && method.as_str() != "controller_path"
                 && !shadowed.contains(method) =>
         {
             // `RouteHelpers` only emits `_path` helpers — Rails'
@@ -2448,33 +2531,41 @@ fn params_option_value(arg: &Expr) -> Option<&Expr> {
 /// that types to a class is a record standing where its id belongs.
 /// Idempotent — a projected argument types `Integer`, not a class.
 pub fn project_route_helper_ids(expr: &Expr) -> Expr {
-    map_expr(expr, &|e| {
-        let ExprNode::Send { recv: Some(r), method, args, block, parenthesized } = &*e.node else {
-            return None;
-        };
-        if !matches!(&*r.node, ExprNode::Const { path }
-            if path.len() == 1 && path[0].as_str() == "RouteHelpers")
-        {
-            return None;
-        }
-        if !(method.as_str().ends_with("_path") || method.as_str().ends_with("_url")) {
-            return None;
-        }
-        if !args.iter().any(arg_carries_a_model) && !args.iter().any(query_carries_an_int) {
-            return None;
-        }
-        let projected: Vec<Expr> = args.iter().map(project_arg).collect();
-        Some(Expr::new(
-            e.span,
-            ExprNode::Send {
-                recv: Some(r.clone()),
-                method: method.clone(),
-                args: projected,
-                block: block.clone(),
-                parenthesized: *parenthesized,
-            },
-        ))
-    })
+    map_expr(expr, &project_route_helper_ids_node)
+}
+
+/// In-place twin. Returns whether any argument was projected so the
+/// test lowerer can skip a follow-up typing pass.
+pub fn project_route_helper_ids_in_place(expr: &mut Expr) -> bool {
+    map_expr_mut(expr, &project_route_helper_ids_node)
+}
+
+fn project_route_helper_ids_node(e: &Expr) -> Option<Expr> {
+    let ExprNode::Send { recv: Some(r), method, args, block, parenthesized } = &*e.node else {
+        return None;
+    };
+    if !matches!(&*r.node, ExprNode::Const { path }
+        if path.len() == 1 && path[0].as_str() == "RouteHelpers")
+    {
+        return None;
+    }
+    if !(method.as_str().ends_with("_path") || method.as_str().ends_with("_url")) {
+        return None;
+    }
+    if !args.iter().any(arg_carries_a_model) && !args.iter().any(query_carries_an_int) {
+        return None;
+    }
+    let projected: Vec<Expr> = args.iter().map(project_arg).collect();
+    Some(Expr::new(
+        e.span,
+        ExprNode::Send {
+            recv: Some(r.clone()),
+            method: method.clone(),
+            args: projected,
+            block: block.clone(),
+            parenthesized: *parenthesized,
+        },
+    ))
 }
 
 /// A route-helper argument with every model instance in it projected
@@ -2612,6 +2703,19 @@ pub(crate) fn const_path(segments: &[&str], span: Span) -> Expr {
             path: segments.iter().map(|s| Symbol::from(*s)).collect(),
         },
     )
+}
+
+/// Like `const_path`, but stamps `Ty::Class` so the emit-time
+/// ruby-family availability gate sees lowers-added raises
+/// (`MissingTemplate` from a missing `render`).
+pub(crate) fn typed_exception_const(segments: &[&str], span: Span) -> Expr {
+    let name = segments.join("::");
+    let mut expr = const_path(segments, span);
+    expr.ty = Some(crate::ty::Ty::Class {
+        id: crate::ident::ClassId(Symbol::from(name)),
+        args: vec![],
+    });
+    expr
 }
 
 /// True when `e` is a bare `params` send: no receiver, no args, no

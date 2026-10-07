@@ -1,9 +1,9 @@
 //! Framework-test transpile gate (Swift target).
 //!
-//! Ingests the five wired `runtime/ruby/test/**/*_test.rb` files as
+//! Ingests the wired framework and regression test files as
 //! TestModules in an otherwise-empty App, runs `swift::emit`, and runs
 //! all emitted XCTest classes under one `swift test`. This compiles the
-//! shared runtime and SPM dependencies once rather than five times.
+//! shared runtime and SPM dependencies once rather than once per suite.
 //!
 //! What this catches that `swift_toolchain` (emit-then-compile of
 //! real-blog) doesn't: transpile-fidelity gaps in the Ruby→Swift lowering
@@ -113,9 +113,13 @@ fn build_and_run(test_files: &[&str], tag: &str) {
         std::fs::write(&path, &file.content).expect("write emitted file");
     }
 
-    // `swift test` builds main + tests and runs XCTest.
+    // `swift test` builds main + tests and runs XCTest. Skip full
+    // debuginfo: CI only needs the XCTest result. Do not pass
+    // `--disable-index-store`: SPM still looks up the index store
+    // path and `swift test` then fatalErrors on Linux.
     let output = Command::new("swift")
         .arg("test")
+        .args(["-Xswiftc", "-gline-tables-only"])
         .current_dir(&scratch)
         .output()
         .expect("run swift test");
@@ -181,6 +185,100 @@ fn xctest_counts_are_per_suite_not_the_total() {
     }
 }
 
+#[test]
+fn a_reassigned_nil_checked_local_reads_unwrapped_not_shadowed() {
+    let test_file = "runtime/ruby/test/action_dispatch/router_test.rb";
+    let source = std::fs::read(test_file).expect("read router test");
+    let mut app = App::new();
+    app.test_modules.push(
+        ingest_test_file(&source, test_file)
+            .expect("ingest router test")
+            .expect("router test class"),
+    );
+    load_framework_rbs(&mut app);
+    Analyzer::new(&app).analyze(&mut app);
+    let router = swift::emit(&app)
+        .into_iter()
+        .find(|f| f.path.ends_with("RouterTest.swift"))
+        .expect("RouterTest.swift");
+    let body = router
+        .content
+        .split("func testAnyRouteMatchesEveryMethod")
+        .nth(1)
+        .expect("testAnyRouteMatchesEveryMethod")
+        .split("\n    func ")
+        .next()
+        .unwrap();
+    // Not `guard let m = m`: that rebinds `m` as a constant, and the method assigns `m` again.
+    assert!(!body.contains("guard let m = m"), "{body}");
+    assert!(body.contains("m!.action") && body.contains("m!.pathParams"), "{body}");
+}
+
+#[test]
+fn a_reassigned_nil_guard_narrows_until_the_next_write() {
+    let source = br#"
+class NarrowTest < Minitest::Test
+  TABLE = [ActionDispatch::Router::Route.new("ANY", "/lookup/:id", :widgets_controller, :show)]
+
+  def test_shapes
+    m = ActionDispatch::Router.match("GET", "/lookup/1", TABLE)
+    raise "joined" if m.nil? || m.action != :show
+    m = ActionDispatch::Router.match(m.action == :show ? "GET" : "POST", "/lookup/12", TABLE)
+    raise "second" if m.nil?
+    raise "ivar" unless @m.nil?
+    m ||= ActionDispatch::Router.match("GET", "/lookup/9", TABLE)
+  end
+end
+"#;
+    let mut app = App::new();
+    app.test_modules.push(
+        ingest_test_file(source, "test/narrow_test.rb")
+            .expect("ingest")
+            .expect("test class"),
+    );
+    load_framework_rbs(&mut app);
+    Analyzer::new(&app).analyze(&mut app);
+    let file = swift::emit(&app)
+        .into_iter()
+        .find(|f| f.path.ends_with("NarrowTest.swift"))
+        .expect("NarrowTest.swift");
+    let body = &file.content;
+    assert!(!body.contains("guard let m = m"), "{body}");
+    // The joined guard's right side, and a write's own right side, read the proven value.
+    assert!(body.contains("m == nil || (m!.action"), "{body}");
+    assert!(body.contains("Router.match((m!.action"), "{body}");
+    // A compound write ends the narrowing: its operand is the optional, not `m!`.
+    assert!(body.contains("m = m ?? "), "{body}");
+    // Narrowing the local `m` proves nothing about `@m`.
+    let ivar_guard = body.lines().take_while(|l| !l.contains("\"ivar\"")).last().unwrap();
+    assert!(!ivar_guard.contains("m!"), "{body}");
+}
+
+/// Keep the native regression in the default suite as an emission check too.
+/// The full framework gate below executes these same Ruby assertions in XCTest.
+#[test]
+fn throwing_calls_are_grouped_as_comparison_operands() {
+    let path = "tests/fixtures/swift_throwing_comparison_test.rb";
+    let source = std::fs::read(path).expect("read throwing comparison regression");
+    let mut app = App::new();
+    app.test_modules.push(
+        ingest_test_file(&source, path).expect("ingest regression").expect("test class"),
+    );
+    load_framework_rbs(&mut app);
+    Analyzer::new(&app).analyze(&mut app);
+    let file = swift::emit(&app)
+        .into_iter()
+        .find(|f| f.path.ends_with("ThrowingComparisonTest.swift"))
+        .expect("ThrowingComparisonTest.swift");
+    for condition in [
+        r#""a b" != (try Router.decodeCapture("a%20b"))"#,
+        r#"try Router.decodeCapture("a%2Fb") != "a/b""#,
+        r#"try Router.decodeCapture("jos%C3%A9") != (try Router.decodeCapture("josé"))"#,
+    ] {
+        assert!(file.content.contains(condition), "{condition}:\n{}", file.content);
+    }
+}
+
 // errors + ac_base were the last deferred pair; both are green now and CI
 // runs this file unfiltered. What it took, recorded because kotlin needed
 // the same four fixes and rust still does:
@@ -215,6 +313,7 @@ fn framework_tests_pass_under_swift() {
             "runtime/ruby/test/action_view/view_helpers_test.rb",
             "runtime/ruby/test/active_record/errors_test.rb",
             "runtime/ruby/test/action_controller/base_test.rb",
+            "tests/fixtures/swift_throwing_comparison_test.rb",
         ],
         "all",
     );

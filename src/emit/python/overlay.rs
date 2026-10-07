@@ -271,6 +271,9 @@ fn emit_models(models: &[LibraryClass]) -> Result<String, String> {
     out.push_str("\nfrom app.active_record_base import Base\n");
     for (needle, import) in [
         ("Db.", "from app.db import Db\n"),
+        // `ActiveRecord.lower_bound` — the `includes(:assoc)` distribute
+        // a lowered query body calls (lower::arel::visitor).
+        ("ActiveRecord.", "from app.active_record_base import ActiveRecord\n"),
         ("RecordNotFound", "from app.errors import RecordNotFound\n"),
         ("RecordInvalid", "from app.errors import RecordInvalid\n"),
         // The temporal intrinsics (`ActiveSupport.db_now` et al)
@@ -387,6 +390,9 @@ fn emit_controllers(
     }
     if body.contains("Db.") {
         out.push_str("from app.db import Db\n");
+    }
+    if body.contains("ActiveRecord.") {
+        out.push_str("from app.active_record_base import ActiveRecord\n");
     }
     out.push_str(&missing_parent_aliases(controllers));
     out.push_str(&body);
@@ -519,7 +525,8 @@ fn emit_dispatch(
     out.push_str(
         "def dispatch(controller: str, action: str, *, params=None, session=None,\n\
          \x20            flash=None, request_method: str = \"GET\",\n\
-         \x20            request_path: str = \"/\", request_format: str = \"html\"):\n\
+         \x20            request_path: str = \"/\", request_format: str = \"html\",\n\
+         \x20            query_string: str = \"\"):\n\
          \x20   \"\"\"Construct the controller, seed request state, run the action,\n\
          \x20   and return the controller with response state populated\n\
          \x20   (status / body / location / content_type). Omitted kwargs keep\n\
@@ -534,6 +541,7 @@ fn emit_dispatch(
          \x20   c.request_method = request_method\n\
          \x20   c.request_path = request_path\n\
          \x20   c.request_format = request_format\n\
+         \x20   c.query_string = query_string\n\
          \x20   # Per-request view-slot reset — the same call every\n\
          \x20   # target's server glue makes before running the action\n\
          \x20   # (crystal server.cr, go slots.go, ts server.ts). Also\n\
@@ -587,6 +595,9 @@ fn emit_dispatch(
          \x20   # would otherwise capture \"1.json\" on the exact-match\n\
          \x20   # pass (Router.match's own ext-retry only runs after an\n\
          \x20   # exact miss).\n\
+         \x20   qs = \"\"\n\
+         \x20   if \"?\" in path:\n\
+         \x20       path, qs = path.split(\"?\", 1)\n\
          \x20   fmt = None\n\
          \x20   last = path.rsplit(\"/\", 1)[-1]\n\
          \x20   if \".\" in last:\n\
@@ -604,7 +615,7 @@ fn emit_dispatch(
          \x20   fmt = m.req_format or fmt or p.get(\"format\") or \"html\"\n\
          \x20   c = dispatch(m.controller, m.action, params=p, flash=flash,\n\
          \x20                request_method=method, request_path=path,\n\
-         \x20                request_format=fmt)\n\
+         \x20                request_format=fmt, query_string=qs)\n\
          \x20   location = c.location or \"\"\n\
          \x20   persisted = c.flash.to_persisted()\n\
          \x20   if fmt != \"html\":\n\

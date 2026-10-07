@@ -200,8 +200,12 @@ struct Nesting {
     /// Helper-name segment (`user`, `account`); accumulates into the
     /// prefix in declaration order.
     singular: String,
-    /// Path segment, which is the name as written (`users`, `account`).
+    /// Plural helper-name segment, the name as written (`users`,
+    /// `account`).
     plural: String,
+    /// Path segment: the name as written, or the resource's `path:`
+    /// (`resources :users, path: "people"` nests at `/people/:user_id`).
+    segment: String,
     /// Whether this level contributes a `/:<singular>_id` segment.
     ///
     /// FALSE for a singular `resource :account`: Rails routes its
@@ -473,8 +477,8 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
         // refuses to build one, #82); skipping it here keeps a
         // hand-built or deserialized table from emitting `:` as a
         // controller symbol.
-        RouteSpec::Root { target } if target.is_empty() => {}
-        RouteSpec::Root { target } => {
+        RouteSpec::Root { target, .. } if target.is_empty() => {}
+        RouteSpec::Root { target, as_name } => {
             let (controller_name, action_name) = target
                 .split_once('#')
                 .map(|(c, a)| (c.to_string(), a.to_string()))
@@ -496,12 +500,19 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
             );
             let path =
                 if ctx.ns_path.is_empty() { "/".to_string() } else { ctx.ns_path.clone() };
+            // Rails applies the scope `as` prefix to an explicit root
+            // `as:` (`namespace :admin do root … as: :home end` →
+            // `admin_home`), matching Explicit's name_prefix handling.
+            let helper = as_name
+                .as_ref()
+                .map(|s| format!("{}{}", ctx.name_prefix, s.as_str()))
+                .unwrap_or_else(|| format!("{}root", ctx.name_prefix));
             out.push(FlatRoute {
                 method: HttpMethod::Get,
                 path,
                 controller: ClassId(Symbol::from(controller_class)),
                 action: Symbol::from(action_name),
-                as_name: format!("{}root", ctx.name_prefix),
+                as_name: helper,
                 path_params: vec![],
                 param_defaults: vec![],
                 named: true,
@@ -520,8 +531,12 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
             as_name,
             controller,
             param,
+            path: path_segment,
         } => {
-            let resource_path = format!("/{name}");
+            // `path:` moves the URL segment only; the helpers and the
+            // controller below still come from `name`.
+            let segment = path_segment.as_deref().unwrap_or(name.as_str());
+            let resource_path = format!("/{segment}");
             // `param: :task_id` renames the member segment (#84). The
             // action table is written with `:id`; substitute here so
             // the path, the helper's param list and the controller's
@@ -586,6 +601,7 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                     p.push(Nesting {
                         singular: singular_low.clone(),
                         plural: name.as_str().to_string(),
+                        segment: segment.to_string(),
                         has_id: !*singular,
                         param: id_param.to_string(),
                     });
@@ -813,13 +829,13 @@ fn nest_path(
     let mut params: Vec<String> = Vec::new();
     for frame in outer {
         prefix.push('/');
-        prefix.push_str(&frame.plural);
+        prefix.push_str(&frame.segment);
         if frame.has_id {
             prefix.push_str(&format!("/:{}_{}", frame.singular, frame.param));
             params.push(format!("{}_{}", frame.singular, frame.param));
         }
     }
-    let (parent, parent_plural) = (innermost.singular.as_str(), innermost.plural.as_str());
+    let (parent, parent_plural) = (innermost.singular.as_str(), innermost.segment.as_str());
     let prefix = &prefix;
     // Rails joins route segments with `/` unconditionally. A bare-verb
     // shortcut arrives here already slash-prefixed (`/reply`), but an
@@ -837,25 +853,18 @@ fn nest_path(
     match rscope {
         // `member do get "reply" end` → `/comments/:id/reply` (`:id`, the
         // record's own key — what a controller's `find` reads as
-        // `params[:id]`). An already-structured path inside `member`
-        // (`get "/comments/:id" => …`, a leading-slash absolute route) is
-        // used verbatim, matching Rails' escape from the nesting.
+        // `params[:id]`). Rails prepends the member scope to EVERY path
+        // written inside the block, a structured one included:
+        // `get "pages/:page"` is `/comments/:id/pages/:page` and even a
+        // leading-slash `get "/comments/:id" => …` comes out as
+        // `/comments/:id/comments/:id` (measured against Rails 8.1).
         ResourceScope::Member => {
-            if is_bare_child_segment(path) {
-                params.push(innermost.param.clone());
-                (format!("{prefix}/{parent_plural}/:{}{path}", innermost.param), params)
-            } else {
-                (path.to_string(), vec![])
-            }
+            params.push(innermost.param.clone());
+            (format!("{prefix}/{parent_plural}/:{}{path}", innermost.param), params)
         }
-        // `collection do get "search" end` → `/photos/search` (no id).
-        ResourceScope::Collection => {
-            if is_bare_child_segment(path) {
-                (format!("{prefix}/{parent_plural}{path}"), params)
-            } else {
-                (path.to_string(), vec![])
-            }
-        }
+        // `collection do get "search" end` → `/photos/search` (no id);
+        // `get "/(:name)"` → `/photos(/:name)`, never a bare `/:name`.
+        ResourceScope::Collection => (format!("{prefix}/{parent_plural}{path}"), params),
         // Bare verb declared directly in the block, or a nested resource's
         // own actions: Rails nests under the parent's `/:<singular>_id`
         // — unless the parent is SINGULAR, which has no id to nest under.
@@ -869,15 +878,6 @@ fn nest_path(
             (full, params)
         }
     }
-}
-
-/// A single bare path segment like `/reply` (from a `get "reply"`
-/// shortcut) — no interior `/` and no `:param`. Such a member/collection
-/// child is nested under the parent; a structured path (`/comments/:id`)
-/// is an absolute override used as-is.
-fn is_bare_child_segment(path: &str) -> bool {
-    let trimmed = path.trim_matches('/');
-    !trimmed.is_empty() && !trimmed.contains('/') && !trimmed.contains(':')
 }
 
 /// Expand a Rails path with optional `(…)` groups into the concrete
@@ -990,6 +990,7 @@ mod tests {
         vec![Nesting {
             singular: singular.to_string(),
             plural: plural.to_string(),
+            segment: plural.to_string(),
             has_id: true,
             param: "id".to_string(),
         }]
@@ -1006,15 +1007,17 @@ mod tests {
     }
 
     #[test]
-    fn member_route_absolute_path_used_verbatim() {
-        // `get "/comments/:id" => …` inside a member block escapes nesting.
+    fn member_route_structured_path_still_nests() {
+        // Rails prepends the member scope even to a leading-slash path:
+        // `get "/comments/:id" => …` inside `member do` is served at
+        // `/comments/:id/comments/:id`.
         let (path, params) = nest_path(
             "/comments/:id",
             &plural("comment", "comments"),
             ResourceScope::Member,
         );
-        assert_eq!(path, "/comments/:id");
-        assert!(params.is_empty());
+        assert_eq!(path, "/comments/:id/comments/:id");
+        assert_eq!(params, vec!["id".to_string()]);
     }
 
     #[test]

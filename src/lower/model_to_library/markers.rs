@@ -405,13 +405,12 @@ pub(super) fn push_attr_accessor_methods(methods: &mut Vec<MethodDef>, model: &M
         //
         // A `def` of the same name REPLACES the accessor — Ruby's last
         // definition wins, and `attr_accessor :foo` is a definition.
-        // Checking only `methods` is not enough: the user's own bodies
-        // arrive later via `push_user_methods`, which DROPS a name a
-        // synthesizer already claimed. So an accessor pushed here for a
-        // name the model defines silently deletes the app's method and
-        // leaves `def foo; @foo; end` in its place — the ivar the app
-        // memoizes into is then never written and the reader answers nil
-        // forever.
+        // Checking only `methods` is not enough: without yielding here,
+        // an accessor pushed for a name the model defines is later
+        // eligible for replacement by `push_user_methods` only when it
+        // still has the bare-ivar attr_* shape; skipping the push when
+        // `model_defines_instance_method` is the primary gate so the
+        // app's memo body is what `methods` carries.
         //
         // Measured on campfire's `Opengraph::Location`, which declares
         // `attr_accessor :url, :parsed_url` and then memoizes
@@ -998,7 +997,11 @@ pub(super) fn push_cache_key_methods(methods: &mut Vec<MethodDef>, model: &Model
     let key = with_ty(
         Expr::new(
             span,
-            ExprNode::If { cond: persisted, then_branch: key_body, else_branch: unsaved },
+            ExprNode::If {
+                cond: persisted.clone(),
+                then_branch: key_body,
+                else_branch: unsaved,
+            },
         ),
         Ty::Str,
     );
@@ -1014,33 +1017,72 @@ pub(super) fn push_cache_key_methods(methods: &mut Vec<MethodDef>, model: &Model
         .find(|c| c.name.as_str() == "updated_at")
         .map(super::schema::col_storage_name);
 
-    let cache_key_call = Expr::new(
-        span,
-        ExprNode::Send {
-            recv: None,
-            method: Symbol::from("cache_key"),
-            args: Vec::new(),
-            block: None,
-            parenthesized: false,
-        },
-    );
     let versioned = match version_ivar {
-        Some(ivar) => with_ty(
+        Some(ivar) => {
+            // One interpolation, not `"#{cache_key}-#{raw}"`. The warm
+            // collection-cache key walks every record; composing through
+            // `cache_key` allocated a prefix string that was thrown away.
+            let persisted_version = with_ty(
+                Expr::new(
+                    span,
+                    ExprNode::StringInterp {
+                        parts: vec![
+                            crate::expr::InterpPart::Text {
+                                value: format!("{table_name}/"),
+                            },
+                            crate::expr::InterpPart::Expr {
+                                expr: Expr::new(span, ExprNode::Ivar { name: Symbol::from("id") }),
+                            },
+                            crate::expr::InterpPart::Text { value: "-".to_string() },
+                            crate::expr::InterpPart::Expr {
+                                expr: Expr::new(span, ExprNode::Ivar { name: ivar.clone() }),
+                            },
+                        ],
+                    },
+                ),
+                Ty::Str,
+            );
+            let unsaved_version = with_ty(
+                Expr::new(
+                    span,
+                    ExprNode::StringInterp {
+                        parts: vec![
+                            crate::expr::InterpPart::Text {
+                                value: format!("{table_name}/new-"),
+                            },
+                            crate::expr::InterpPart::Expr {
+                                expr: Expr::new(span, ExprNode::Ivar { name: ivar }),
+                            },
+                        ],
+                    },
+                ),
+                Ty::Str,
+            );
+            with_ty(
+                Expr::new(
+                    span,
+                    ExprNode::If {
+                        cond: persisted,
+                        then_branch: persisted_version,
+                        else_branch: unsaved_version,
+                    },
+                ),
+                Ty::Str,
+            )
+        }
+        None => with_ty(
             Expr::new(
                 span,
-                ExprNode::StringInterp {
-                    parts: vec![
-                        crate::expr::InterpPart::Expr { expr: cache_key_call },
-                        crate::expr::InterpPart::Text { value: "-".to_string() },
-                        crate::expr::InterpPart::Expr {
-                            expr: Expr::new(span, ExprNode::Ivar { name: ivar }),
-                        },
-                    ],
+                ExprNode::Send {
+                    recv: None,
+                    method: Symbol::from("cache_key"),
+                    args: Vec::new(),
+                    block: None,
+                    parenthesized: false,
                 },
             ),
             Ty::Str,
         ),
-        None => with_ty(cache_key_call, Ty::Str),
     };
     methods.push(str_method(model, "cache_key_with_version", versioned));
 }
@@ -1247,9 +1289,9 @@ pub(super) fn push_callback_methods(methods: &mut Vec<MethodDef>, model: &Model)
 /// `on:` restrictions lower structurally: `after_commit ..., on:
 /// :create` targets the runtime's `after_create_commit` hook, and
 /// validation hooks get a `new_record?` guard (accurate at validation
-/// time — the insert hasn't happened yet). Ingest already rejected
-/// every (hook, on) pair this match doesn't cover, plus `if:`/
-/// `unless:` conditions.
+/// time — the insert hasn't happened yet). `if:`/`unless:` conditions
+/// wrap the body in the guard they name. Ingest already rejected every
+/// (hook, on) pair this match doesn't cover.
 fn push_symbol_callback(
     methods: &mut Vec<MethodDef>,
     model: &Model,
@@ -1258,9 +1300,6 @@ fn push_symbol_callback(
 ) {
     use crate::dialect::{CallbackHook as Hook, CallbackOn as On};
 
-    if cb.condition.is_some() {
-        return;
-    }
     let hook_name = match (cb.hook, cb.on) {
         (Hook::AfterCommit, Some(On::Create)) => "after_create_commit",
         (Hook::AfterCommit, Some(On::Update)) => "after_update_commit",
@@ -1280,17 +1319,30 @@ fn push_symbol_callback(
         )
     };
 
+    let mut body = seq(cb.targets.iter().map(self_call).collect());
     if matches!(cb.hook, Hook::BeforeValidation | Hook::AfterValidation) && cb.on.is_some() {
         // Validations never run on destroy; ingest rejects this.
         let Some(on) = cb.on else { return };
-        let body = seq(cb.targets.iter().map(self_call).collect());
-        let Some(body) = guard_validation_on(body, on, span) else { return };
-        fold_into_or_push(methods, model, hook_name, body);
-    } else {
-        for target in &cb.targets {
-            fold_into_or_push(methods, model, hook_name, self_call(target));
-        }
+        let Some(guarded) = guard_validation_on(body, on, span) else { return };
+        body = guarded;
     }
+    // `if:` / `unless:` — the callback runs only when the condition
+    // holds, exactly as Rails. The condition was already negated for
+    // `unless:` at ingest.
+    if let Some(cond) = &cb.condition {
+        body = Expr::new(
+            span,
+            ExprNode::If {
+                cond: cond.clone(),
+                then_branch: body,
+                else_branch: Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Lit { value: Literal::Nil },
+                ),
+            },
+        );
+    }
+    fold_into_or_push(methods, model, hook_name, body);
 }
 
 /// Wrap a validation-hook body in the `new_record?` guard its `on:`
