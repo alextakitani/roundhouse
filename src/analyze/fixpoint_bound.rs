@@ -27,12 +27,13 @@
 //! every type the public corpora carry (depth 10 and about 320 nodes at
 //! most), so a program without such a cycle is unchanged.
 //!
-//! Gradual is a warning, not an error, and no target rejects it at emit.
-//! These walks are an open gap on Rust whether or not the bound cuts them:
-//! a value that may be a Hash, an Array or a scalar renders as
-//! `serde_json::Value`, which has no `transform_values` and is not an
-//! iterator, so the calls after each `is_a?` check fail `cargo check`
-//! while `check` reports no error. The emitted Ruby runs
+//! Gradual is a warning, not an error, and every emitter accepts it. These
+//! walks are an open gap on Rust whether or not the bound cuts them: a
+//! value that may be a Hash, an Array or a scalar renders as
+//! `serde_json::Value`, which has none of the Hash and Array methods
+//! called on it (`transform_values`, `sort`, `merge`, iteration), and a
+//! `case … when Hash` renders every arm as `_`. The crate fails
+//! `cargo check` while `check` reports no error. The emitted Ruby runs
 //! (`tests/recursive_type_bound.rs`).
 
 use crate::ty::{Param, Row, Ty};
