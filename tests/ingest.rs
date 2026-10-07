@@ -1482,13 +1482,13 @@ fn survey_mode_keeps_the_class_when_one_body_item_is_unsupported() {
 }
 
 #[test]
-fn cattr_classvar_bodies_normalize_to_class_ivars() {
+fn cattr_and_verbatim_classvar_reads_share_storage() {
+    use roundhouse::expr::LValue;
     use roundhouse::ingest::ingest_library_classes;
     use roundhouse::{Expr, ExprNode};
 
-    // The extras/keybase.rb shape: cattr_accessor storage and verbatim
-    // `@@X` reads must agree (class-level ivar), and the `@@X = nil`
-    // body initializer drops as semantically exact.
+    // extras/keybase.rb shape: cattr_accessor and verbatim `@@X` share
+    // Rails class-variable storage; the `@@X = nil` seed is kept.
     let src = br#"class Keybase
   cattr_accessor :DOMAIN
 
@@ -1502,49 +1502,50 @@ end
     let classes = ingest_library_classes(src, "extras/keybase.rb").expect("ingest");
     let kb = &classes[0];
 
-    fn has_classvar(e: &Expr) -> bool {
+    fn has_classvar(e: &Expr, cvar: &str) -> bool {
         let mut found = false;
-        fn walk(e: &Expr, found: &mut bool) {
+        fn walk(e: &Expr, cvar: &str, found: &mut bool) {
             if let ExprNode::Var { name, .. } = &*e.node {
-                if name.as_str().starts_with("@@") {
+                if name.as_str() == cvar {
                     *found = true;
                 }
             }
-            e.node.for_each_child(&mut |c| walk(c, found));
+            e.node.for_each_child(&mut |c| walk(c, cvar, found));
         }
-        walk(e, &mut found);
-        found
-    }
-    fn reads_ivar(e: &Expr, ivar: &str) -> bool {
-        let mut found = false;
-        fn walk(e: &Expr, ivar: &str, found: &mut bool) {
-            if let ExprNode::Ivar { name } = &*e.node {
-                if name.as_str() == ivar {
-                    *found = true;
-                }
-            }
-            e.node.for_each_child(&mut |c| walk(c, ivar, found));
-        }
-        walk(e, ivar, &mut found);
+        walk(e, cvar, &mut found);
         found
     }
 
+    assert!(
+        kb.class_ivar_initializers.iter().any(|expr| {
+            matches!(
+                &*expr.node,
+                ExprNode::Assign {
+                    target: LValue::Var { name, .. },
+                    ..
+                } if name.as_str() == "@@DOMAIN"
+            )
+        }),
+        "@@DOMAIN = nil seed must survive"
+    );
     let enabled = kb
         .methods
         .iter()
         .find(|m| m.name.as_str() == "enabled?")
         .expect("enabled? ingested");
     assert!(
-        !has_classvar(&enabled.body) && reads_ivar(&enabled.body, "DOMAIN"),
-        "class-method @@DOMAIN read should normalize to the @DOMAIN class ivar"
+        has_classvar(&enabled.body, "@@DOMAIN"),
+        "class-method @@DOMAIN read must keep shared class-variable storage"
     );
-    // The cattr_accessor reader uses the same storage.
     let reader = kb
         .methods
         .iter()
         .find(|m| m.name.as_str() == "DOMAIN")
         .expect("cattr reader synthesized");
-    assert!(reads_ivar(&reader.body, "DOMAIN"), "accessor reads @DOMAIN");
+    assert!(
+        has_classvar(&reader.body, "@@DOMAIN"),
+        "accessor reads @@DOMAIN"
+    );
 }
 
 #[test]
@@ -1997,14 +1998,32 @@ fn post_rest_effectful_targets_remain_explicitly_unsupported() {
 }
 
 #[test]
-fn class_method_classvar_writes_cannot_be_normalized_to_per_class_storage() {
+fn class_method_classvar_writes_keep_shared_inheritance_storage() {
+    use roundhouse::expr::ExprNode;
     for method in ["def self.bump", "class << self; def bump"] {
         for write in ["@@count ||= 11", "@@count = 14", "@@count &&= 17", "@@count += 3", "@@count -= 1"] {
             let extra_end = if method.starts_with("class") { "end" } else { "" };
             let source = format!("class Parent; {method}; {write}; @@count; end; {extra_end}; end\nclass Child < Parent; end");
-            let err = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
-                .expect_err("shared classvar storage must not become a class ivar");
-            assert!(err.to_string().contains("shared inheritance storage"), "{err}");
+            let classes = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
+                .expect("shared @@ storage must ingest on class methods");
+            let bump = classes[0]
+                .methods
+                .iter()
+                .find(|m| m.name.as_str() == "bump")
+                .expect("bump");
+            let mut saw = false;
+            bump.body.node.for_each_child(&mut |c| {
+                if matches!(&*c.node, ExprNode::Var { name, .. } if name.as_str() == "@@count") {
+                    saw = true;
+                }
+            });
+            // OpAssign / Assign targets are LValues, not child Exprs — also
+            // accept bodies whose emitted text would read @@count.
+            let text = format!("{:?}", bump.body.node);
+            assert!(
+                saw || text.contains("@@count"),
+                "expected @@count in bump body: {text}"
+            );
         }
     }
 }
@@ -2287,13 +2306,26 @@ fn nested_class_methods_cannot_relocate_native_initializers() {
     ).expect_err("ClassMethods owns @@flag, not the enclosing Probe");
     assert!(err.to_string().contains("class-variable initialization in module ClassMethods is not modeled"), "{err}");
 
-    // A cattr in the same body keeps its pre-existing storage approximation.
+    // A cattr in the same body shares @@ storage; the nil seed relocates
+    // onto Probe with the ClassMethods methods.
     let classes = ingest_library_classes(
         b"module Probe; module ClassMethods; @@flag = nil; cattr_accessor :flag; def read; @@flag; end; end; end",
         "probe.rb",
     ).unwrap();
     let probe = classes.iter().find(|class| class.name.0.as_str() == "Probe").unwrap();
-    assert!(probe.class_ivar_initializers.is_empty());
+    assert!(
+        probe.class_ivar_initializers.iter().any(|expr| {
+            matches!(
+                &*expr.node,
+                roundhouse::expr::ExprNode::Assign {
+                    target: roundhouse::expr::LValue::Var { name, .. },
+                    ..
+                } if name.as_str() == "@@flag"
+            )
+        }),
+        "@@flag seed must fold onto Probe: {:?}",
+        probe.class_ivar_initializers
+    );
     assert!(probe.methods.iter().any(|method| method.name.as_str() == "read"));
 
     // An initializer actually owned by Probe must not be rejected.

@@ -236,7 +236,7 @@ pub(super) fn library_class_and_struct_base(
         None => parent,
     };
 
-    let DeclBody { mut includes, mut methods, mut constants, mut unknown_calls, class_initializers } =
+    let DeclBody { mut includes, mut methods, mut constants, mut unknown_calls, class_initializers, class_attributes: _ } =
         walk_decl_body(class.body(), &owner, file, false)?;
 
     // A `T::Struct` is a class GENERATOR, not an annotation: `const
@@ -1071,7 +1071,7 @@ pub(super) fn library_class_from_module_node_with_scope(
     let owner = ClassId(Symbol::from(full_path.join("::")));
 
     let visibility = Visibility::resolve(module.body().as_ref(), file, Some(&owner))?;
-    let DeclBody { includes, methods, constants, unknown_calls, class_initializers } =
+    let DeclBody { includes, methods, constants, unknown_calls, class_initializers, class_attributes: _ } =
         walk_decl_body_with_visibility(module.body(), &owner, file, false, &visibility)?;
     Ok(LibraryClass {
         name: owner,
@@ -1107,6 +1107,9 @@ struct DeclBody {
     constants: Vec<(Symbol, Expr)>,
     unknown_calls: Vec<Expr>,
     class_initializers: Vec<Expr>,
+    /// `mattr_*` / `cattr_*` attribute names declared in this body —
+    /// used when folding ClassMethods seeds onto the enclosing module.
+    class_attributes: HashSet<Symbol>,
 }
 
 impl DeclBody {
@@ -1116,6 +1119,7 @@ impl DeclBody {
         self.constants.extend(other.constants);
         self.unknown_calls.extend(other.unknown_calls);
         self.class_initializers.extend(other.class_initializers);
+        self.class_attributes.extend(other.class_attributes);
     }
 
     fn finalize_classvars(
@@ -1125,34 +1129,39 @@ impl DeclBody {
         file: &str,
     ) -> IngestResult<()> {
         // Library-class `default:` / block values are not applied here
-        // (model ingest owns those seeds). Mixing the flag with native
-        // @@ initializers would drop or reorder the default — refuse.
-        if has_class_attr_default && !self.class_initializers.is_empty() {
+        // (model ingest owns those seeds). Mixing that flag with a
+        // source-spanned @@ initializer would drop or reorder the
+        // default — refuse. Synthetic seeds alone are fine.
+        if has_class_attr_default
+            && self
+                .class_initializers
+                .iter()
+                .any(|expr| !expr.span.is_synthetic())
+        {
             return Err(IngestError::Unsupported {
                 file: file.into(),
                 message: "cattr/mattr defaults require source-order initialization".into(),
             });
         }
-        // Rails mattr/cattr uses @@ shared across the hierarchy. Seed
-        // `@@attr = nil` when no source initializer and no unmodeled
-        // default (matches `class_variable_set` in Module#mattr_reader).
-        if !has_class_attr_default {
-            let mut attrs: Vec<&Symbol> = class_attributes.iter().collect();
-            attrs.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-            for attr in attrs {
-                let cvar = mattr_cvar_name(attr);
-                let already = self.class_initializers.iter().any(|expr| {
-                    matches!(
-                        &*expr.node,
-                        ExprNode::Assign {
-                            target: LValue::Var { name, .. },
-                            ..
-                        } if name == &cvar
-                    )
-                });
-                if !already {
-                    self.class_initializers.push(mattr_nil_seed(attr));
-                }
+        // Rails mattr/cattr uses @@ shared across the hierarchy. Always
+        // seed `@@attr = nil` when no initializer exists yet (matches
+        // `class_variable_set` in Module#mattr_reader). One declaration
+        // with an unmodeled `default:` must not skip siblings.
+        let mut attrs: Vec<&Symbol> = class_attributes.iter().collect();
+        attrs.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        for attr in attrs {
+            let cvar = mattr_cvar_name(attr);
+            let already = self.class_initializers.iter().any(|expr| {
+                matches!(
+                    &*expr.node,
+                    ExprNode::Assign {
+                        target: LValue::Var { name, .. },
+                        ..
+                    } if name == &cvar
+                )
+            });
+            if !already {
+                self.class_initializers.push(mattr_nil_seed(attr));
             }
         }
         // Source-spanned @@ initializers still need a body with no other
@@ -1174,6 +1183,24 @@ impl DeclBody {
         }
         Ok(())
     }
+}
+
+/// Synthetic mattr nil seeds, or source `@@attr = nil` for a declared
+/// mattr/cattr attr — safe to fold from `module ClassMethods` onto the
+/// enclosing module with the Class-receiver methods.
+fn is_relocatable_mattr_seed(expr: &Expr, class_attributes: &HashSet<Symbol>) -> bool {
+    if expr.span.is_synthetic() {
+        return true;
+    }
+    matches!(
+        &*expr.node,
+        ExprNode::Assign {
+            target: LValue::Var { name, .. },
+            value,
+        } if name.as_str().strip_prefix("@@").is_some_and(|bare| {
+            class_attributes.iter().any(|attr| attr.as_str() == bare)
+        }) && matches!(&*value.node, ExprNode::Lit { value: Literal::Nil })
+    )
 }
 
 /// Receiverless class-body calls that are NOT safe to capture into
@@ -1643,10 +1670,13 @@ fn walk_decl_body_with_visibility<'pr>(
         if let Some(m) = stmt.as_module_node() {
             if module_name_path(&m).as_deref() == Some(&["ClassMethods".to_string()]) {
                 let class_methods = walk_decl_body_with_visibility(m.body(), owner, file, true, visibility)?;
-                // The recursive walk has already applied cattr/mattr handling.
-                // A surviving native initializer belongs to ClassMethods, not
-                // the enclosing module where these methods are materialized.
-                if !class_methods.class_initializers.is_empty() {
+                // ClassMethods methods materialize on the enclosing module.
+                // Mattr/cattr `@@attr = nil` seeds (synthetic or matching a
+                // declared class attribute) relocate with them. Any other
+                // native initializer stays owned by ClassMethods — refuse.
+                if class_methods.class_initializers.iter().any(|expr| {
+                    !is_relocatable_mattr_seed(expr, &class_methods.class_attributes)
+                }) {
                     return Err(IngestError::Unsupported {
                         file: file.into(),
                         message: "class-variable initialization in module ClassMethods is not modeled".into(),
@@ -1775,6 +1805,7 @@ fn walk_decl_body_with_visibility<'pr>(
                         has_class_attr_default |= has_default;
                         if is_class_attr {
                             class_attributes.extend(names.iter().cloned());
+                            out.class_attributes.extend(names.iter().cloned());
                         }
                         let recv = if is_class_attr || force_class_receiver {
                             MethodReceiver::Class
