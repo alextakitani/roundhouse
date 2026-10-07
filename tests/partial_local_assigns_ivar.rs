@@ -52,6 +52,7 @@ fn spinel(files: &[(&str, &str)]) -> Vec<(String, String)> {
     target_files(&app, Path::new("."), BuildTarget::Spinel).expect("spinel files")
 }
 
+/// The emitted source at `path`.
 fn file<'a>(files: &'a [(String, String)], path: &str) -> &'a str {
     &files
         .iter()
@@ -60,6 +61,7 @@ fn file<'a>(files: &'a [(String, String)], path: &str) -> &'a str {
         .1
 }
 
+/// `source` parses as Ruby; the message names `path`.
 fn assert_parses(source: &str, path: &str) {
     let result = ruby_prism::parse(source.as_bytes());
     let errors: Vec<String> = result.errors().map(|e| e.message().to_string()).collect();
@@ -244,4 +246,12 @@ fn a_controller_render_with_locals_passes_the_same_arguments() {
         "error",
         "app/controllers/posts_controller.rb",
     );
+    // The contract lets a same-named local win over the ivar: `error`
+    // receives the local "x", not `@error`.
+    let source = file(&files, "app/controllers/posts_controller.rb");
+    let args = source
+        .lines()
+        .find_map(|l| arg_list(l, "Views::Posts.note("))
+        .unwrap_or_else(|| panic!("no note call:\n{source}"));
+    assert_eq!(args[1], "\"x\"", "args {args:?}\n{source}");
 }
