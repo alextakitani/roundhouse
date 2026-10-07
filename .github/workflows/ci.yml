@@ -1175,7 +1175,8 @@ jobs:
     needs: [spinel-build, plan]
     if: ${{ !cancelled() && contains(fromJSON(needs.plan.outputs.jobs), 'campfire-spinel-build') && needs.spinel-build.outputs.artifact-id != '' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    # 60m: apt alone can take 20m; fetch 5m + emit/build 25m still need room.
+    timeout-minutes: 60
     continue-on-error: true
     outputs:
       artifact-id: ${{ steps.binary.outputs.artifact-id }}
@@ -1423,7 +1424,8 @@ jobs:
     if: ${{ !cancelled() && contains(fromJSON(needs.plan.outputs.jobs), 'campfire-spinel-db') && needs.spinel-build.outputs.artifact-id != '' }}
     outputs: *advisory-outputs
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    # 60m: leave headroom after a slow 20m libvips-dev apt for oracle/emit.
+    timeout-minutes: 60
 
     continue-on-error: true
     services:
