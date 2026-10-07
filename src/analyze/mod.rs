@@ -5336,6 +5336,12 @@ impl Analyzer {
             })
             .filter(|(_, includes)| !includes.is_empty())
             .collect();
+        // `self.classes` is a HashMap: without a fixed order the
+        // includers' observations reach the module's slot in a
+        // different order every run, and a union's variant order (or
+        // any order-sensitive join) leaks into the emitted signature.
+        let mut targets = targets;
+        targets.sort_by(|a, b| a.0.cmp(&b.0));
         let mut adds: Vec<((ClassId, Symbol), Vec<Ty>)> = Vec::new();
         for (id, includes) in targets {
             let mut queue = includes;
@@ -6771,7 +6777,8 @@ fn block_filter_gates(call: &Expr) -> (Vec<Symbol>, Vec<Symbol>) {
 /// joinrules at a higher level — we operate on `Ty` directly, so the
 /// rules are:
 /// - same type → keep
-/// - one side is `Ty::Var` (no info yet) → take the other
+/// - one side is `Ty::Var` (no info yet) → take the other, including
+///   when the other is `Untyped` (`Var` is the bottom of the join)
 /// - one side is `Untyped` (an argument nobody could type) → take the
 ///   other: an untyped observation says nothing about the value, and
 ///   letting it into the union turns every concrete observation into
@@ -6786,10 +6793,23 @@ fn unify_param_ty(stored: Ty, observed: Ty) -> Ty {
     if stored == observed {
         return stored;
     }
-    if matches!(stored, Ty::Var { .. } | Ty::Untyped) {
+    // `Var` is checked on both sides before `Untyped` so the join is
+    // commutative: `Var` (no observation) is below `Untyped` (an
+    // observed argument nobody could type), and `Untyped` is below a
+    // concrete type. Testing `Var | Untyped` together on `stored`
+    // first made `unify(Untyped, Var) = Var` but `unify(Var, Untyped)
+    // = Untyped`, so the result depended on the order call sites
+    // arrived in (#209).
+    if matches!(stored, Ty::Var { .. }) {
         return observed;
     }
-    if matches!(observed, Ty::Var { .. } | Ty::Untyped) {
+    if matches!(observed, Ty::Var { .. }) {
+        return stored;
+    }
+    if matches!(stored, Ty::Untyped) {
+        return observed;
+    }
+    if matches!(observed, Ty::Untyped) {
         return stored;
     }
     // T + Nil → Union<T, Nil>; same for the symmetric case. Skip
