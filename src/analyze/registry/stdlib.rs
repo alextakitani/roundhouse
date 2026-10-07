@@ -498,10 +498,11 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         "TypeError", "NameError", "NoMethodError", "IndexError",
         "KeyError", "RangeError", "IOError", "NotImplementedError",
         "FrozenError", "ZeroDivisionError", "StopIteration",
-        // Both CRuby's bundled libraries and Spinel's uri/net packages
-        // define these exception classes; emitted requires load them.
+        "ThreadError", "ClosedQueueError",
+        // CRuby's bundled libraries and Spinel's uri/net/json packages
+        // recognize these exception names; emitted requires load them.
         "URI::InvalidURIError", "Net::OpenTimeout", "Net::ReadTimeout",
-        "OpenSSL::OpenSSLError", "JSON::ParserError",
+        "OpenSSL::OpenSSLError", "JSON::ParserError", "JSON::GeneratorError",
         // Campfire tip: `rescue SystemCallError` / `OpenSSL::SSL::SSLError`
         // on pooled web-push connections; `rescue Vips::Error` beside
         // ActiveStorage::PreviewError when drawing attachment variants.
@@ -652,6 +653,14 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // Do not invent member or synchronization return types here.
     register_stdlib_class(classes, "Struct", &[], &[]);
     register_stdlib_class(classes, "Mutex", &[], &[]);
+    // The queue constructors, Thread's core aliases, and the standard
+    // mixins likewise need exact entries for source constant resolution.
+    // No queue element, synchronization or mixin method types are added;
+    // the Ruby-family runtimes supply the actual behavior.
+    for name in ["Queue", "SizedQueue", "Thread::Queue", "Thread::SizedQueue",
+        "Thread::Mutex", "Comparable", "Enumerable"] {
+        register_stdlib_class(classes, name, &[], &[]);
+    }
     // `Array.wrap` is folded by `lower::enumerable_ext` before emit.
     // Registered so the analyzer does not report it as unknown. The
     // element type is not known from a scalar argument.
