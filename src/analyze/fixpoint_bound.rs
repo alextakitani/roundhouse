@@ -47,8 +47,13 @@ pub(super) fn bound(ty: Ty) -> Ty {
     let mut limit = measure(&ty).0.min(MAX_DEPTH);
     loop {
         let cut = cut(&ty, limit);
-        if limit == 0 || measure(&cut).1 <= MAX_NODES {
+        if measure(&cut).1 <= MAX_NODES {
             return cut;
+        }
+        // A union with more leaf arms than the node bound has no nesting
+        // left to cut.
+        if limit == 0 {
+            return Ty::Untyped;
         }
         limit -= 1;
     }
@@ -150,6 +155,7 @@ fn cut(ty: &Ty, levels: usize) -> Ty {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ident::{ClassId, Symbol};
 
     fn arr(elem: Ty) -> Ty {
         Ty::Array { elem: Box::new(elem) }
@@ -215,6 +221,14 @@ mod tests {
         assert!(cut_nodes <= MAX_NODES, "{cut_nodes} nodes");
         assert!(cut_depth < depth);
         assert!(cut.mentions_unknown());
+    }
+
+    #[test]
+    fn a_leaf_union_wider_than_the_node_bound_is_untyped() {
+        let classes = (0..MAX_NODES).map(|i| Ty::Class { id: ClassId(Symbol::from(format!("C{i}").as_str())), args: vec![] });
+        let wide = body::union_many(classes.chain([arr(Ty::Int)]).collect());
+        assert!(measure(&wide).1 > MAX_NODES);
+        assert_eq!(bound(wide), Ty::Untyped);
     }
 
     #[test]
