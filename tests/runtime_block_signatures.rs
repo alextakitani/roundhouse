@@ -180,6 +180,64 @@ end
 }
 
 #[test]
+fn class_side_blocks_win_when_instance_shares_the_name() {
+    // Registry already has an instance `rows` block contract. Same-file
+    // class-side `rows` overlays the class table. Class-object calls must
+    // bind the class contract, not the instance one (dispatch order).
+    let ruby = r#"
+class BothSides
+  def self.rows
+    yield 7
+    nil
+  end
+
+  def self.consume
+    total = 0
+    rows { |n| total = n + 1 }
+    total
+  end
+end
+"#;
+    let rbs = r#"
+class BothSides
+  def self.rows: () { (Integer) -> void } -> nil
+  def self.consume: () -> Integer
+end
+"#;
+    let batch_id = ClassId(Symbol::from("BothSides"));
+    let mut batch = ClassInfo::default();
+    batch.instance_methods.insert(
+        Symbol::from("rows"),
+        Ty::Fn {
+            params: vec![],
+            ret: Box::new(Ty::Nil),
+            block: Some(Box::new(Ty::Fn {
+                params: vec![roundhouse::ty::Param {
+                    name: Symbol::from("s"),
+                    ty: Ty::Str,
+                    kind: roundhouse::ty::ParamKind::Required,
+                }],
+                ret: Box::new(Ty::Nil),
+                block: None,
+                effects: roundhouse::effect::EffectSet::default(),
+            })),
+            effects: roundhouse::effect::EffectSet::default(),
+        },
+    );
+    let classes = HashMap::from([(batch_id, batch)]);
+    let methods = parse_methods_with_rbs_in_ctx(ruby, rbs, &classes).expect("runtime parses");
+    let consume = method(&methods, "consume");
+    assert_eq!(consume.body.ty, Some(Ty::Int));
+    assert_no_inference_gaps(&consume.body);
+    assert_local_type(&consume.body, "n", Ty::Int);
+    assert_emitted_ruby(
+        &methods,
+        "BothSides",
+        "raise 'wrong sum' unless BothSides.consume == 8",
+    );
+}
+
+#[test]
 fn non_block_methods_keep_cross_file_return_types() {
     let ruby = r#"
 class RegistryProbe

@@ -916,6 +916,7 @@ pub fn parse_methods_with_rbs_in_ctx(
                      ivars: &std::collections::HashMap<Symbol, Ty>|
      -> crate::analyze::Ctx {
         let mut ctx = crate::analyze::Ctx::default();
+        ctx.class_side = m.receiver == MethodReceiver::Class;
         if let Some(Ty::Fn { params, .. }) = &m.signature {
             for (param, p) in m.params.iter().zip(params.iter()) {
                 ctx.local_bindings.insert(param.name.clone(), p.ty.clone());

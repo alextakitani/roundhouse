@@ -213,6 +213,7 @@ impl<'a> BodyTyper<'a> {
         recv_ty: Option<&Ty>,
         method: &Symbol,
         args: &[Expr],
+        class_object_receiver: bool,
         block: &Expr,
     ) -> Ctx {
         let mut new_ctx = outer.clone();
@@ -257,7 +258,7 @@ impl<'a> BodyTyper<'a> {
             }
             return new_ctx;
         }
-        let Some(param_tys) = self.block_params_for(recv_ty, method) else {
+        let Some(param_tys) = self.block_params_for(recv_ty, method, class_object_receiver) else {
             return new_ctx;
         };
         for (name, ty) in params.iter().zip(param_tys.iter()) {
@@ -321,10 +322,13 @@ impl<'a> BodyTyper<'a> {
 
 /// Per-param types a block yields, given the receiver type and method.
     /// `None` means "no binding info available" — params stay unknown.
+    /// `class_object_receiver` picks class-method block contracts before
+    /// instance ones, matching ordinary dispatch on a class/module object.
     pub(super) fn block_params_for(
         &self,
         recv_ty: Option<&Ty>,
         method: &Symbol,
+        class_object_receiver: bool,
     ) -> Option<Vec<Ty>> {
         let recv_ty = recv_ty?;
         if matches!(recv_ty, Ty::Class { id, .. } if id.0.as_str() == PARAM_VALUE) {
@@ -351,7 +355,7 @@ impl<'a> BodyTyper<'a> {
             let as_array = Ty::Array {
                 elem: Box::new(elems.iter().cloned().reduce(union_of).unwrap_or(Ty::Untyped)),
             };
-            return self.block_params_for(Some(&as_array), method);
+            return self.block_params_for(Some(&as_array), method, class_object_receiver);
         }
         match recv_ty {
             Ty::Str if method.as_str() == "bytes" => Some(vec![Ty::Int]),
@@ -378,7 +382,7 @@ impl<'a> BodyTyper<'a> {
                 let as_array = Ty::Array {
                     elem: Box::new(Ty::Class { id: of.clone(), args: vec![] }),
                 };
-                self.block_params_for(Some(&as_array), method)
+                self.block_params_for(Some(&as_array), method, class_object_receiver)
             }
             Ty::Hash { key, value } => match method.as_str() {
                 "each" | "each_pair" | "map" | "collect"
@@ -435,11 +439,16 @@ impl<'a> BodyTyper<'a> {
                     for c in std::iter::once(cls)
                         .chain(cls.includes.iter().filter_map(|m| self.classes().get(m)))
                     {
-                        if let Some(sig) = c
-                            .instance_methods
-                            .get(method)
-                            .or_else(|| c.class_methods.get(method))
-                        {
+                        let sig = if class_object_receiver {
+                            c.class_methods
+                                .get(method)
+                                .or_else(|| c.instance_methods.get(method))
+                        } else {
+                            c.instance_methods
+                                .get(method)
+                                .or_else(|| c.class_methods.get(method))
+                        };
+                        if let Some(sig) = sig {
                             // The block's yield may name the receiver
                             // (`{ (instance) -> void }`); substitute
                             // against the class the walk started from,
@@ -489,7 +498,9 @@ impl<'a> BodyTyper<'a> {
                     if matches!(v, Ty::Nil | Ty::Var { .. }) {
                         continue;
                     }
-                    if let Some(params) = self.block_params_for(Some(v), method) {
+                    if let Some(params) =
+                        self.block_params_for(Some(v), method, class_object_receiver)
+                    {
                         return Some(params);
                     }
                 }
