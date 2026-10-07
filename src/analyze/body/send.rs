@@ -97,6 +97,40 @@ impl<'a> BodyTyper<'a> {
         })
     }
 
+    /// Rails' per-column dynamic finders (`find_by_<attr>`,
+    /// `find_by_<attr>!`) are generated at runtime for any real column —
+    /// the same shape `find_by`/`find_by!` already type, just spelled
+    /// with the attribute baked into the method name instead of passed
+    /// as a keyword. Column existence is checked against the model's
+    /// actual schema table (`ClassInfo::has_schema_column` — the same
+    /// check the arel lowerer's `normalize_dynamic_finder_send` makes,
+    /// #558): an attribute no known column backs isn't a dynamic
+    /// finder (and the pipeline has no runtime for inventing one), so
+    /// it falls through to "no known method" rather than guessing. This
+    /// runs only once the caller has already checked `class_methods`
+    /// for the name (see the call site), so a real class method of this
+    /// shape — a `has_secure_password` token finder, say — still wins.
+    fn dynamic_finder_ty(&self, model: &ClassId, method: &Symbol) -> Option<Ty> {
+        let (base, bang) = match method.as_str().strip_suffix('!') {
+            Some(base) => (base, true),
+            None => (method.as_str(), false),
+        };
+        let attr = base.strip_prefix("find_by_")?;
+        if attr.is_empty() {
+            return None;
+        }
+        let cls = self.classes().get(model)?;
+        if !cls.has_schema_column(&Symbol::from(attr)) {
+            return None;
+        }
+        let kind = if bang {
+            crate::catalog::ReturnKind::SelfType
+        } else {
+            crate::catalog::ReturnKind::SelfOrNil
+        };
+        Some(crate::analyze::instantiate_return_kind(kind, model))
+    }
+
     /// `rel.group(:col).count` — Rails' GROUPED count, a Hash of
     /// group-key => COUNT rather than the scalar Integer.
     ///
@@ -1754,6 +1788,13 @@ impl<'a> BodyTyper<'a> {
                         }
                         _ => {}
                     }
+                }
+                // No class-side entry claimed this name (including a
+                // hand-written `self.find_by_<attr>`, caught above) — a
+                // per-column dynamic finder is the last static reading
+                // before falling to the Enumerable surface (#558).
+                if let Some(t) = self.dynamic_finder_ty(of, method) {
+                    return t;
                 }
                 let elem = Ty::Class { id: of.clone(), args: vec![] };
                 array_method(method, &elem, block_ret)

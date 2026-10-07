@@ -254,6 +254,21 @@ pub struct ClassInfo {
     pub app_declared: bool,
 }
 
+impl ClassInfo {
+    /// Whether `name` is one of this model's real SCHEMA TABLE columns.
+    /// `attributes` is built once, straight off `Schema::tables` (see
+    /// `ingest::model::row_from_table`), never merged with method-only
+    /// surface like a `has_secure_password` reader or a plain `def` —
+    /// so this is a strictly narrower, more precise test than "does
+    /// `instance_methods` know this name," which also answers yes for
+    /// synthesized non-column readers (`password_reset_token`). Shared
+    /// by the body-typer's and the arel lowerer's dynamic-finder
+    /// handling (#558) so a per-column check can't drift between them.
+    pub fn has_schema_column(&self, name: &Symbol) -> bool {
+        self.attributes.fields.contains_key(name)
+    }
+}
+
 /// Resolve a single-segment Const ref (like `Const { path:
 /// ["HashWithIndifferentAccess"] }` from app source) to a fully-
 /// qualified ClassId by walking the class registry. Returns the
