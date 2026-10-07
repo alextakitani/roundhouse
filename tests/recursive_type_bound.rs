@@ -17,6 +17,9 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
+#[path = "support/emit_and_run.rs"]
+mod emit_and_run;
+
 use roundhouse::analyze::{diagnose, Analyzer, Severity};
 use roundhouse::ident::{ClassId, Symbol};
 use roundhouse::ingest::ingest_app_from_tree;
@@ -188,9 +191,7 @@ fn analyze(files: &[(&str, &str)], methods: &[(&str, &str, bool)]) -> Settled {
     }
     let methods: Vec<(String, String, bool)> =
         methods.iter().map(|(c, m, s)| (c.to_string(), m.to_string(), *s)).collect();
-    let (tx, rx) = mpsc::channel();
-    let worker = std::thread::Builder::new().stack_size(64 << 20);
-    worker.spawn(move || {
+    watched(move || {
         let mut app = ingest_app_from_tree(tree).expect("ingest");
         let mut analyzer = Analyzer::new(&app);
         analyzer.analyze(&mut app);
@@ -213,13 +214,25 @@ fn analyze(files: &[(&str, &str)], methods: &[(&str, &str, bool)]) -> Settled {
             .filter(|d| d.severity == Severity::Error)
             .map(|d| d.message)
             .collect();
-        let _ = tx.send(Settled { returns, params, errors });
+        Settled { returns, params, errors }
     })
-    .expect("spawn analysis");
+}
+
+/// Run `work` on a worker thread with a main-thread-sized stack, and stop
+/// the binary if it outlives [`TIMEOUT`] or the process passes
+/// [`MEMORY_LIMIT_MIB`].
+fn watched<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = mpsc::channel();
+    let worker = std::thread::Builder::new().stack_size(64 << 20);
+    worker
+        .spawn(move || {
+            let _ = tx.send(work());
+        })
+        .expect("spawn analysis");
     let started = Instant::now();
     loop {
         match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(settled) => return settled,
+            Ok(done) => return done,
             Err(RecvTimeoutError::Disconnected) => panic!("analysis panicked"),
             Err(RecvTimeoutError::Timeout) => {}
         }
@@ -297,4 +310,73 @@ fn a_self_recursive_walk_settles_bounded() {
         &[("TreesController", "walk", false)],
     );
     assert_bounded(&settled);
+}
+
+/// The call sites live in the class, so analysis sees the same feedback
+/// as the controllers above.
+const TREE_WALK: &str = r#"
+class TreeWalk
+  def walked
+    walk_0({ "a" => [1, { "b" => "x" }] })
+  end
+
+  def canonicalized
+    inner = canonical({ "b" => [1, "x"] })
+    canonical({ "a" => inner.merge("d" => 2), "c" => [inner.merge("e" => nil)] })
+  end
+
+  def walk_0(value)
+    if value.is_a?(Hash)
+      value.transform_values { |v| walk_1(v) }
+    elsif value.is_a?(Array)
+      value.map { |v| walk_1(v) }
+    else
+      value
+    end
+  end
+
+  def walk_1(value)
+    if value.is_a?(Hash)
+      value.transform_values { |v| walk_0(v) }
+    elsif value.is_a?(Array)
+      value.map { |v| walk_0(v) }
+    else
+      value
+    end
+  end
+
+  def canonical(value)
+    case value
+    when Hash then value.sort.to_h { |k, v| [k.to_s, canonical(v)] }
+    when Array then value.map { |v| canonical(v) }
+    else value
+    end
+  end
+end
+"#;
+
+/// A clean `check` on these shapes is a claim that they run: the bounded
+/// types must not cost the emitted program its values.
+#[test]
+fn the_cycle_and_the_merged_back_result_run_once_emitted() {
+    let run = watched(|| {
+        emit_and_run::empty_app()
+            .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
+            .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
+            .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"probes\" do |t|\n    t.string \"name\"\n  end\nend\n")
+            .write("app/models/tree_walk.rb", TREE_WALK)
+            .run_ruby(
+                r#"
+walk = TreeWalk.new
+walked = walk.walked
+raise "cycle lost values: #{walked.inspect}" unless walked == { "a" => [1, { "b" => "x" }] }
+canonical = walk.canonicalized
+expected = { "a" => { "b" => [1, "x"], "d" => 2 }, "c" => [{ "b" => [1, "x"], "e" => nil }] }
+raise "merge feedback lost values: #{canonical.inspect}" unless canonical == expected
+raise "canonical kept a Symbol key" unless walk.canonical({ b: { c: 1 } }) == { "b" => { "c" => 1 } }
+puts "recursive walks ran"
+"#,
+            )
+    });
+    run.assert_passes();
 }
