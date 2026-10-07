@@ -438,9 +438,20 @@ fn compact_and_extra_compare_share_commands_but_not_results() {
         controller_identity["if"].as_str(),
         Some("${{ !cancelled() && matrix.target == 'rust' }}")
     );
-    assert_eq!(
-        controller_identity["run"].as_str(),
-        Some("cargo test --locked --test rust_toolchain real_blog_controller_identity_values_match_rails -- --ignored --nocapture --exact")
+    let identity_run = controller_identity["run"].as_str().unwrap();
+    let cargo_command = concat!(
+        "cargo test --locked --test rust_toolchain ",
+        "real_blog_controller_identity_values_match_rails -- --ignored --nocapture --exact"
+    );
+    assert!(
+        identity_run.contains(&format!("if output=$({cargo_command} 2>&1); then")),
+        "the required Rust toolchain command and exact filter must be preserved:\n{identity_run}"
+    );
+    let success_check =
+        "grep -Fxq 'test real_blog_controller_identity_values_match_rails ... ok' <<< \"$output\"";
+    assert!(
+        identity_run.contains(success_check),
+        "the selected outer test must produce its exact success line:\n{identity_run}"
     );
     assert!(
         controller_identity["continue-on-error"].is_null()
@@ -511,6 +522,80 @@ fn compact_and_extra_compare_share_commands_but_not_results() {
     assert_eq!(ci["permissions"]["contents"].as_str(), Some("read"));
     assert!(ci["permissions"].get("pages").is_none());
     assert!(ci["permissions"].get("id-token").is_none());
+}
+
+/// Verifies the required Rust identity step needs execution and preserves Cargo failures.
+#[cfg(unix)]
+#[test]
+fn rust_identity_ci_guard_requires_execution_and_propagates_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let ci: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
+    let step = ci["jobs"]["compare"]["steps"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .find(|step| {
+            step["name"].as_str()
+                == Some("cargo test --test rust_toolchain controller identity values")
+        })
+        .unwrap();
+
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "rust-identity-ci-{}-{unique}",
+        std::process::id()
+    ));
+    fs::create_dir(&root).unwrap();
+    let cargo = root.join("cargo");
+    fs::write(
+        &cargo,
+        r#"#!/bin/sh
+printf '<%s>\n' "$@" >> "$CARGO_LOG"
+case "$CARGO_MODE" in
+  success) printf '%s\n' 'test real_blog_controller_identity_values_match_rails ... ok'; exit 0 ;;
+  zero_match) printf '%s\n' 'running 0 tests'; exit 0 ;;
+  forged_success_on_failure) printf '%s\n' 'test real_blog_controller_identity_values_match_rails ... ok'; exit 37 ;;
+  *) exit 64 ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let cargo_args = "<test>\n<--locked>\n<--test>\n<rust_toolchain>\n<real_blog_controller_identity_values_match_rails>\n<-->\n<--ignored>\n<--nocapture>\n<--exact>\n";
+    for (mode, expected_status) in [
+        ("success", 0),
+        ("zero_match", 1),
+        ("forged_success_on_failure", 37),
+    ] {
+        let log = root.join("cargo.log");
+        fs::write(&log, "").unwrap();
+        let result = Command::new("bash")
+            .args(["-e", "-o", "pipefail", "-c", step["run"].as_str().unwrap()])
+            .env("CARGO_LOG", &log)
+            .env("CARGO_MODE", mode)
+            .env("CARGO_TERM_COLOR", "always")
+            .env(
+                "PATH",
+                format!("{}:{}", root.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap();
+        assert_eq!(
+            result.status.code(),
+            Some(expected_status),
+            "{mode}: {result:?}"
+        );
+        assert_eq!(fs::read_to_string(log).unwrap(), cargo_args);
+    }
+
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

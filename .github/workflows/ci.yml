@@ -2111,7 +2111,20 @@ jobs:
       # Not separate jobs: each target's framework-tests and toolchain suites ride the compare job that already installs its toolchain (#273).
       - name: cargo test --test rust_toolchain controller identity values
         if: ${{ !cancelled() && matrix.target == 'rust' }}
-        run: cargo test --locked --test rust_toolchain real_blog_controller_identity_values_match_rails -- --ignored --nocapture --exact
+        run: |
+          if output=$(cargo test --locked --test rust_toolchain real_blog_controller_identity_values_match_rails -- --ignored --nocapture --exact 2>&1); then
+            cargo_status=0
+          else
+            cargo_status=$?
+          fi
+          printf '%s\n' "$output"
+          if [ "$cargo_status" -ne 0 ]; then
+            exit "$cargo_status"
+          fi
+          if ! grep -Fxq 'test real_blog_controller_identity_values_match_rails ... ok' <<< "$output"; then
+            echo '::error::Rust controller identity test did not execute successfully'
+            exit 1
+          fi
       - name: cargo test --test framework_tests_rust (green subset)
         id: inflector
         if: ${{ !cancelled() && matrix.target == 'rust' }}
