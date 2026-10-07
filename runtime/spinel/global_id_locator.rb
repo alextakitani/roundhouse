@@ -70,7 +70,11 @@ module GlobalID
     # `lower::global_id_locate` rewrites a literal `only:` to a
     # generated `locate_signed_<model>(sgid, purpose)` entry point so
     # a strict target never dispatches through a class object.
-    def self.locate_signed(sgid, only:, for: purpose)
+    # `for` is a Ruby reserved word, so the keyword cannot be bound to
+    # a plain local via `for: purpose` (that form is a DEFAULT of
+    # `purpose`, not an alias). Pull it from `**opts` instead.
+    def self.locate_signed(sgid, only:, **opts)
+      purpose = opts[:for]
       parts = parts_from_signed(sgid, purpose)
       return nil if parts.nil?
       return nil unless parts[1] == only.name
