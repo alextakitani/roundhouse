@@ -17,7 +17,7 @@ use crate::ident::VarId;
 use crate::span::Span;
 use crate::{ClassId, Symbol};
 
-use super::expr::ingest_expr;
+use super::expr::{ingest_expr, ingest_expr_strict};
 use super::visibility::{self, Visibility};
 use super::util::{
     class_name_path, constant_id_str, constant_path_of, find_all_classes_with_scope,
@@ -2046,9 +2046,16 @@ fn library_mattr_claim(
                     };
                     match symbol_value(&assoc.key()).as_deref() {
                         Some("default") if default.is_none() => {
-                            match ingest_expr(&assoc.value(), file) {
+                            // Strict: survey-mode nil substitution must not
+                            // become a claimed `@@attr = nil` default.
+                            match ingest_expr_strict(&assoc.value(), file) {
                                 Ok(expr) => default = Some(expr),
-                                Err(_) => unmodeled = true,
+                                Err(err) => {
+                                    if super::survey::is_active() {
+                                        super::survey::record(&err);
+                                    }
+                                    unmodeled = true;
+                                }
                             }
                         }
                         Some("default") => unmodeled = true,
@@ -2073,9 +2080,14 @@ fn library_mattr_claim(
         let Some(body) = block_node.body() else {
             return Ok(LibraryMattrClaim::Unmodeled);
         };
-        match ingest_expr(&body, file) {
+        match ingest_expr_strict(&body, file) {
             Ok(expr) => default = Some(expr),
-            Err(_) => return Ok(LibraryMattrClaim::Unmodeled),
+            Err(err) => {
+                if super::survey::is_active() {
+                    super::survey::record(&err);
+                }
+                return Ok(LibraryMattrClaim::Unmodeled);
+            }
         }
     }
     if unmodeled || (default.is_some() && other_kwargs) {
