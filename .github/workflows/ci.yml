@@ -2441,8 +2441,10 @@ jobs:
     needs: [build-site, plan]
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.build-site.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'smoke') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-
+    # 30m matches browser-smoke / campfire smoke: shared ci-playwright-install
+    # may spend most of a slow apt day on install-deps before emit/test work.
+    # (Do not regress to 15m — slow Azure apt can burn ~20m on install alone.)
+    timeout-minutes: 30
     permissions:
       contents: read
       actions: read
@@ -2619,8 +2621,7 @@ jobs:
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.build-site.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'smoke-extra') }}
     continue-on-error: ${{ needs.plan.outputs.extras-advisory == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-
+    timeout-minutes: 30
     permissions:
       contents: read
       actions: read
@@ -2647,8 +2648,7 @@ jobs:
     if: ${{ !cancelled() && contains(fromJSON(needs.plan.outputs.jobs), 'spinel-smoke') && needs.build-site.result == 'success' && needs.spinel-build.outputs.artifact-id != '' }}
     outputs: *advisory-outputs
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-
+    timeout-minutes: 30
     continue-on-error: true
     env:
       MAKEFLAGS: "-j4"
