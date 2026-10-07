@@ -85,6 +85,13 @@ in `src/project.rs`. Shape notes worth knowing:
   `scaffold/` tree overlaid into
   every emitted Ruby/Spinel project, and a `test/` tree of
   target-specific test files.
+- `runtime/spinel/db_pg.rb` implements the same `Db` contract over
+  PostgreSQL, on the pure-Ruby spinel-pg driver (no libpq). No target
+  selects it yet. `tests/spinel_pg_db.rs` compiles it with Spinel and
+  runs it against a live server. Until `INSERT … RETURNING` lands,
+  `Db.last_insert_rowid` reads the inserted table's own sequence, so
+  only serial and identity keys work; any other key raises. The SQLite-only boot hooks (read snapshot,
+  checkpointer) do nothing there, and `seed_from_file` raises.
 
 ## Framework runtime — `runtime/ruby/`
 

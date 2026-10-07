@@ -52,6 +52,10 @@ env:
   RUBY_BENCH_SHA: d771f81f1ce9db51376e03ca7b8e6a83160556d4
   CAMPFIRE_SHA: 90b330024dec3e757c79b6a7e6568f93da8e3148
   WRITEBOOK_SHA: f3fadd21907ad9b18cb23800d971c2cc25045e2a
+  # rubys/spinel-pg, the PostgreSQL driver the Spinel Db shim
+  # (runtime/spinel/db_pg.rb) is tested against in spinel-framework.
+  # Pinned like the apps above; bump deliberately.
+  SPINEL_PG_SHA: f48735c91aa8cde258299e1189957972667a0d1f
 
 jobs:
   plan:
@@ -986,10 +990,27 @@ jobs:
     timeout-minutes: 25
 
     continue-on-error: ${{ needs.plan.outputs.spinel-advisory == 'true' }}
+    # spinel_pg_db runs the PostgreSQL Db shim against this server.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
     env:
       MAKEFLAGS: "-j4"
     steps:
       - uses: actions/checkout@v7
+      - name: Check out spinel-pg (pinned)
+        if: ${{ contains(fromJSON(needs.plan.outputs.spinel-tests), 'spinel_pg_db') }}
+        uses: actions/checkout@v7
+        with:
+          repository: rubys/spinel-pg
+          ref: ${{ env.SPINEL_PG_SHA }}
+          path: spinel-pg
       - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@v2
       - uses: actions/download-artifact@v8
@@ -1010,6 +1031,9 @@ jobs:
       - name: Run selected native framework checks
         env:
           TESTS: ${{ join(fromJSON(needs.plan.outputs.spinel-tests), ' ') }}
+          # Inputs of spinel_pg_db only; it fails without them.
+          SPINEL_PG_DIR: ${{ github.workspace }}/spinel-pg
+          DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
         run: |
           test -n "$TESTS"
           status=0
