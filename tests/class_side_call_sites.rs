@@ -1,4 +1,4 @@
-//! A call through `x.class` is evidence for the class-side method only.
+//! An `x.class.foo` call site is not param evidence for an instance `def foo`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -30,6 +30,15 @@ fn params_of_get(client: &str) -> Vec<Ty> {
     )
 }
 
+/// The caller's `{ a: 1 }` joined with the `{}` default: no `{ query: … }` arm.
+fn caller_options_hash() -> Ty {
+    let unknown = || Ty::Var { var: roundhouse::ident::TyVar(0) };
+    Ty::Hash {
+        key: Box::new(Ty::Union { variants: vec![Ty::Sym, unknown()] }),
+        value: Box::new(Ty::Union { variants: vec![Ty::Int, unknown()] }),
+    }
+}
+
 /// HTTParty gives the class a `get(url, options)`; `self.class.get` inside
 /// the instance `get` is that call, not a recursive one. Read as the
 /// instance method's own site, `params` took `{ query: params }` and
@@ -40,13 +49,7 @@ fn a_class_side_call_does_not_feed_the_instance_method_of_the_same_name() {
     let params = params_of_get(
         "class Client\n  include HTTParty\n\n  def get(path, params = {})\n    options = { query: params }\n    self.class.get(path, options)\n  end\nend\n",
     );
-    // The caller's `{ a: 1 }` joined with the `{}` default: no `{ query: … }` arm.
-    let unknown = || Ty::Var { var: roundhouse::ident::TyVar(0) };
-    let caller = Ty::Hash {
-        key: Box::new(Ty::Union { variants: vec![Ty::Sym, unknown()] }),
-        value: Box::new(Ty::Union { variants: vec![Ty::Int, unknown()] }),
-    };
-    assert_eq!(params[1], caller);
+    assert_eq!(params[1], caller_options_hash());
 }
 
 /// Same shape when the class also defines `def self.get`: the shared
@@ -57,12 +60,7 @@ fn both_sides_class_call_still_does_not_feed_the_instance_method() {
     let params = params_of_get(
         "class Client\n  def self.get(url, options = {})\n    [url, options]\n  end\n\n  def get(path, params = {})\n    options = { query: params }\n    self.class.get(path, options)\n  end\nend\n",
     );
-    let unknown = || Ty::Var { var: roundhouse::ident::TyVar(0) };
-    let caller = Ty::Hash {
-        key: Box::new(Ty::Union { variants: vec![Ty::Sym, unknown()] }),
-        value: Box::new(Ty::Union { variants: vec![Ty::Int, unknown()] }),
-    };
-    assert_eq!(params[1], caller);
+    assert_eq!(params[1], caller_options_hash());
 }
 
 /// A mailer's class-side call is how its instance method runs. Under

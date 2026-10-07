@@ -5691,11 +5691,11 @@ impl Analyzer {
                 // method. Constant receivers stay: `UserMailer.welcome(user)`
                 // and an `extend self` module's `GlobalPath.cdn_path(p)` are
                 // how their instance methods run.
-                let via_class = recv.as_ref().is_some_and(|r| {
-                    matches!(&*r.node, ExprNode::Send { method, args, .. }
-                        if method.as_str() == "class" && args.is_empty())
+                let via_dot_class = recv.as_ref().is_some_and(|r| {
+                    matches!(&*r.node, ExprNode::Send { method: m, args, .. }
+                        if m.as_str() == "class" && args.is_empty())
                 });
-                if via_class {
+                if via_dot_class {
                     recv_classes.retain(|c| {
                         !self.classes.get(c).is_some_and(|k| {
                             k.instance_methods.contains_key(method)
