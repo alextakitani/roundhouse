@@ -629,6 +629,11 @@ build_spinel_binary() {
         || { fail "spinel build failed (see $LOG_DIR/build-spinel.log)"; return 1; }
     [[ -x "$SP_EMIT/build/bin/blog" ]] \
         || { fail "spinel build produced no binary"; return 1; }
+    # The binary serves static/assets, which only `make assets` fills:
+    # without it every stylesheet the room page links is a 404.
+    step "staging the spinel tree's assets"
+    ( cd "$SP_EMIT" && make assets ) > "$LOG_DIR/assets-spinel.log" 2>&1 \
+        || fail "spinel make assets failed (see $LOG_DIR/assets-spinel.log)"
     ok "spinel binary at $SP_EMIT/build/bin/blog"
 }
 

@@ -162,6 +162,13 @@ cells.each { |c| by[c['endpoint']][c['target']] = c }
 # that makes campfire's comparison honest, was dropped from every chart,
 # leaving a page that said "Rails is 1.6x faster" by omission. What a
 # report renders is the data it was handed. The hint only orders it.
+# How a route reads on the page. campfire's per-route suite records the
+# lane-specific paths as placeholders ({avatar}, {css}) and writes as
+# `POST:<path>`; the record keeps those so cells line up across lanes.
+def ep_label(ep)
+  ep.sub(/\APOST:/, 'POST ').sub('{avatar}', ':avatar_token').sub(/\A\{css\}\z/, 'a stylesheet (/assets/*.css)')
+end
+
 def order_first(values, hint)
   known = hint & values
   known + (values - known).sort
@@ -722,7 +729,7 @@ html << h2.('Throughput across targets')
 html << %(<p>Each endpoint is its own chart. Bars are log-scaled; raw req/sec is shown at the right.</p>\n)
 endpoints.each do |ep|
   rows = targets.map { |t| by[ep][t] }.compact
-  html << "<h3>#{ep}</h3>\n"
+  html << "<h3>#{ep_label(ep)}</h3>\n"
   html << hbar_log(rows, metric: 'req_sec', unit: 'req/sec')
 end
 
@@ -741,7 +748,7 @@ if (%w[ruby rails] - measured_targets).empty?
     ruby_v  = by[ep]['ruby']&.dig('req_sec').to_f
     rails_v = by[ep]['rails']&.dig('req_sec').to_f
     {
-      label:      ep,
+      label:      ep_label(ep),
       annotation: rails_v > 0 ? "#{fmt_dec(ruby_v / rails_v, 1)}×" : '',
       values:     { 'ruby' => ruby_v, 'rails' => rails_v },
     }
@@ -828,7 +835,7 @@ html << <<~P
 P
 endpoints.each do |ep|
   rows = targets.map { |t| by[ep][t] }.compact
-  html << "<h3>#{ep}</h3>\n"
+  html << "<h3>#{ep_label(ep)}</h3>\n"
   html << hbar_log(rows, metric: 'rps_per_gb', unit: 'req/sec/GB')
 end
 
@@ -958,13 +965,13 @@ if endpoints.size > lat_order.size
   lat_order.each { html << "<th>p50</th><th>p99</th>" }
   html << "</tr></thead>\n<tbody>\n"
   endpoints.each do |ep|
-    html << "<tr><td><code>#{ep}</code></td>"
+    html << "<tr><td><code>#{ep_label(ep)}</code></td>"
     lat_order.each { |tgt| html << lat_pair.(by[ep][tgt]) }
     html << "</tr>\n"
   end
 else
   html << "<table>\n<thead><tr><th>target</th>"
-  endpoints.each { |ep| html << "<th colspan=2>#{ep}</th>" }
+  endpoints.each { |ep| html << "<th colspan=2>#{ep_label(ep)}</th>" }
   html << "</tr>\n<tr><th></th>"
   endpoints.each { html << "<th>p50</th><th>p99</th>" }
   html << "</tr></thead>\n<tbody>\n"
@@ -1069,7 +1076,7 @@ unless parity_rows.empty?
   html << "<table>\n<thead><tr><th>lane</th><th>endpoint</th><th>status</th><th>tags</th><th>bytes</th></tr></thead>\n<tbody>\n"
   parity_rows.each do |line|
     lane, ep, status, tags, bytes = line.split("\t").map { |f| f.to_s.sub(/\A[a-z_]+=/, '') }
-    html << %(<tr><td>#{lane}</td><td><code>#{ep}</code></td>) +
+    html << %(<tr><td>#{lane}</td><td><code>#{ep_label(ep)}</code></td>) +
             %(<td class="num">#{status}</td><td class="num">#{fmt_int(tags.to_i)}</td>) +
             %(<td class="num">#{fmt_int(bytes.to_i)}</td></tr>\n)
   end
