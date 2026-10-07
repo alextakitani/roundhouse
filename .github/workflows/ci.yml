@@ -1198,9 +1198,13 @@ jobs:
       - name: System libvips + libsqlite3-dev + libjemalloc-dev
         # libvips-dev pulls ~150 packages; slow Azure apt has burned 8m
         # mid-download (Full validation 37683643149 campfire-smoke).
+        # Cache .deb archives (not dpkg); still run ci-apt-install. Shared
+        # package set with smoke/compare/db-diff so one cache key warms all.
+        # Keep the 20m step budget (#590): cache miss still hits the network.
         timeout-minutes: 20
-        run: |
-          "$GITHUB_WORKSPACE/scripts/ci-apt-install" libvips-dev libsqlite3-dev libjemalloc-dev
+        uses: ./.github/actions/ci-apt-install-cached
+        with:
+          packages: libvips-dev libsqlite3-dev libjemalloc-dev sqlite3
       - name: Fetch pinned once-campfire
         timeout-minutes: 5
         run: |
@@ -1354,9 +1358,11 @@ jobs:
         # the producer link set. libvips-dev is ~150 packages — keep the
         # step bound high enough for slow Azure apt (8m was exhausted on
         # Full validation 37683643149 campfire-smoke mid-download).
+        # .deb archive cache via ci-apt-install-cached; #590 timeouts stay.
         timeout-minutes: 20
-        run: |
-          "$GITHUB_WORKSPACE/scripts/ci-apt-install" libvips-dev libsqlite3-dev libjemalloc-dev sqlite3
+        uses: ./.github/actions/ci-apt-install-cached
+        with:
+          packages: libvips-dev libsqlite3-dev libjemalloc-dev sqlite3
       - name: Fetch pinned once-campfire
         timeout-minutes: 5
         run: |
@@ -1452,8 +1458,9 @@ jobs:
           echo "$PWD/spinel-dist" >> $GITHUB_PATH
       - name: System libvips + libsqlite3-dev + libjemalloc-dev
         timeout-minutes: 20
-        run: |
-          "$GITHUB_WORKSPACE/scripts/ci-apt-install" libvips-dev libsqlite3-dev libjemalloc-dev sqlite3
+        uses: ./.github/actions/ci-apt-install-cached
+        with:
+          packages: libvips-dev libsqlite3-dev libjemalloc-dev sqlite3
       - name: Fetch pinned once-campfire
         run: |
           curl -fsSL "https://codeload.github.com/basecamp/once-campfire/tar.gz/${CAMPFIRE_SHA}" -o /tmp/campfire.tar.gz
@@ -2957,8 +2964,11 @@ jobs:
         # declares image variants), and the package links -lvips.
         # ~150 packages / ~47MB — 8m step timeout failed mid-download on
         # Full validation 37683643149 (slow Azure apt Ign:/Get cycles).
-        run: |
-          "$GITHUB_WORKSPACE/scripts/ci-apt-install" libsqlite3-dev libjemalloc-dev libvips-dev
+        # Host .deb archive cache (Docker lane already has BuildKit apt
+        # layers). Same package set as campfire-spinel jobs; #590 timeouts.
+        uses: ./.github/actions/ci-apt-install-cached
+        with:
+          packages: libvips-dev libsqlite3-dev libjemalloc-dev sqlite3
       - uses: actions/setup-node@v7
         with:
           node-version: '24'

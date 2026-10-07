@@ -287,6 +287,91 @@ fn campfire_docker_smoke_caches_apt_for_eight_hours_and_always_builds() {
 }
 
 #[test]
+fn host_libvips_dev_jobs_share_cached_apt_deb_install() {
+    let workflow: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
+    let action: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+        &fs::read_to_string(".github/actions/ci-apt-install-cached/action.yml").unwrap(),
+    )
+    .unwrap();
+    assert_eq!(action["runs"]["using"].as_str(), Some("composite"));
+    let action_steps = action["runs"]["steps"].as_sequence().unwrap();
+    let restore = action_steps
+        .iter()
+        .find(|step| step["uses"].as_str() == Some("actions/cache/restore@v6"))
+        .expect("restore apt .deb archives");
+    assert_eq!(restore["continue-on-error"].as_bool(), Some(true));
+    let restore_keys = match &restore["with"]["restore-keys"] {
+        serde_yaml_ng::Value::String(s) => s.clone(),
+        serde_yaml_ng::Value::Sequence(items) => items
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        other => panic!("restore-keys shape: {other:?}"),
+    };
+    assert!(
+        restore_keys.contains("steps.key.outputs.prefix"),
+        "{restore_keys}"
+    );
+    let save = action_steps
+        .iter()
+        .find(|step| step["uses"].as_str() == Some("actions/cache/save@v6"))
+        .expect("save apt .deb archives");
+    assert_eq!(save["continue-on-error"].as_bool(), Some(true));
+    assert_eq!(
+        save["if"].as_str(),
+        Some("steps.cache.outputs.cache-hit != 'true'")
+    );
+    let install = action_steps
+        .iter()
+        .find(|step| step["name"].as_str() == Some("Install apt packages"))
+        .unwrap()["run"]
+        .as_str()
+        .unwrap();
+    assert!(install.contains("ci-apt-archives") && install.contains("ci-apt-install"));
+
+    let shared = "libvips-dev libsqlite3-dev libjemalloc-dev sqlite3";
+    for (job_name, step_name) in [
+        (
+            "campfire-spinel-build",
+            "System libvips + libsqlite3-dev + libjemalloc-dev",
+        ),
+        (
+            "campfire-spinel-compare",
+            "System libvips + libsqlite3-dev + libjemalloc-dev",
+        ),
+        (
+            "campfire-spinel-db",
+            "System libvips + libsqlite3-dev + libjemalloc-dev",
+        ),
+        (
+            "campfire-smoke",
+            "Install libsqlite3-dev + libjemalloc-dev + libvips-dev",
+        ),
+    ] {
+        let steps = workflow["jobs"][job_name]["steps"].as_sequence().unwrap();
+        let step = steps
+            .iter()
+            .find(|step| step["name"].as_str() == Some(step_name))
+            .unwrap_or_else(|| panic!("{job_name}: missing {step_name}"));
+        assert_eq!(
+            step["uses"].as_str(),
+            Some("./.github/actions/ci-apt-install-cached"),
+            "{job_name}"
+        );
+        assert_eq!(step["timeout-minutes"].as_u64(), Some(20), "{job_name}");
+        assert_eq!(
+            step["with"]["packages"].as_str(),
+            Some(shared),
+            "{job_name}: shared package set for one cache key"
+        );
+        // Still a .deb cache around ci-apt-install — never a dpkg-state restore.
+        assert!(step.get("run").is_none(), "{job_name}");
+    }
+}
+
+#[test]
 fn rust_ci_uses_the_repository_pin_before_restoring_caches() {
     let workflow: serde_yaml_ng::Value =
         serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
