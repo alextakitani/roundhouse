@@ -5423,7 +5423,7 @@ impl Analyzer {
                 // chases — the reverse call graph now decides retype,
                 // so Class-only receivers would leave callers of
                 // `records.first.foo` off the frontier.
-                let recv_classes: Vec<ClassId> = match recv {
+                let mut recv_classes: Vec<ClassId> = match recv {
                     Some(r) => r
                         .ty
                         .as_ref()
@@ -5438,6 +5438,21 @@ impl Analyzer {
                         .into_iter()
                         .collect(),
                 };
+                // The params table keys by name alone, so `self.class.get(url, opts)`
+                // (HTTParty's class-side `get`) would feed an instance `def get`. Only an
+                // `x.class` receiver: `UserMailer.welcome(user)` and an `extend self`
+                // module's `GlobalPath.cdn_path(p)` are how their instance methods run.
+                let via_class = recv.as_ref().is_some_and(|r| {
+                    matches!(&*r.node, ExprNode::Send { method, args, .. }
+                        if method.as_str() == "class" && args.is_empty())
+                });
+                if via_class {
+                    recv_classes.retain(|c| {
+                        !self.classes.get(c).is_some_and(|k| {
+                            k.instance_methods.contains_key(method) && !k.class_methods.contains_key(method)
+                        })
+                    });
+                }
                 if !recv_classes.is_empty() {
                     let arg_tys: Vec<Ty> = args
                         .iter()
