@@ -92,9 +92,11 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub enum_defaults: IndexMap<Symbol, crate::expr::Literal>,
 
-    /// `mattr_accessor :x, default: …` / `cattr_accessor(:x) { … }` —
-    /// class-ivar seeds lowered into `LibraryClass::class_ivar_initializers`.
-    /// Symbol-only mattr/cattr leave this empty (readers start nil).
+    /// `mattr_*` / `cattr_*` seeds lowered into
+    /// `LibraryClass::class_ivar_initializers` as `@@attr = <expr>`.
+    /// Plain (no `default:`) declarations store `nil` so first read
+    /// matches Rails' `class_variable_set`. Non-nil `default:` / block
+    /// values are also stored here.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub class_attr_defaults: IndexMap<Symbol, crate::expr::Expr>,
 

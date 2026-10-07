@@ -576,20 +576,22 @@ fn model_class(model: &Model, methods: Vec<MethodDef>, table: Option<&Table>) ->
     }
 }
 
-/// `mattr_accessor` / `cattr_accessor` `default:` / block seeds → class
-/// ivar writes emitted once on the model class object.
+/// `mattr_*` / `cattr_*` seeds → `@@attr = <expr>` on the model class
+/// object (Rails class-variable storage, shared with subclasses).
+/// Nil / absent-default seeds are conditional so subclass redeclarations
+/// do not wipe an inherited value (same guard as `mattr_nil_seed`).
 fn collect_class_attr_initializers(model: &Model) -> Vec<Expr> {
+    use crate::ingest::library_class::{mattr_nil_seed, mattr_seed};
+
     model
         .class_attr_defaults
         .iter()
         .map(|(name, value)| {
-            Expr::new(
-                Span::synthetic(),
-                ExprNode::Assign {
-                    target: crate::expr::LValue::Ivar { name: name.clone() },
-                    value: value.clone(),
-                },
-            )
+            if matches!(&*value.node, ExprNode::Lit { value: Literal::Nil }) {
+                mattr_nil_seed(name)
+            } else {
+                mattr_seed(name, value.clone())
+            }
         })
         .collect()
 }
