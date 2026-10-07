@@ -48,7 +48,7 @@ use crate::ident::{ClassId, Symbol, VarId};
 use crate::naming::{camelize_path, last_segment, singularize, snake_case};
 use crate::span::Span;
 
-use self::extra_params::collect_extra_params;
+use self::extra_params::{collect_extra_params, drop_closure_names};
 use self::form_wrapper::{FormWrapperHelper, form_wrapper_helpers};
 use self::walker::walk_body;
 
@@ -489,6 +489,7 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
     // closure ivars, flash/defined? extras) are skipped.
     let mut extra_params = extra_params;
     if is_partial {
+        drop_closure_names(&mut extra_params, &closure_ivars);
         let keys_map = &lx.locals_keys;
         if let Some(keys) = view_key_of(view).and_then(|k| keys_map.get(&k).cloned()) {
             for k in keys {
@@ -2431,6 +2432,7 @@ pub(crate) fn partial_call_contracts(
                     .collect()
             })
             .unwrap_or_default();
+        drop_closure_names(&mut extras, &closure);
         if let Some(keys) = keys_map.get(&key) {
             for k in keys {
                 if k != &record && !closure.contains(k) && !extras.contains(k) {
@@ -2605,6 +2607,7 @@ pub(super) fn partial_extras_map(
             .get(&key)
             .map(|ivs| ivs.iter().map(|s| crate::naming::safe_local(s.as_str())).collect())
             .unwrap_or_default();
+        drop_closure_names(&mut extras, &closure);
         if let Some(keys) = keys_map.get(&key) {
             for k in keys {
                 if k != &arg_name && !closure.contains(k) && !extras.contains(k) {

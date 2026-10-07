@@ -20,6 +20,17 @@ use crate::expr::{Expr, ExprNode, InterpPart};
 /// controller would need view-specific signature knowledge to decide
 /// whether to pass each flash slot. Cost is two unused locals per
 /// view that doesn't reference flash; emit-side it's negligible.
+/// Drop the extras a threaded closure ivar already names. After the
+/// ivar→local rewrite `@error` and `local_assigns[:error]` read the same
+/// local `error`, which the closure param supplies; a second `error`
+/// param is a duplicate argument name (#389). A `locals:` key that names
+/// a closure ivar is skipped the same way. The def site and both call-site
+/// contracts apply it to the same lists, so positions stay aligned.
+/// `closure` holds `safe_local` names; `extras` holds raw ones.
+pub(super) fn drop_closure_names(extras: &mut Vec<String>, closure: &[String]) {
+    extras.retain(|k| !closure.contains(&crate::naming::safe_local(k)));
+}
+
 pub(super) fn collect_extra_params(body: &Expr, arg_name: &str) -> Vec<String> {
     let mut out: Vec<String> = vec!["notice".to_string(), "alert".to_string()];
     // `action_name`/`controller_name` are controller context Rails exposes
