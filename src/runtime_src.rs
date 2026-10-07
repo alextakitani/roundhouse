@@ -731,6 +731,37 @@ fn seed_well_known_classes(
         .or_insert(adapter_iface);
 }
 
+/// Private typing view: re-attach this file's full `Ty::Fn` for methods
+/// that declare a block. Shared registries are often return-only
+/// (`ret` stripped); `block_params_for` needs the Fn. Non-block entries
+/// are left alone so cross-file / seeded return types still win.
+/// Never mutates `classes`.
+fn typing_classes_with_local_block_contracts(
+    classes: &std::collections::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo>,
+    methods: &[MethodDef],
+) -> std::collections::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo> {
+    let mut typing_classes = classes.clone();
+    for m in methods {
+        let (Some(enclosing), Some(sig @ Ty::Fn { block: Some(_), .. })) =
+            (&m.enclosing_class, &m.signature)
+        else {
+            continue;
+        };
+        let info = typing_classes
+            .entry(crate::ident::ClassId(enclosing.clone()))
+            .or_default();
+        match m.receiver {
+            MethodReceiver::Instance => {
+                info.instance_methods.insert(m.name.clone(), sig.clone());
+            }
+            MethodReceiver::Class => {
+                info.class_methods.insert(m.name.clone(), sig.clone());
+            }
+        }
+    }
+    typing_classes
+}
+
 /// Same as `parse_methods_with_rbs` but takes a pre-built class
 /// registry — so cross-class method dispatch during body-typing can
 /// resolve. Used by the runtime-sweep test, which builds a unified
@@ -872,25 +903,7 @@ pub fn parse_methods_with_rbs_in_ctx(
     // Reads now resolve cleanly even when they lexically precede
     // the assignment (e.g. `@cache ||= compute` lowers to a `BoolOp`
     // whose left arm reads the unset ivar).
-    //
-    // Restore this file's block contracts in a private typing table.
-    let mut typing_classes = classes.clone();
-    for m in &methods {
-        let (Some(enclosing), Some(sig @ Ty::Fn { block: Some(_), .. })) =
-            (&m.enclosing_class, &m.signature)
-        else { continue };
-        let info = typing_classes
-            .entry(crate::ident::ClassId(enclosing.clone()))
-            .or_default();
-        match m.receiver {
-            MethodReceiver::Instance => {
-                info.instance_methods.insert(m.name.clone(), sig.clone());
-            }
-            MethodReceiver::Class => {
-                info.class_methods.insert(m.name.clone(), sig.clone());
-            }
-        }
-    }
+    let typing_classes = typing_classes_with_local_block_contracts(classes, &methods);
     let typer = crate::analyze::BodyTyper::new(&typing_classes);
 
     // Extract module-level constants from the .rb so dispatch on
