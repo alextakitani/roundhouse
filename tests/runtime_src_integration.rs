@@ -802,10 +802,9 @@ fn every_runtime_method_body_concretely_typed() {
     // `super(message)` is gradual, as in `ParameterMissing`.
     // `Timeout.timeout` (Spinel port for Campfire tip) adds 3: Pattern D
     // block/return gradual after `sec: Integer | Float` — polymorphic yield.
-    // `ActiveStorage::AttachedMany#attachments` reaches the synthesized
-    // `ActiveStorage::Attachment` MODEL (not a runtime class), so the
-    // Relation.new / where / to_a chain is gradual (+8).
-    const CEILING: usize = 312;
+    // `AttachedMany#attachments` stays typed via raw SQL + ManyAttachment
+    // (not Relation over the synthesized Attachment MODEL).
+    const CEILING: usize = 304;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",

@@ -1384,12 +1384,45 @@ module ActiveStorage
     end
   end
 
+  # One join row behind `AttachedMany#attachments`. The Attachment
+  # MODEL lives under `app/models/` (synthesized); the runtime cannot
+  # name it without going gradual, so this value mirrors the surface
+  # `uploads.attachments.last` needs — `id` / `blob` / `filename` /
+  # `url` — via the same raw-SQL join One already uses.
+  class ManyAttachment
+    def initialize(id, blob)
+      @id = id
+      @blob = blob
+    end
+
+    def id
+      @id
+    end
+
+    def blob
+      @blob
+    end
+
+    def filename
+      b = @blob
+      b.nil? ? nil : b.filename
+    end
+
+    def content_type
+      b = @blob
+      b.nil? ? nil : b.content_type
+    end
+
+    def url
+      b = @blob
+      b.nil? ? "" : b.redirect_url("")
+    end
+  end
+
   # What a `has_many_attached :uploads` reader hands back. Always
   # constructed — never nil — so `uploads.attach` / `uploads.attachments`
   # need no nil guard. Unlike `Attached` (One), `attach_blob` APPENDS:
-  # prior rows under the same name stay. `attachments` answers the
-  # Attachment MODEL rows (synthesized under `app/models/`), which is
-  # what lets `uploads.attachments.last` resolve.
+  # prior rows under the same name stay.
   class AttachedMany
     def initialize(record_type, record_id, name)
       @record_type = record_type
@@ -1401,16 +1434,21 @@ module ActiveStorage
       attachments.length > 0
     end
 
-    # Every Attachment row for this name on this record — Rails'
-    # `Attached::Many#attachments` (a collection proxy over the join
-    # model). Uses the synthesized `ActiveStorage::Attachment` finder
-    # so `.last` / `.first` / indexing are ordinary Array ops.
+    # Every join row for this name on this record — Rails'
+    # `Attached::Many#attachments`. Raw SQL (not Relation over the
+    # synthesized Attachment MODEL) so the body stays fully typed.
     def attachments
-      ActiveRecord::Relation.new(ActiveStorage::Attachment).where(
-        record_type: @record_type,
-        record_id: @record_id,
-        name: @name
-      ).to_a
+      sql = "SELECT a.id AS attachment_id, " + Blob.columns("b") +
+            " FROM active_storage_attachments a " +
+            "JOIN active_storage_blobs b ON b.id = a.blob_id WHERE a.record_type = " +
+            ActiveRecord.adapter.escape_value(@record_type) +
+            " AND a.record_id = " + ActiveRecord.adapter.escape_value(@record_id) +
+            " AND a.name = " + ActiveRecord.adapter.escape_value(@name)
+      out = []
+      ActiveRecord.adapter.select_rows(sql).each do |row|
+        out.push(ManyAttachment.new(row["attachment_id"].to_i, Blob.from_row(row)))
+      end
+      out
     end
 
     # APPEND — prior attachments under `@name` stay. One's `attach_blob`

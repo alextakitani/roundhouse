@@ -1819,10 +1819,14 @@ end
     crate::lower::plain_text_attr::synthesize_record_model(&mut app);
     crate::lower::attachment_model::synthesize_attachment_model(&mut app);
     // Second chance for `on_load(:active_storage_attachment)` includes
-    // whose target was only synthesized above; then splice so
-    // `has_many_attached` from the concern lands on the new model.
-    super::on_load_reopen::apply_pending(&mut app);
-    splice_concerns_into_models(&mut app);
+    // whose target was only synthesized above; then splice ONLY those
+    // models so `has_many_attached` from the concern lands — a full
+    // re-splice would duplicate every concern already expanded at the
+    // first pass (doubled scopes, unique-constraint failures at run).
+    let late_on_load = super::on_load_reopen::apply_pending(&mut app);
+    if !late_on_load.is_empty() {
+        splice_concerns_into_models_named(&mut app, &late_on_load);
+    }
     super::on_load_reopen::drain_pending(&mut app);
     app.const_resolver = crate::timings::phase("rubydex: wait", || const_resolver.finish());
     // Admission needs complete controller permit demand and model DSL,
@@ -1909,10 +1913,24 @@ fn walk_binary_assets<V: Vfs + ?Sized>(vfs: &V, root: &Path, dir: &Path, app: &m
 /// Strict targets get the DSL items the same way; module
 /// methods-via-include remain their separate, ledger-visible gap.
 fn splice_concerns_into_models(app: &mut App) {
+    splice_concerns_into_models_named(app, &[]);
+}
+
+/// Splice concern `included do` bodies into models.
+///
+/// When `only` is empty, every model is visited (the first pass). When
+/// non-empty, only models whose [`ClassId`] name is listed — the late
+/// `on_load(:active_storage_attachment)` path after Attachment /
+/// Markdown synthesis, which must not re-expand includes already
+/// spliced on the first pass.
+fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol]) {
     use crate::dialect::ModelBodyItem;
     use crate::expr::ExprNode;
 
     for model in &mut app.models {
+        if !only.is_empty() && !only.iter().any(|n| n == &model.name.0) {
+            continue;
+        }
         // Concerns already spliced into this model. A spliced item may
         // itself be an `include` (a concern's `included do include
         // Other end`), whose own items are spliced in turn; a concern

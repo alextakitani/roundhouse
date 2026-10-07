@@ -286,22 +286,42 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         );
         classes.insert(attached_id.clone(), attached);
 
-        // `has_many_attached` proxy — same surface the runtime RBS
-        // declares. `attachments` is gradual (`Array[untyped]`) because
-        // the Attachment MODEL is synthesized into `app.models` and
-        // typed there; the registry cannot name it as a ClassId without
-        // racing the model loop.
+        // `has_many_attached` proxy — `attachments` answers
+        // `ManyAttachment` (runtime join-row value), not the
+        // synthesized Attachment MODEL, so the registry can name it
+        // without racing the model loop.
         {
+            let many_row_id = ClassId(Symbol::from("ActiveStorage::ManyAttachment"));
+            let mut many_row = ClassInfo::default();
+            many_row.instance_methods.insert(Symbol::from("id"), Ty::Int);
+            many_row.instance_methods.insert(
+                Symbol::from("blob"),
+                Ty::Union {
+                    variants: vec![class_ty(&blob_id), Ty::Nil],
+                },
+            );
+            many_row.instance_methods.insert(
+                Symbol::from("filename"),
+                Ty::Union {
+                    variants: vec![class_ty(&filename_id), Ty::Nil],
+                },
+            );
+            many_row.instance_methods.insert(
+                Symbol::from("content_type"),
+                Ty::Union {
+                    variants: vec![Ty::Str, Ty::Nil],
+                },
+            );
+            many_row.instance_methods.insert(Symbol::from("url"), Ty::Str);
+            classes.insert(many_row_id.clone(), many_row);
+
             let many_id = ClassId(Symbol::from("ActiveStorage::AttachedMany"));
             let mut many = ClassInfo::default();
             many.instance_methods.insert(Symbol::from("attached?"), Ty::Bool);
             many.instance_methods.insert(
                 Symbol::from("attachments"),
                 Ty::Array {
-                    elem: Box::new(Ty::Class {
-                        id: ClassId(Symbol::from("ActiveStorage::Attachment")),
-                        args: vec![],
-                    }),
+                    elem: Box::new(class_ty(&many_row_id)),
                 },
             );
             many.instance_methods.insert(Symbol::from("attach_blob"), Ty::Nil);

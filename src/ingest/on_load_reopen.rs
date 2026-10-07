@@ -261,14 +261,20 @@ fn includes_only_reopen(class: &ruby_prism::ClassNode<'_>) -> Option<Vec<String>
 /// were not yet in `app.models` when the load hook was scanned.
 /// Leftovers (no matching model) are surveyed like other uncarried
 /// reopens.
-pub(super) fn apply_pending(app: &mut App) {
+///
+/// Returns the names of models that received a fresh `include`, so a
+/// later concern splice can target only those — a full re-splice would
+/// duplicate every previously expanded concern body.
+pub(super) fn apply_pending(app: &mut App) -> Vec<Symbol> {
     let pending = std::mem::take(&mut app.pending_attachment_on_load);
     let mut still = Vec::new();
+    let mut touched = Vec::new();
     for (model_name, mods) in pending {
         if let Some(model) = app.models.iter_mut().find(|m| m.name.0 == model_name) {
             for path in &mods {
                 push_model_include(model, path.as_str());
             }
+            touched.push(model_name);
         } else {
             // Model may appear later via synthesis (`has_markdown` /
             // Attachment table). Keep the queue for a second apply
@@ -277,6 +283,7 @@ pub(super) fn apply_pending(app: &mut App) {
         }
     }
     app.pending_attachment_on_load = still;
+    touched
 }
 
 /// Survey any `on_load(:active_storage_attachment)` includes that
