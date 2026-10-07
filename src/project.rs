@@ -1433,14 +1433,20 @@ pub fn target_files(
     // in an earlier class initializer. CRuby/JRuby execute each definition
     // in order; refuse this shape before producing a silently different app.
     if target == BuildTarget::Spinel {
+        // Ingest keeps reopened declarations separate, but they share the
+        // same class object and method table, including its initializers.
+        let mut classes = std::collections::BTreeMap::new();
         for lc in &app.library_classes {
-            if lc.class_ivar_initializers.is_empty() { continue; }
+            classes.entry(&lc.name).or_insert_with(Vec::new).push(lc);
+        }
+        for (name, declarations) in classes {
+            if declarations.iter().all(|lc| lc.class_ivar_initializers.is_empty()) { continue; }
             let mut methods = std::collections::HashSet::new();
-            for m in &lc.methods {
+            for m in declarations.iter().flat_map(|lc| &lc.methods) {
                 if !methods.insert((m.receiver == crate::dialect::MethodReceiver::Class, &m.name)) {
                     return Err(format!(
                         "class-instance-variable initialization with method redefinition is not supported (spinel): {}.{}",
-                        lc.name.0, m.name,
+                        name.0, m.name,
                     ));
                 }
             }

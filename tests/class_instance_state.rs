@@ -292,6 +292,55 @@ fn spinel_refuses_class_state_with_redefined_methods() {
     assert!(error.contains("method redefinition is not supported (spinel)"), "{error}");
 }
 
+#[test]
+fn spinel_refuses_class_state_with_redefined_methods_across_reopens() {
+    for receiver in ["self.", ""] {
+        for initializer_first in [true, false] {
+            let call = if receiver.is_empty() { "new.value" } else { "value" };
+            let initializer = format!("  @snapshot = {call}\n");
+            let source = format!(
+                "class Counter\n  def {receiver}value\n    11\n  end\n{}end\n\
+                 class Counter\n  def {receiver}value\n    42\n  end\n{}end\n",
+                if initializer_first { initializer.as_str() } else { "" },
+                if initializer_first { "" } else { initializer.as_str() },
+            );
+            let mut app = roundhouse::App::default();
+            app.library_classes = roundhouse::ingest::ingest_library_classes(
+                source.as_bytes(), "counter.rb",
+            ).unwrap();
+            assert_eq!(app.library_classes.len(), 2, "reopens must stay separate");
+            let error = roundhouse::project::target_files(
+                &app, std::path::Path::new("."), roundhouse::project::BuildTarget::Spinel,
+            ).err().expect("reopened class bypasses the method-redefinition guard");
+            assert_eq!(error, "class-instance-variable initialization with method redefinition is not supported (spinel): Counter.value");
+        }
+    }
+}
+
+#[test]
+fn spinel_keeps_reopens_without_conflicting_state_methods() {
+    for source in [
+        "class Counter; @value = 1; def self.value; 11; end; end; \
+         class Counter; def value; 42; end; end",
+        "class Counter; @value = 1; def self.value; 11; end; end; \
+         class OtherCounter; def self.value; 42; end; end",
+        "class Counter; def self.value; 11; end; end; \
+         class Counter; def self.value; 42; end; end",
+        "class Counter; @value = 1; end; \
+         class OtherCounter; def self.value; 11; end; end; \
+         class OtherCounter; def self.value; 42; end; end",
+    ] {
+        let mut app = roundhouse::App::default();
+        app.library_classes = roundhouse::ingest::ingest_library_classes(
+            source.as_bytes(), "counter.rb",
+        ).unwrap();
+        let result = roundhouse::project::target_files(
+            &app, std::path::Path::new("."), roundhouse::project::BuildTarget::Spinel,
+        );
+        assert!(result.is_ok(), "distinct receivers/classes or stateless reopens are supported: {}", result.err().unwrap());
+    }
+}
+
 fn once_initialized_app() -> emit_and_run::Overlay {
     app()
         .write("app/services/initializer_tally.rb", r#"class InitializerTally
