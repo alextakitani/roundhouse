@@ -56,7 +56,9 @@ runs:
         # Package names are caller-controlled (workflow literals).
         # shellcheck disable=SC2086
         "$GITHUB_WORKSPACE/scripts/ci-apt-install" $PACKAGES
-        "$GITHUB_WORKSPACE/scripts/ci-apt-archives" harvest "$APT_ARCHIVE_DIR"
+        # Harvest is cache-only; a disk/permission miss must not fail install.
+        "$GITHUB_WORKSPACE/scripts/ci-apt-archives" harvest "$APT_ARCHIVE_DIR" \
+          || echo "::warning::apt archive harvest failed; cache will not be saved"
 
     - name: Save apt .deb archives
       # Exact hit already holds today's archives. Prefix hits and misses save.
