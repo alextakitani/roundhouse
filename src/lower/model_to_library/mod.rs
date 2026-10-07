@@ -399,6 +399,7 @@ pub(crate) fn lower_models_inner_with_ruby_values(
             if !unfold {
                 crate::lower::arel::rewrite_arel_in_expr_with_ruby_values(
                     &mut method.body, schema, &classes, &[], ruby_read_values,
+                    &HashSet::new(),
                 );
             }
             type_method_body(method, &classes, table, Some(model));

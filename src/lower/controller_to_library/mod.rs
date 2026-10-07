@@ -538,6 +538,7 @@ pub fn lower_controllers_with_arel_views_assocs_and_routes(
                 if !refined_across_methods {
                     rewritten |= crate::lower::arel::rewrite_arel_in_expr_with_ruby_values(
                         &mut method.body, schema, &classes, assocs, ruby_read_values,
+                        &relation_scope_names,
                     );
                 }
             }
