@@ -2082,7 +2082,7 @@ fn mattr_and_native_classvar_writes_share_storage() {
 #[test]
 fn cattr_defaults_cannot_be_silently_dropped_with_native_initializers() {
     for declaration in ["cattr_reader", "cattr_writer", "cattr_accessor", "mattr_reader", "mattr_writer", "mattr_accessor"] {
-        for default in ["default: 41", "default: nil", "**{default: 41}", "**options", ""] {
+        for default in ["default: 41", "default: nil", ""] {
             let call = if default.is_empty() {
                 format!("{declaration}(:count) {{ 41 }}")
             } else {
@@ -2091,14 +2091,69 @@ fn cattr_defaults_cannot_be_silently_dropped_with_native_initializers() {
             for body in [format!("@@count = nil; {call}"), format!("{call}; @@count = nil")] {
                 let source = format!("class Probe; {body}; def self.current; @@count; end; end");
                 let err = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
-                    .expect_err("an unmodeled default must not become an unset class ivar");
+                    .expect_err("an explicit default must not share a body with a native @@ seed");
                 assert!(err.to_string().contains("cattr/mattr defaults require source-order initialization"), "{err}");
             }
-            // Standalone cattr/mattr with default: still synthesizes accessors;
-            // applying the default value is a separate claim.
+            // Standalone parseable defaults seed @@attr = <value>.
             let source = format!("class Probe; {call}; end");
-            roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
-                .expect("standalone class-attribute ingest remains unchanged");
+            let classes = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
+                .expect("standalone class-attribute default must seed");
+            let seed = classes[0].class_ivar_initializers.iter().find(|expr| {
+                matches!(
+                    &*expr.node,
+                    ExprNode::Assign {
+                        target: LValue::Var { name, .. },
+                        ..
+                    } if name.as_str() == "@@count"
+                )
+            });
+            assert!(seed.is_some(), "missing @@count seed for {call}: {:?}", classes[0].class_ivar_initializers);
+            match &*seed.unwrap().node {
+                ExprNode::Assign { value, .. } => {
+                    let expected_nil = default == "default: nil";
+                    assert_eq!(
+                        matches!(&*value.node, ExprNode::Lit { value: Literal::Nil }),
+                        expected_nil,
+                        "{call}: {:?}",
+                        value.node
+                    );
+                    if default == "default: 41" || default.is_empty() {
+                        assert!(
+                            matches!(&*value.node, ExprNode::Lit { value: Literal::Int { value: 41 } }),
+                            "{call}: {:?}",
+                            value.node
+                        );
+                    }
+                }
+                other => panic!("expected assign seed, got {other:?}"),
+            }
+        }
+        for default in ["**{default: 41}", "**options", "instance_reader: false, default: 41"] {
+            let call = format!("{declaration} :count, {default}");
+            let source = format!("class Probe; {call}; end");
+            let classes = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
+                .expect("unmodeled defaults leave the class standing");
+            assert!(
+                classes[0].class_ivar_initializers.iter().all(|expr| {
+                    !matches!(
+                        &*expr.node,
+                        ExprNode::Assign {
+                            target: LValue::Var { name, .. },
+                            ..
+                        } if name.as_str() == "@@count"
+                    )
+                }),
+                "unmodeled default must not nil-seed @@count: {:?}",
+                classes[0].class_ivar_initializers
+            );
+            assert!(
+                !classes[0].methods.iter().any(|m| m.name.as_str() == "count"),
+                "unmodeled default must not synthesize accessors"
+            );
+            assert!(
+                !classes[0].unknown_calls.is_empty(),
+                "unmodeled mattr/cattr must remain an unknown call"
+            );
         }
         let source = format!("class Probe; @@count = nil; {declaration} :count; end");
         let classes = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb").unwrap();
@@ -2335,6 +2390,26 @@ fn nested_class_methods_cannot_relocate_native_initializers() {
     ).unwrap();
     let probe = classes.iter().find(|class| class.name.0.as_str() == "Probe").unwrap();
     assert_eq!(probe.class_ivar_initializers.len(), 1);
+
+    // Plain ClassMethods cattr (no source @@) still relocates a nil seed.
+    let classes = ingest_library_classes(
+        b"module Probe; module ClassMethods; cattr_accessor :flag; end; end",
+        "probe.rb",
+    ).unwrap();
+    let probe = classes.iter().find(|class| class.name.0.as_str() == "Probe").unwrap();
+    assert!(
+        probe.class_ivar_initializers.iter().any(|expr| {
+            matches!(
+                &*expr.node,
+                roundhouse::expr::ExprNode::Assign {
+                    target: roundhouse::expr::LValue::Var { name, .. },
+                    ..
+                } if name.as_str() == "@@flag"
+            )
+        }),
+        "ClassMethods cattr must seed @@flag on Probe"
+    );
+    assert!(probe.methods.iter().any(|m| m.name.as_str() == "flag"));
 }
 
 /// Parameters after a rest (`->(*, payload)`, `|*rest, a, b|`) used to

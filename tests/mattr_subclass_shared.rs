@@ -192,3 +192,52 @@ puts "library_mattr_cattr_subclass_ok"
         )
         .assert_passes();
 }
+
+#[test]
+fn library_mattr_default_seeds_shared_classvar() {
+    let classes = roundhouse::ingest::ingest_library_classes(
+        b"class Probe\n  mattr_accessor :channel, default: \"news\"\nend\n",
+        "probe.rb",
+    )
+    .expect("ingest");
+    assert!(
+        classes[0].class_ivar_initializers.iter().any(|expr| {
+            matches!(
+                &*expr.node,
+                ExprNode::Assign {
+                    target: LValue::Var { name, .. },
+                    value,
+                } if name.as_str() == "@@channel"
+                    && matches!(
+                        &*value.node,
+                        ExprNode::Lit {
+                            value: roundhouse::expr::Literal::Str { value }
+                        } if value == "news"
+                    )
+            )
+        }),
+        "expected @@channel = \"news\" seed: {:?}",
+        classes[0].class_ivar_initializers
+    );
+
+    emit_and_run::real_blog()
+        .write(
+            "app/services/channel_config.rb",
+            r#"class ChannelConfig
+  mattr_accessor :channel, default: "news"
+end
+class SpecialChannelConfig < ChannelConfig
+end
+"#,
+        )
+        .run_ruby(
+            r#"
+raise "lib default parent" unless ChannelConfig.channel == "news"
+raise "lib default subclass" unless SpecialChannelConfig.channel == "news"
+SpecialChannelConfig.channel = "sports"
+raise "lib default write-through" unless ChannelConfig.channel == "sports"
+puts "library_mattr_default_ok"
+"#,
+        )
+        .assert_passes();
+}

@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use indexmap::IndexMap;
 use ruby_prism::parse;
 
 use crate::dialect::{LibraryClass, MethodDef, MethodReceiver, Param};
@@ -1125,14 +1126,13 @@ impl DeclBody {
     fn finalize_classvars(
         &mut self,
         class_attributes: &HashSet<Symbol>,
-        has_class_attr_default: bool,
+        class_attr_defaults: &IndexMap<Symbol, Expr>,
         file: &str,
     ) -> IngestResult<()> {
-        // Library-class `default:` / block values are not applied here
-        // (model ingest owns those seeds). Mixing that flag with a
-        // source-spanned @@ initializer would drop or reorder the
-        // default — refuse. Synthetic seeds alone are fine.
-        if has_class_attr_default
+        // Mixing an explicit `default:` / block with a source-spanned @@
+        // initializer would drop or reorder the default — refuse.
+        // Synthetic seeds alone are fine.
+        if !class_attr_defaults.is_empty()
             && self
                 .class_initializers
                 .iter()
@@ -1143,10 +1143,9 @@ impl DeclBody {
                 message: "cattr/mattr defaults require source-order initialization".into(),
             });
         }
-        // Rails mattr/cattr uses @@ shared across the hierarchy. Always
-        // seed `@@attr = nil` when no initializer exists yet (matches
-        // `class_variable_set` in Module#mattr_reader). One declaration
-        // with an unmodeled `default:` must not skip siblings.
+        // Rails mattr/cattr uses @@ shared across the hierarchy. Seed
+        // `@@attr = <default>` when modeled, else `@@attr = nil` (matches
+        // `class_variable_set` in Module#mattr_reader).
         let mut attrs: Vec<&Symbol> = class_attributes.iter().collect();
         attrs.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         for attr in attrs {
@@ -1161,11 +1160,16 @@ impl DeclBody {
                 )
             });
             if !already {
-                self.class_initializers.push(mattr_nil_seed(attr));
+                let seed = class_attr_defaults
+                    .get(attr)
+                    .cloned()
+                    .map(|value| mattr_seed(attr, value))
+                    .unwrap_or_else(|| mattr_nil_seed(attr));
+                self.class_initializers.push(seed);
             }
         }
         // Source-spanned @@ initializers still need a body with no other
-        // class-body buckets (ordering). Synthetic mattr nil seeds are
+        // class-body buckets (ordering). Synthetic mattr seeds are
         // order-insensitive relative to includes/constants.
         let has_source_ordered_init = self
             .class_initializers
@@ -1445,7 +1449,7 @@ fn walk_decl_body_with_visibility<'pr>(
 ) -> IngestResult<DeclBody> {
     let mut out = DeclBody::default();
     let mut class_attributes: HashSet<Symbol> = HashSet::new();
-    let mut has_class_attr_default = false;
+    let mut class_attr_defaults: IndexMap<Symbol, Expr> = IndexMap::new();
     // `module_function` (called bare inside a module body) marks every
     // subsequent direct `def` as a module-function — both an instance
     // method AND a class method. For our targets (which call these as
@@ -1786,24 +1790,33 @@ fn walk_decl_body_with_visibility<'pr>(
                         // copies; models synthesize those separately).
                         let is_class_attr =
                             kw.starts_with("cattr_") || kw.starts_with("mattr_");
-                        let mut has_default = is_class_attr && call.block().is_some();
                         let mut names: Vec<Symbol> = Vec::new();
                         if let Some(args) = call.arguments() {
                             for arg in args.arguments().iter() {
                                 if let Some(s) = symbol_value(&arg) {
                                     names.push(Symbol::from(s));
                                 }
-                                if is_class_attr && let Some(hash) = arg.as_keyword_hash_node() {
-                                    has_default |= hash.elements().iter().any(|element| {
-                                        // A keyword splat can also carry a default.
-                                        element.as_assoc_node().is_none_or(|assoc|
-                                            symbol_value(&assoc.key()).as_deref() == Some("default"))
-                                    });
-                                }
                             }
                         }
-                        has_class_attr_default |= has_default;
+                        // Unmodeled mattr/cattr options (instance_*, splats,
+                        // uningestible defaults) stay as unknown_calls — same
+                        // honesty as model expand returning None — so a model
+                        // file's dual library pass cannot abort ingest.
                         if is_class_attr {
+                            match library_mattr_claim(&call, file)? {
+                                LibraryMattrClaim::Unmodeled => {
+                                    if let Ok(e) = ingest_expr(&stmt, file) {
+                                        out.unknown_calls.push(e);
+                                    }
+                                    continue;
+                                }
+                                LibraryMattrClaim::Plain => {}
+                                LibraryMattrClaim::Default(expr) => {
+                                    for name in &names {
+                                        class_attr_defaults.insert(name.clone(), expr.clone());
+                                    }
+                                }
+                            }
                             class_attributes.extend(names.iter().cloned());
                             out.class_attributes.extend(names.iter().cloned());
                         }
@@ -1996,8 +2009,84 @@ fn walk_decl_body_with_visibility<'pr>(
         }
     }
 
-    out.finalize_classvars(&class_attributes, has_class_attr_default, file)?;
+    out.finalize_classvars(&class_attributes, &class_attr_defaults, file)?;
     Ok(out)
+}
+
+/// Outcome of claiming a library-class `mattr_*` / `cattr_*` declaration.
+enum LibraryMattrClaim {
+    /// No `default:` / block — expand accessors and nil-seed.
+    Plain,
+    /// Representable `default:` / block — expand and seed that value.
+    Default(Expr),
+    /// Options we do not model (splats, `instance_*`, uningestible
+    /// defaults). Leave the call in `unknown_calls` rather than nil-seed
+    /// over a dropped value.
+    Unmodeled,
+}
+
+/// Parse a library-class `mattr_*` / `cattr_*` `default:` / block.
+fn library_mattr_claim(
+    call: &ruby_prism::CallNode<'_>,
+    file: &str,
+) -> IngestResult<LibraryMattrClaim> {
+    let mut default: Option<Expr> = None;
+    let mut other_kwargs = false;
+    let mut unmodeled = false;
+    if let Some(args) = call.arguments() {
+        for arg in args.arguments().iter() {
+            if symbol_value(&arg).is_some() {
+                continue;
+            }
+            if let Some(hash) = arg.as_keyword_hash_node() {
+                for element in hash.elements().iter() {
+                    let Some(assoc) = element.as_assoc_node() else {
+                        unmodeled = true;
+                        break;
+                    };
+                    match symbol_value(&assoc.key()).as_deref() {
+                        Some("default") if default.is_none() => {
+                            match ingest_expr(&assoc.value(), file) {
+                                Ok(expr) => default = Some(expr),
+                                Err(_) => unmodeled = true,
+                            }
+                        }
+                        Some("default") => unmodeled = true,
+                        // `instance_reader:` / friends are ignored when no
+                        // default is claimed; mixed with `default:` they
+                        // would silently drop half the declaration.
+                        _ => other_kwargs = true,
+                    }
+                }
+                continue;
+            }
+            unmodeled = true;
+        }
+    }
+    if let Some(block) = call.block() {
+        let Some(block_node) = block.as_block_node() else {
+            return Ok(LibraryMattrClaim::Unmodeled);
+        };
+        if block_node.parameters().is_some() || default.is_some() {
+            return Ok(LibraryMattrClaim::Unmodeled);
+        }
+        let Some(body) = block_node.body() else {
+            return Ok(LibraryMattrClaim::Unmodeled);
+        };
+        match ingest_expr(&body, file) {
+            Ok(expr) => default = Some(expr),
+            Err(_) => return Ok(LibraryMattrClaim::Unmodeled),
+        }
+    }
+    if unmodeled || (default.is_some() && other_kwargs) {
+        return Ok(LibraryMattrClaim::Unmodeled);
+    }
+    // Other kwargs without a default stay expanded (pre-existing library
+    // surface); only a claimed default forces the unmodeled gate above.
+    Ok(match default {
+        Some(expr) => LibraryMattrClaim::Default(expr),
+        None => LibraryMattrClaim::Plain,
+    })
 }
 
 /// For `alias_method :new, :old`: the new name, and the index of the
@@ -2058,9 +2147,8 @@ pub(crate) fn mattr_cvar_name(attr: &Symbol) -> Symbol {
     Symbol::from(format!("@@{}", attr.as_str()))
 }
 
-/// Rails `mattr_*` / `cattr_*` seed: `@@attr = nil` when no default is set
-/// (`Module#mattr_reader` calls `class_variable_set` so first read is nil).
-pub(crate) fn mattr_nil_seed(attr: &Symbol) -> Expr {
+/// Rails `mattr_*` / `cattr_*` seed: `@@attr = <value>`.
+pub(crate) fn mattr_seed(attr: &Symbol, value: Expr) -> Expr {
     Expr::new(
         Span::synthetic(),
         ExprNode::Assign {
@@ -2068,13 +2156,22 @@ pub(crate) fn mattr_nil_seed(attr: &Symbol) -> Expr {
                 id: VarId(0),
                 name: mattr_cvar_name(attr),
             },
-            value: Expr::new(
-                Span::synthetic(),
-                ExprNode::Lit {
-                    value: Literal::Nil,
-                },
-            ),
+            value,
         },
+    )
+}
+
+/// Rails `mattr_*` / `cattr_*` seed: `@@attr = nil` when no default is set
+/// (`Module#mattr_reader` calls `class_variable_set` so first read is nil).
+pub(crate) fn mattr_nil_seed(attr: &Symbol) -> Expr {
+    mattr_seed(
+        attr,
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Lit {
+                value: Literal::Nil,
+            },
+        ),
     )
 }
 
