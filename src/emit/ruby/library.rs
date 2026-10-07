@@ -6117,12 +6117,12 @@ fn emit_library_class_decl_inner(
     // otherwise be classified body-only and left to the aggregator.
     // Source class state can call methods and read constants between writes.
     // Keep those declarations in source order; synthesized framework classes
-    // retain their existing initialization/deferral policy.
+    // and mattr/cattr `@@` seeds retain their existing initialization policy.
     // Lowered controllers also have no origin, but Concern methods carry
     // spans from another file. Their offsets cannot order the controller's
     // macro calls: those initializers must run after all collected methods.
     let ordered_body = lc.origin.is_none()
-        && !lc.class_ivar_initializers.is_empty()
+        && lc.has_source_ivar_initializers()
         && !app.controllers.iter().any(|controller| controller.name == lc.name);
     let (mut eager, mut deferred, initializers_call_self) = partition_deferred_constants(lc);
     let load_time_bodies = initializers_call_self || !deferred.is_empty();
@@ -6257,11 +6257,40 @@ fn emit_library_class_decl_inner(
     let mut body: Vec<_> = eager.iter().map(|&i| {
         (lc.constants[i].1.span.start, BodyItem::Constant(i, &lc.constants[i].1))
     }).collect();
-    body.extend(lc.class_ivar_initializers.iter().map(|init| {
+    body.extend(lc.class_ivar_initializers.iter().filter(|init| {
+        // Source-ordered bodies interleave only real `@ivar` writes; keep
+        // synthetic mattr/cattr `@@` seeds on the partitioned path below.
+        !ordered_body || (!init.span.is_synthetic() && matches!(
+            &*init.node,
+            ExprNode::Assign { target: LValue::Ivar { .. }, .. }
+                | ExprNode::OpAssign { target: LValue::Ivar { .. }, .. }
+        ))
+    }).map(|init| {
         (init.span.start, BodyItem::Initializer(init))
     }));
+    // Concern-spliced and other foreign-file methods keep foreign
+    // `name_span` offsets; interleave only same-file declarations.
+    let body_file = lc.class_ivar_initializers.iter().find_map(|init| {
+        (!init.span.is_synthetic()
+            && matches!(
+                &*init.node,
+                ExprNode::Assign { target: LValue::Ivar { .. }, .. }
+                    | ExprNode::OpAssign { target: LValue::Ivar { .. }, .. }
+            ))
+        .then_some(init.span.file)
+    });
+    let method_in_ordered_body = |m: &MethodDef| {
+        ordered_body
+            && !m.name_span.is_synthetic()
+            && body_file.is_some_and(|file| m.name_span.file == file)
+    };
     if ordered_body {
-        body.extend(lc.methods.iter().map(|m| (m.name_span.start, BodyItem::Method(m))));
+        body.extend(
+            lc.methods
+                .iter()
+                .filter(|m| method_in_ordered_body(m))
+                .map(|m| (m.name_span.start, BodyItem::Method(m))),
+        );
     }
     body.sort_by_key(|(start, _)| *start);
     // Every require the file needs at its TOP: the class-body calls and
@@ -6512,6 +6541,22 @@ fn emit_library_class_decl_inner(
             }
         }
     };
+    // Concern-spliced / synthetic-span methods cannot order against
+    // source `@ivar` writes; emit them before the interleaved body.
+    if ordered_body {
+        let mut first = true;
+        for m in lc.methods.iter().filter(|m| !method_in_ordered_body(m)) {
+            if !first {
+                writeln!(s).unwrap();
+            }
+            first = false;
+            render_method(&mut s, m);
+        }
+        if lc.methods.iter().any(|m| !method_in_ordered_body(m)) && !body.is_empty() {
+            writeln!(s).unwrap();
+        }
+    }
+
     let mut start = 0;
     for (at, reqs) in &splits {
         render_body(&mut s, &body[start..*at]);
@@ -6555,23 +6600,39 @@ fn emit_library_class_decl_inner(
         }
     }
 
-    let mut first = true;
-    for m in lc.methods.iter().filter(|_| !ordered_body) {
-        if !first {
-            writeln!(s).unwrap();
+    // Non-ordered classes keep the methods-then-initializers partition.
+    // Ordered bodies already emitted foreign methods above and same-file
+    // methods inside the interleaved body.
+    if !ordered_body {
+        let mut first = true;
+        for m in &lc.methods {
+            if !first {
+                writeln!(s).unwrap();
+            }
+            first = false;
+            render_method(&mut s, m);
         }
-        first = false;
-        render_method(&mut s, m);
     }
 
     // Finite class-side initialization is lowered IR, not replay of a
-    // framework DSL. Each statement runs once on this class object, after
-    // the class methods it may call (a Concern macro writing its
-    // `class_attribute`); unset subclasses keep their ivar absent.
-    if !ordered_body && !lc.class_ivar_initializers.is_empty() && !lc.methods.is_empty() {
+    // framework DSL. Runs after class methods (a Concern macro may write
+    // its `class_attribute`). Per-class `@ivar` seeds leave unset
+    // subclasses absent; `mattr_*` / `cattr_*` seeds are `@@` and share
+    // across the hierarchy by Ruby class-variable rules. Source-ordered
+    // `@ivar` writes already interleaved above; remaining seeds still run.
+    let remaining_inits = |init: &Expr| {
+        !ordered_body
+            || init.span.is_synthetic()
+            || !matches!(
+                &*init.node,
+                ExprNode::Assign { target: LValue::Ivar { .. }, .. }
+                    | ExprNode::OpAssign { target: LValue::Ivar { .. }, .. }
+            )
+    };
+    if lc.class_ivar_initializers.iter().any(remaining_inits) && !lc.methods.is_empty() {
         writeln!(s).unwrap();
     }
-    for init in lc.class_ivar_initializers.iter().filter(|_| !ordered_body) {
+    for init in lc.class_ivar_initializers.iter().filter(|init| remaining_inits(init)) {
         for line in super::emit_expr(init).lines() {
             writeln!(s, "{body_pad}{line}").unwrap();
         }
@@ -7728,6 +7789,11 @@ enum PreloadKind {
     /// (`lower::attached::variations_ruby_source`), the proxy's fourth
     /// constructor argument.
     Attached { attr: String, owner: String, variations: String },
+    /// `has_many_attached :<attr>`: install an `AttachedMany` proxy per
+    /// record. Rows are still loaded on ask (`AttachedMany#attachments`);
+    /// the batch here is the memoized proxy, matching One's "one proxy
+    /// per record" contract.
+    AttachedMany { attr: String, owner: String },
     /// `has_rich_text :<attr>`: one `IN` over `action_text_rich_texts`,
     /// installed through the owner's load-once setter.
     RichText { attr: String, owner: String },
@@ -7857,6 +7923,17 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
                 attr: attr.as_str().to_string(),
                 owner: model.name.0.as_str().to_string(),
                 variations: crate::lower::attached::variations_ruby_source(model, &attr),
+            },
+        ));
+    }
+    for (_span, attr) in crate::lower::attached::many_attached_attrs(model) {
+        out.push((
+            crate::lower::attached::many_attachments_assoc_name(&attr)
+                .as_str()
+                .to_string(),
+            PreloadKind::AttachedMany {
+                attr: attr.as_str().to_string(),
+                owner: model.name.0.as_str().to_string(),
             },
         ));
     }
@@ -8070,6 +8147,19 @@ end
 "#
                 );
             }
+            PreloadKind::AttachedMany { attr, owner } => {
+                let _ = write!(
+                    src,
+                    r#"
+def self._preload_batch_{name}(records)
+  records.each do |r|
+    r._preload_{name}(ActiveStorage::AttachedMany.new("{owner}", r.id, "{attr}"))
+  end
+  []
+end
+"#
+                );
+            }
             // One IN over the rich-text table; a record with no row is
             // told so, which is the state the load-once reader must not
             // re-query.
@@ -8144,8 +8234,8 @@ end
                 PreloadKind::PlainText { .. } => Some("ActionText::Markdown"),
                 // `includes(logo_attachment: :blob)`: the blob is already
                 // in the row the loader fetched; there is no model to
-                // recurse into.
-                PreloadKind::Attached { .. } => None,
+                // recurse into. Many installs the proxy only.
+                PreloadKind::Attached { .. } | PreloadKind::AttachedMany { .. } => None,
             };
             match target {
                 Some(target) => {

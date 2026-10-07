@@ -40,6 +40,7 @@ mod registry;
 mod test_module;
 mod render;
 mod ivar_set;
+pub(crate) use ivar_set::controller_name_of;
 mod effects;
 mod diagnostics;
 pub(crate) mod forwarding;
@@ -596,6 +597,42 @@ impl Analyzer {
                     id: ClassId(Symbol::from("ActiveStorage::Attached")),
                     args: vec![],
                 });
+            }
+            for (_span, attr) in crate::lower::attached::many_attached_attrs(model) {
+                cls.instance_methods.entry(attr).or_insert(Ty::Class {
+                    id: ClassId(Symbol::from("ActiveStorage::AttachedMany")),
+                    args: vec![],
+                });
+            }
+            // `ActiveStorage::Attachment` helpers synthesized by
+            // `lower::attachment_model::push_attachment_record_methods`
+            // at the emit seam — register here so `attachment.url` /
+            // `.filename` resolve in check the same way the reader
+            // macros do.
+            if crate::lower::attachment_model::is_attachment_model(model) {
+                let blob = Ty::Class {
+                    id: ClassId(Symbol::from("ActiveStorage::Blob")),
+                    args: vec![],
+                };
+                let filename = Ty::Class {
+                    id: ClassId(Symbol::from("ActiveStorage::Filename")),
+                    args: vec![],
+                };
+                let nilable = |ty: Ty| Ty::Union {
+                    variants: vec![ty, Ty::Nil],
+                };
+                cls.instance_methods
+                    .entry(Symbol::from("blob"))
+                    .or_insert(nilable(blob));
+                cls.instance_methods
+                    .entry(Symbol::from("url"))
+                    .or_insert(Ty::Str);
+                cls.instance_methods
+                    .entry(Symbol::from("filename"))
+                    .or_insert(nilable(filename));
+                cls.instance_methods
+                    .entry(Symbol::from("content_type"))
+                    .or_insert(nilable(Ty::Str));
             }
             // `attr_accessor :x` — and `attr_accessor *CONST`, which is
             // how campfire's `Opengraph::Metadata` names its four. The
@@ -4042,6 +4079,7 @@ impl Analyzer {
                 method.name.as_str(),
                 "generates_token_for"
                     | "has_one_attached"
+                    | "has_many_attached"
                     | "has_rich_text"
                     | "has_markdown"
                     | "has_secure_token"

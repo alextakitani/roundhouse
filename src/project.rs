@@ -1440,7 +1440,11 @@ pub fn target_files(
             classes.entry(&lc.name).or_insert_with(Vec::new).push(lc);
         }
         for (name, declarations) in classes {
-            if declarations.iter().all(|lc| lc.class_ivar_initializers.is_empty()) { continue; }
+            // Synthetic mattr/cattr `@@` seeds are not the Spinel ordering
+            // hazard — only direct source `@ivar` initialization is.
+            if declarations.iter().all(|lc| !lc.has_source_ivar_initializers()) {
+                continue;
+            }
             let mut methods = std::collections::HashSet::new();
             for m in declarations.iter().flat_map(|lc| &lc.methods) {
                 if !methods.insert((m.receiver == crate::dialect::MethodReceiver::Class, &m.name)) {
@@ -3252,6 +3256,18 @@ fn apply_global_id_locate(files: &mut [(String, String)], app: &App) {
              \x20   end\n",
         ));
     }
+    for model in &app.global_id_locate_signed_models {
+        let name = model.as_str();
+        let suffix = crate::lower::global_id_locate::entry_point_suffix(name);
+        generated.push_str(&format!(
+            "    def self.locate_signed_{suffix}(sgid, purpose)\n\
+             \x20     parts = parts_from_signed(sgid, purpose)\n\
+             \x20     return nil if parts.nil?\n\
+             \x20     return nil unless parts[1] == \"{name}\"\n\n\
+             \x20     {name}.find(cast_id(parts[2]))\n\
+             \x20   end\n",
+        ));
+    }
     generated.push_str(TAIL);
 
     for (path, content) in files.iter_mut() {
@@ -4640,6 +4656,10 @@ fn spinel_files(app: &App, fixture: &Path) -> Result<(Vec<(String, String)>, Vec
         "inflector",
         "inflector_ext",
         "json_builder",
+        // Pure string ActiveSupport helpers for the Ruby/Spinel
+        // scaffold (strict targets literalize controller_name/path).
+        // Listed before active_support_ext so require_relative resolves.
+        "active_support_inflections",
         "active_support_ext",
         "security_utils",
         "params",

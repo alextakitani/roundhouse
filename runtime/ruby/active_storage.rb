@@ -80,6 +80,68 @@ module ActiveStorage
     variable_content_types.include?(content_type)
   end
 
+  # Rails' `config.active_storage.video_preview_arguments` — the ffmpeg
+  # argv fragment after `-i <path>`. Default matches the filter the
+  # ruby-family poster reopen draws with; an initializer override
+  # (campfire adds `gte(t,5)`) is lifted onto the Application reopen
+  # at ingest. Suite pins and `Previewer.poster` both read this.
+  def self.video_preview_arguments
+    Rails.application.active_storage_video_preview_arguments
+  end
+
+  # The `-vf` filter expression peeled from `video_preview_arguments`.
+  # One Rails knob, one Application override; the poster reopen takes
+  # this alone (it already passes `-frames:v` / `-f image2`).
+  # Falls back to the framework default filter when the argv has no
+  # quoted `-vf` value — never feeds the whole argv into `-vf`.
+  def self.video_preview_vf_filter
+    args = video_preview_arguments
+    default = "select=eq(n\\,0)+eq(key\\,1)+gt(scene\\,0.015),loop=loop=-1:size=2,trim=start_frame=1"
+    # Match `-vf` as a whole option (not a prefix of `-vframes`).
+    i = 0
+    found = nil
+    while i < args.length
+      j = args.index("-vf", i)
+      if j.nil?
+        break
+      end
+      before_ok = j == 0 || args[j - 1] == " "
+      after = args[j + 3]
+      after_ok = after.nil? || after == " " || after == "'" || after == "\""
+      if before_ok && after_ok
+        found = j
+        break
+      end
+      i = j + 1
+    end
+    if found.nil?
+      return default
+    end
+    rest = args[(found + 3)..-1].to_s
+    while rest.start_with?(" ")
+      rest = rest[1..-1].to_s
+    end
+    quote = rest[0]
+    if quote != "'" && quote != "\""
+      return default
+    end
+    body = rest[1..-1].to_s
+    j = body.index(quote)
+    if j.nil?
+      return default
+    end
+    body[0...j]
+  end
+
+  # Rails' `config.active_storage.previewers` — class list used for
+  # identity checks (`assert_includes ActiveStorage.previewers, …`).
+  # Default is the video previewer only (RH does not ship PDF
+  # previewers). A VideoPreviewer → replacement map on the Application
+  # reopen (campfire: TimeLimitedVideoPreviewer) is lifted at ingest.
+  def self.previewers
+    Rails.application.active_storage_previewers
+  end
+
   # Marcel's answers for the formats a variation can name, so the
   # variant blob's `content_type` column is what Rails would write.
   def self.content_type_for_format(format)
@@ -1317,6 +1379,106 @@ module ActiveStorage
     # destroying that removes the join row while leaving the blob to a
     # `purge_later` job. There is no job here, so this is `purge`
     # under Rails' other name.
+    def destroy
+      purge
+    end
+  end
+
+  # One join row behind `AttachedMany#attachments`. The Attachment
+  # MODEL lives under `app/models/` (synthesized); the runtime cannot
+  # name it without going gradual, so this value mirrors the surface
+  # `uploads.attachments.last` needs — `id` / `blob` / `filename` /
+  # `url` — via the same raw-SQL join One already uses.
+  class ManyAttachment
+    def initialize(id, blob)
+      @id = id
+      @blob = blob
+    end
+
+    def id
+      @id
+    end
+
+    def blob
+      @blob
+    end
+
+    def filename
+      b = @blob
+      b.nil? ? nil : b.filename
+    end
+
+    def content_type
+      b = @blob
+      b.nil? ? nil : b.content_type
+    end
+
+    def url
+      b = @blob
+      b.nil? ? "" : b.redirect_url("")
+    end
+  end
+
+  # What a `has_many_attached :uploads` reader hands back. Always
+  # constructed — never nil — so `uploads.attach` / `uploads.attachments`
+  # need no nil guard. Unlike `Attached` (One), `attach_blob` APPENDS:
+  # prior rows under the same name stay.
+  class AttachedMany
+    def initialize(record_type, record_id, name)
+      @record_type = record_type
+      @record_id = record_id
+      @name = name
+    end
+
+    def attached?
+      attachments.length > 0
+    end
+
+    # Every join row for this name on this record — Rails'
+    # `Attached::Many#attachments`. Raw SQL (not Relation over the
+    # synthesized Attachment MODEL) so the body stays fully typed.
+    def attachments
+      sql = "SELECT a.id AS attachment_id, " + Blob.columns("b") +
+            " FROM active_storage_attachments a " +
+            "JOIN active_storage_blobs b ON b.id = a.blob_id WHERE a.record_type = " +
+            ActiveRecord.adapter.escape_value(@record_type) +
+            " AND a.record_id = " + ActiveRecord.adapter.escape_value(@record_id) +
+            " AND a.name = " + ActiveRecord.adapter.escape_value(@name)
+      out = []
+      ActiveRecord.adapter.select_rows(sql).each do |row|
+        out.push(ManyAttachment.new(row["attachment_id"].to_i, Blob.from_row(row)))
+      end
+      out
+    end
+
+    # APPEND — prior attachments under `@name` stay. One's `attach_blob`
+    # purges first; Many must not.
+    def attach_blob(blob)
+      ActiveRecord.adapter.insert("active_storage_attachments", {
+        "name" => @name,
+        "record_type" => @record_type,
+        "record_id" => @record_id,
+        "blob_id" => blob.id,
+        "created_at" => ActiveSupport.db_now,
+      })
+      nil
+    end
+
+    # DATA, NOT AN IO: `lower::attached::apply_attach_lowering` grounds
+    # `attach(io: …)` / `attach([…])` at the call site.
+    def attach(data, filename, content_type)
+      attach_blob(Blob.create_and_upload!(data, filename, content_type))
+    end
+
+    def purge
+      attachments.each do |att|
+        blob = att.blob
+        ActiveRecord.adapter.delete("active_storage_attachments", att.id)
+        blob.purge unless blob.nil?
+      end
+      nil
+    end
+
     def destroy
       purge
     end
