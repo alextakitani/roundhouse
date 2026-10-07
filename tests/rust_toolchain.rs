@@ -80,6 +80,69 @@ fn real_blog_controller_identity_methods_emit_as_instance_methods() {
     }
 }
 
+/// Execute the generated identity methods in the native Rust toolchain lane.
+///
+/// Kept ignored for the default suite because it shells out to Cargo; CI selects
+/// this focused regression from the Rust compare job. The full-app cargo test
+/// below remains a separate, broader local gate.
+#[test]
+#[ignore]
+fn real_blog_controller_identity_values_match_rails() {
+    let fixture = roundhouse::fixtures::real_blog();
+    let scratch = scratch_dir("real-blog-controller-identity-values");
+    generate_project(fixture, &scratch);
+
+    std::fs::create_dir_all(scratch.join("tests")).unwrap();
+    std::fs::write(
+        scratch.join("tests/controller_identity.rs"),
+        r#"
+use app::action_controller_base::Base;
+use app::controllers::ArticlesController;
+
+/// Verifies the generated controllers return their concrete Rails identities.
+#[test]
+fn controller_identity_values_match_rails() {
+    let base = Base::default();
+    assert_eq!(base.controller_name(), "base");
+    assert_eq!(base.controller_path(), "action_controller/base");
+
+    let controller = ArticlesController::default();
+    assert_eq!(controller.controller_name(), "articles");
+    assert_eq!(controller.controller_path(), "articles");
+}
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new("cargo")
+        .args([
+            "test",
+            "--test",
+            "controller_identity",
+            "--",
+            "--exact",
+            "controller_identity_values_match_rails",
+        ])
+        .current_dir(&scratch)
+        .output()
+        .expect("run focused cargo test");
+
+    assert!(
+        output.status.success(),
+        "focused cargo test failed on emitted real-blog project at {}:\n\
+         \n=== stdout ===\n{}\n\
+         \n=== stderr ===\n{}",
+        scratch.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("test controller_identity_values_match_rails ... ok"),
+        "the emitted controller identity value test did not run:\n{stdout}"
+    );
+}
+
 /// Compile the complete generated application and execute its model/runtime
 /// contracts with the actual Cargo dependency graph and packaged imports.
 #[test]
@@ -158,30 +221,9 @@ fn routed_captures_and_checked_bytes() {
 "#,
     ).unwrap();
 
-    // Exercise the normal Ruby instance-call shape on generated Base and app types.
-    std::fs::write(
-        scratch.join("tests/controller_identity.rs"),
-        r#"
-use app::action_controller_base::Base;
-use app::controllers::ArticlesController;
-
-/// Verifies both generated controller types expose their concrete identities.
-#[test]
-fn controller_identity_methods_are_instance_methods() {
-    let base = Base::default();
-    assert_eq!(base.controller_name(), "base");
-    assert_eq!(base.controller_path(), "action_controller/base");
-
-    let controller = ArticlesController::default();
-    assert_eq!(controller.controller_name(), "articles");
-    assert_eq!(controller.controller_path(), "articles");
-}
-"#,
-    )
-    .unwrap();
-
     let output = Command::new("cargo")
         .arg("test")
+        .arg("--quiet")
         .current_dir(&scratch)
         .output()
         .expect("run cargo test");
@@ -194,11 +236,6 @@ fn controller_identity_methods_are_instance_methods() {
         scratch.display(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("test controller_identity_methods_are_instance_methods ... ok"),
-        "the emitted controller identity test did not run:\n{stdout}"
     );
 }
 
