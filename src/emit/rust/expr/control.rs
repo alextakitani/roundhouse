@@ -431,8 +431,18 @@ pub(super) fn emit_case(scrutinee: &Expr, arms: &[crate::expr::Arm]) -> String {
     // form. A range, class or other `===` pattern, a nil/float literal,
     // or a guarded arm has none, and rendering it as `_` makes the first
     // such arm swallow every input, so report it instead.
-    if arms.iter().any(|arm| arm.guard.is_some() || !case_pattern_supported(&arm.pattern)) {
-        return crate::emit::diagnostics::report_unsupported(scrutinee.span, "rust", "Case", "");
+    // The diagnostic points at the first such arm's guard or pattern
+    // expression; a literal pattern carries no span, so it falls back to
+    // the scrutinee.
+    if let Some(arm) =
+        arms.iter().find(|arm| arm.guard.is_some() || !case_pattern_supported(&arm.pattern))
+    {
+        let span = match (&arm.guard, &arm.pattern) {
+            (Some(guard), _) => guard.span,
+            (None, crate::expr::Pattern::Expr { expr }) => expr.span,
+            _ => scrutinee.span,
+        };
+        return crate::emit::diagnostics::report_unsupported(span, "rust", "Case", "");
     }
     let scrutinee_s = emit_expr(scrutinee);
     let return_ty = current_return_ty();

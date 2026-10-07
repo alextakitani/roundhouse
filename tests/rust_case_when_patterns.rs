@@ -31,7 +31,7 @@ fn read_tree(root: &Path, dir: &Path, out: &mut HashMap<PathBuf, Vec<u8>>) {
 
 /// real-blog with `Article.probe(x)` added; returns the emitted
 /// `article.rs` and the error diagnostics.
-fn emit_rust_with_probe(body: &str) -> (String, Vec<Diagnostic>) {
+fn emit_rust_with_probe(body: &str) -> (String, Vec<Diagnostic>, String) {
     let root = roundhouse::fixtures::real_blog();
     let mut tree = HashMap::new();
     read_tree(root, root, &mut tree);
@@ -41,7 +41,7 @@ fn emit_rust_with_probe(body: &str) -> (String, Vec<Diagnostic>) {
         &format!("class Article < ApplicationRecord\n  def self.probe(x)\n    {body}\n  end\n"),
         1,
     );
-    tree.insert(model, source.into_bytes());
+    tree.insert(model, source.clone().into_bytes());
     let mut app = ingest_app_from_tree(tree).unwrap();
     roundhouse::session::analyze_and_lower(&mut app);
     let (files, diagnostics) = scope(|| target_files(&app, root, BuildTarget::Rust));
@@ -52,19 +52,20 @@ fn emit_rust_with_probe(body: &str) -> (String, Vec<Diagnostic>) {
         .map(|(_, text)| text)
         .unwrap_or_default();
     let errors = diagnostics.into_iter().filter(|d| d.severity == Severity::Error).collect();
-    (article, errors)
+    (article, errors, source)
 }
 
 #[test]
 fn non_literal_when_patterns_are_unsupported_not_wildcards() {
-    for body in [
-        "case x\n    when 0..3 then \"low\"\n    when 4..9 then \"high\"\n    else \"neg\"\n    end",
-        "case x\n    when 0...3 then \"low\"\n    else \"other\"\n    end",
-        "case x\n    when ..0 then \"nonpos\"\n    when 10.. then \"big\"\n    else \"mid\"\n    end",
-        "case x\n    when String then \"s\"\n    when Integer then \"i\"\n    else \"o\"\n    end",
-        "case x\n    when 0 then \"zero\"\n    when 1..5 then \"few\"\n    else \"many\"\n    end",
+    // Each body pairs with the arm the diagnostic must point at.
+    for (body, failing) in [
+        ("case x\n    when 0..3 then \"low\"\n    when 4..9 then \"high\"\n    else \"neg\"\n    end", "0..3"),
+        ("case x\n    when 0...3 then \"low\"\n    else \"other\"\n    end", "0...3"),
+        ("case x\n    when ..0 then \"nonpos\"\n    when 10.. then \"big\"\n    else \"mid\"\n    end", "..0"),
+        ("case x\n    when String then \"s\"\n    when Integer then \"i\"\n    else \"o\"\n    end", "String"),
+        ("case x\n    when 0 then \"zero\"\n    when 1..5 then \"few\"\n    else \"many\"\n    end", "1..5"),
     ] {
-        let (article, errors) = emit_rust_with_probe(body);
+        let (article, errors, source) = emit_rust_with_probe(body);
         assert!(!errors.is_empty(), "rust accepted {body}:\n{article}");
         assert_eq!(errors.len(), 1, "{body}: {errors:?}");
         assert!(
@@ -72,13 +73,15 @@ fn non_literal_when_patterns_are_unsupported_not_wildcards() {
                 if construct.as_str() == "Case" && t.as_str() == "rust"),
             "{body}: {errors:?}"
         );
-        assert!(!errors[0].span.is_synthetic(), "lost source span");
+        let span = errors[0].span;
+        assert!(!span.is_synthetic(), "lost source span");
+        assert_eq!(&source[span.start as usize..span.end as usize], failing, "{body}: span");
     }
 }
 
 #[test]
 fn literal_when_patterns_still_emit_a_match() {
-    let (article, errors) = emit_rust_with_probe(
+    let (article, errors, _) = emit_rust_with_probe(
         "case x\n    when 1, 2 then \"small\"\n    when 3 then \"three\"\n    else \"other\"\n    end",
     );
     assert!(errors.is_empty(), "{errors:?}");
