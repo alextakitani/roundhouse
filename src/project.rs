@@ -4617,6 +4617,10 @@ fn spinel_files(app: &App, fixture: &Path) -> Result<(Vec<(String, String)>, Vec
         "inflector",
         "inflector_ext",
         "json_builder",
+        // Pure string ActiveSupport helpers for the Ruby/Spinel
+        // scaffold (strict targets literalize controller_name/path).
+        // Listed before active_support_ext so require_relative resolves.
+        "active_support_inflections",
         "active_support_ext",
         "security_utils",
         "params",

@@ -40,6 +40,7 @@ mod registry;
 mod test_module;
 mod render;
 mod ivar_set;
+pub(crate) use ivar_set::controller_name_of;
 mod effects;
 mod diagnostics;
 pub(crate) mod forwarding;

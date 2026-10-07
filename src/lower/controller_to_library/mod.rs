@@ -1303,7 +1303,71 @@ fn build_methods(
     // Class-side methods are already seeded at the start of build_methods;
     // do not append them again (duplicate defs break several emitters).
 
+    // Specialize `controller_name` / `controller_path` as string
+    // literals so Base does not need `self.class.to_s` reflection or
+    // an ActiveSupport char-walk that several AOT string emits cannot
+    // host yet. Upsert (retain + push) so a source-defined method of
+    // the same name cannot leave a duplicate MethodDef.
+    upsert_controller_string_method(
+        &mut methods,
+        controller,
+        "controller_name",
+        &crate::analyze::controller_name_of(&controller.name),
+    );
+    upsert_controller_string_method(
+        &mut methods,
+        controller,
+        "controller_path",
+        &crate::analyze::controller_view_prefix(&controller.name),
+    );
+
     methods
+}
+
+/// Replace any prior def of `name`, then push the AOT string-literal
+/// override — duplicate MethodDefs break several emitters.
+fn upsert_controller_string_method(
+    methods: &mut Vec<MethodDef>,
+    controller: &Controller,
+    name: &str,
+    value: &str,
+) {
+    methods.retain(|m| m.name.as_str() != name);
+    methods.push(synthesize_controller_string_method(controller, name, value));
+}
+
+/// Instance method returning a String literal — AOT-safe override of
+/// Base's `controller_name` / `controller_path`.
+fn synthesize_controller_string_method(
+    controller: &Controller,
+    name: &str,
+    value: &str,
+) -> MethodDef {
+    let span = crate::span::Span::synthetic();
+    MethodDef {
+        visibility: crate::dialect::MethodVisibility::Public,
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        name_span: span,
+        name: Symbol::from(name),
+        receiver: MethodReceiver::Instance,
+        params: vec![],
+        body: Expr::new(
+            span,
+            ExprNode::Lit {
+                value: crate::expr::Literal::Str {
+                    value: value.to_string(),
+                },
+            },
+        ),
+        signature: Some(crate::lower::typing::fn_sig(vec![], Ty::Str)),
+        effects: EffectSet::default(),
+        enclosing_class: Some(controller.name.0.clone()),
+        kind: AccessorKind::Method,
+        is_async: false,
+        mutates_self: false,
+        block_param: None,
+    }
 }
 
 /// Names a controller marks with `helper_method :x` whose public
@@ -1750,11 +1814,15 @@ fn default_forgery_protection() -> Filter {
 /// `post_authenticating_url` (a private method on the Authentication
 /// concern, spliced into ApplicationController) and `logo_path` are the
 /// corpus members that made this visible.
+///
+/// Always includes `controller_path`: ActionController::Base answers it
+/// (and the lowerer synthesizes a literal override) even when no source
+/// `def` appears in the ancestry.
 fn route_helper_shadows(
     controller: &Controller,
     all: &[Controller],
 ) -> std::collections::HashSet<Symbol> {
-    ancestor_chain(controller, all)
+    let mut out: std::collections::HashSet<Symbol> = ancestor_chain(controller, all)
         .into_iter()
         .chain(std::iter::once(controller))
         .flat_map(|c| c.body.iter())
@@ -1764,7 +1832,9 @@ fn route_helper_shadows(
         })
         .filter(|n| n.as_str().ends_with("_path") || n.as_str().ends_with("_url"))
         .cloned()
-        .collect()
+        .collect();
+    out.insert(Symbol::from("controller_path"));
+    out
 }
 
 /// Walk `parent` links root-first (`[ApplicationController]` for a
