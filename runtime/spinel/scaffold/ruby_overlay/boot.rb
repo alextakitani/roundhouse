@@ -58,6 +58,9 @@ require_relative "runtime/json_builder"
 # entry points need it: the CRuby target uses this overlay, and patching
 # only the spinel one leaves `<Resource>Params.from_raw` reaching an
 # undefined constant on every request that carries params.
+# Mime - `Params.wrap` asks the registry whether a request body is JSON
+# (Rails' own synonyms and parameters included).
+require_relative "runtime/mime"
 require_relative "runtime/params"
 # ActionText::Content — see the spinel scaffold's main.rb. Both entry
 # points need it: a `has_rich_text` model's `body` reader constructs

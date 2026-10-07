@@ -13,6 +13,8 @@ mod class_attribute;
 mod integer_query_find_by;
 #[path = "emit_and_run/strong_params.rs"]
 mod strong_params;
+#[path = "emit_and_run/params_wrapper.rs"]
+mod params_wrapper;
 
 #[path = "support/class_configuration.rs"]
 mod class_configuration;

@@ -43,13 +43,16 @@ module CgiIo
   }.freeze
 
   # Parse a CGI request from the given env hash + body-readable IO.
-  # Returns: { method:, path:, params:, cookies: }.
+  # Returns: { method:, path:, params:, body_params:, cookies:, accept: }.
+  # `body_params` holds the body's params alone (Rails'
+  # `request_parameters`), which ParamsWrapper copies from.
   def self.parse_request(env, stdin)
     method = (env["REQUEST_METHOD"] || "GET").upcase
     path   = env["PATH_INFO"] || "/"
     query  = env["QUERY_STRING"] || ""
 
     params = {}
+    body_params = {}
     parse_form_into(query, params) unless query.empty?
 
     if method == "POST" || method == "PATCH" || method == "PUT"
@@ -58,6 +61,7 @@ module CgiIo
       if length > 0 && ctype.start_with?("application/x-www-form-urlencoded")
         body = stdin.read(length).to_s
         parse_form_into(body, params)
+        parse_form_into(body, body_params)
       elsif length > 0 && ctype.start_with?("multipart/form-data")
         # File parts land in the params tree as UploadedFile objects
         # under their bracket-nested name, the way Rack nests them; see
@@ -66,6 +70,8 @@ module CgiIo
         form = ActionDispatch::Http::Multipart.parse(body, ctype)
         form.fields.each { |k, v| assign_form_pair(params, k, v) }
         form.files.each { |k, v| assign_form_pair(params, k, v) }
+        form.fields.each { |k, v| assign_form_pair(body_params, k, v) }
+        form.files.each { |k, v| assign_form_pair(body_params, k, v) }
       elsif length > 0 && ctype.start_with?("application/json")
         # `@rails/request.js` with `contentType: "application/json"`
         # (campfire's link unfurl): Rails parses the object into params,
@@ -74,7 +80,10 @@ module CgiIo
         body = stdin.read(length).to_s
         begin
           parsed = JSON.parse(body)
-          parsed.each { |k, v| params[k] = v } if parsed.is_a?(Hash)
+          if parsed.is_a?(Hash)
+            parsed.each { |k, v| params[k] = v }
+            parsed.each { |k, v| body_params[k] = v }
+          end
         rescue JSON::ParserError
           nil
         end
@@ -103,7 +112,7 @@ module CgiIo
     # same URL typed into the address bar.
     accept = env.fetch("HTTP_ACCEPT", "").to_s
 
-    { method: method, path: path, params: params, cookies: cookies, accept: accept }
+    { method: method, path: path, params: params, body_params: body_params, cookies: cookies, accept: accept }
   end
 
   # Write a CGI response to the given writable IO. `set_cookies` is
