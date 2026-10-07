@@ -24,8 +24,8 @@
 //! recursive value has no finite type in this lattice, so the cut gives
 //! up only precision that was never reachable, and it surfaces as gradual
 //! `untyped` (which strict targets reject at emit) instead of a deeper copy
-//! each round. Both bounds sit well above every type the public corpora
-//! carry (depth 10 and 57 nodes at most), so a program without such a
+//! each round. Both bounds sit above every type the public corpora carry
+//! (depth 10 and about 320 nodes at most), so a program without such a
 //! cycle is unchanged.
 
 use crate::ty::{Param, Row, Ty};
