@@ -76,13 +76,19 @@ fn arg_list(line: &str, open: &str) -> Option<Vec<String>> {
     Some(inner.split(", ").map(|p| p.trim().to_string()).collect())
 }
 
-/// The partial takes one `error`, and every call in `caller` fits its
-/// signature: `note_into(io, …)` has no defaults, so a call passes exactly
-/// as many arguments; `note(…)` defaults its extras, so a call passes at
-/// most as many.
-fn assert_one_error_and_matching_calls(files: &[(String, String)], caller: &str) {
-    let partial = file(files, "app/views/posts/_note.rb");
-    assert_parses(partial, "app/views/posts/_note.rb");
+/// The partial `posts/_<name>` takes one `param`, and every call in
+/// `caller` fits its signature: `<name>_into(io, …)` has no defaults, so a
+/// call passes exactly as many arguments; `<name>(…)` defaults its extras,
+/// so a call passes at most as many.
+fn assert_one_param_and_matching_calls(
+    files: &[(String, String)],
+    name: &str,
+    param: &str,
+    caller: &str,
+) {
+    let path = format!("app/views/posts/_{name}.rb");
+    let partial = file(files, &path);
+    assert_parses(partial, &path);
     let source = file(files, caller);
     assert_parses(source, caller);
     let def = |open: &str| {
@@ -91,26 +97,28 @@ fn assert_one_error_and_matching_calls(files: &[(String, String)], caller: &str)
             .find_map(|l| arg_list(l, open))
             .unwrap_or_else(|| panic!("no {open}:\n{partial}"))
     };
-    let into_params = def("def self.note_into(");
-    let note_params = def("def self.note(");
-    let errors = into_params.iter().filter(|p| p.as_str() == "error").count();
-    assert_eq!(errors, 1, "params {into_params:?}\n{partial}");
+    let into_params = def(&format!("def self.{name}_into("));
+    let plain_params = def(&format!("def self.{name}("));
+    let count = into_params.iter().filter(|p| p.as_str() == param).count();
+    assert_eq!(count, 1, "params {into_params:?}\n{partial}");
+    let into_call = format!("Views::Posts.{name}_into(");
+    let plain_call = format!("Views::Posts.{name}(");
     let mut calls = 0;
     for line in source
         .lines()
         .filter(|l| !l.trim_start().starts_with("def "))
     {
-        if let Some(args) = arg_list(line, "Views::Posts.note_into(") {
+        if let Some(args) = arg_list(line, &into_call) {
             assert_eq!(
                 into_params.len(),
                 args.len(),
                 "params {into_params:?}, args {args:?}\n{source}"
             );
             calls += 1;
-        } else if let Some(args) = arg_list(line, "Views::Posts.note(") {
+        } else if let Some(args) = arg_list(line, &plain_call) {
             assert!(
-                args.len() <= note_params.len(),
-                "params {note_params:?}, args {args:?}\n{source}"
+                args.len() <= plain_params.len(),
+                "params {plain_params:?}, args {args:?}\n{source}"
             );
             calls += 1;
         }
@@ -129,7 +137,7 @@ fn a_partial_reading_local_assigns_and_the_same_ivar_takes_one_param() {
             "<%= render \"posts/note\" %>\n",
         ),
     ]);
-    assert_one_error_and_matching_calls(&files, "app/views/posts/index.rb");
+    assert_one_param_and_matching_calls(&files, "note", "error", "app/views/posts/index.rb");
 }
 
 /// A view render with locals binds the extras by name
@@ -144,8 +152,14 @@ fn a_view_render_with_locals_passes_the_same_arguments() {
             "<%= render \"posts/note\", error: \"x\", alert: \"a\" %>\n",
         ),
     ]);
-    assert_one_error_and_matching_calls(&files, "app/views/posts/index.rb");
+    assert_one_param_and_matching_calls(&files, "note", "error", "app/views/posts/index.rb");
 }
+
+const CARD: (&str, &str) = (
+    "app/views/posts/_card.html.erb",
+    "<div class=\"<%= local_assigns[:class] %> <%= @class %>\"></div>\n",
+);
+const CLASS_INDEX: &str = "class PostsController < ApplicationController\n  def index\n    @class = \"wide\"\n  end\nend\n";
 
 /// A reserved word: the closure carries `@class` as `class_`, the extra
 /// is the raw `class`. They are the same local, so still one param.
@@ -153,29 +167,56 @@ fn a_view_render_with_locals_passes_the_same_arguments() {
 fn a_reserved_word_local_and_ivar_take_one_param() {
     let files = spinel(&[
         ("config/routes.rb", ROUTES_INDEX),
-        (
-            "app/controllers/posts_controller.rb",
-            "class PostsController < ApplicationController\n  def index\n    @class = \"wide\"\n  end\nend\n",
-        ),
-        (
-            "app/views/posts/_card.html.erb",
-            "<div class=\"<%= local_assigns[:class] %> <%= @class %>\"></div>\n",
-        ),
+        ("app/controllers/posts_controller.rb", CLASS_INDEX),
+        CARD,
         (
             "app/views/posts/index.html.erb",
             "<%= render \"posts/card\" %>\n",
         ),
     ]);
-    let partial = file(&files, "app/views/posts/_card.rb");
-    assert_parses(partial, "app/views/posts/_card.rb");
-    let params = partial
-        .lines()
-        .find_map(|l| arg_list(l, "def self.card_into("))
-        .unwrap_or_else(|| panic!("no card_into def:\n{partial}"));
-    assert_eq!(
-        params.iter().filter(|p| p.as_str() == "class_").count(),
-        1,
-        "params {params:?}\n{partial}"
+    assert_one_param_and_matching_calls(&files, "card", "class_", "app/views/posts/index.rb");
+}
+
+/// The same reserved word as a `locals:` key from a view: the raw key
+/// `class` is the closure's `class_`, not a second param.
+#[test]
+fn a_reserved_word_view_local_passes_the_same_arguments() {
+    let files = spinel(&[
+        ("config/routes.rb", ROUTES_INDEX),
+        ("app/controllers/posts_controller.rb", CLASS_INDEX),
+        CARD,
+        (
+            "app/views/posts/index.html.erb",
+            "<%= render \"posts/card\", class: \"x\" %>\n",
+        ),
+    ]);
+    assert_one_param_and_matching_calls(&files, "card", "class_", "app/views/posts/index.rb");
+}
+
+/// The same `locals:` key from a controller render
+/// (`partial_call_contracts`).
+#[test]
+fn a_reserved_word_controller_local_passes_the_same_arguments() {
+    let files = spinel(&[
+        (
+            "config/routes.rb",
+            "Rails.application.routes.draw do\n  resources :posts, only: %i[index]\n  get \"posts/preview\", to: \"posts#preview\"\nend\n",
+        ),
+        (
+            "app/controllers/posts_controller.rb",
+            "class PostsController < ApplicationController\n  def index\n    @class = \"wide\"\n  end\n\n  def preview\n    @class = \"wide\"\n    render partial: \"posts/card\", locals: { class: \"x\" }\n  end\nend\n",
+        ),
+        CARD,
+        (
+            "app/views/posts/index.html.erb",
+            "<%= render \"posts/card\" %>\n",
+        ),
+    ]);
+    assert_one_param_and_matching_calls(
+        &files,
+        "card",
+        "class_",
+        "app/controllers/posts_controller.rb",
     );
 }
 
@@ -197,5 +238,10 @@ fn a_controller_render_with_locals_passes_the_same_arguments() {
             "<%= render \"posts/note\" %>\n",
         ),
     ]);
-    assert_one_error_and_matching_calls(&files, "app/controllers/posts_controller.rb");
+    assert_one_param_and_matching_calls(
+        &files,
+        "note",
+        "error",
+        "app/controllers/posts_controller.rb",
+    );
 }

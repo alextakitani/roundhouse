@@ -23,10 +23,11 @@ use crate::expr::{Expr, ExprNode, InterpPart};
 /// Drop the extras a threaded closure ivar already names. After the
 /// ivar→local rewrite `@error` and `local_assigns[:error]` read the same
 /// local `error`, which the closure param supplies; a second `error`
-/// param is a duplicate argument name (#389). A `locals:` key that names
-/// a closure ivar is skipped the same way. The def site and both call-site
-/// contracts apply it to the same lists, so positions stay aligned.
-/// `closure` holds `safe_local` names; `extras` holds raw ones.
+/// param is a duplicate argument name (#389). It runs after the `locals:`
+/// keys are appended, so a key that names a closure ivar is dropped the
+/// same way. The def site and both call-site contracts apply it to the
+/// same lists, so positions stay aligned. `closure` holds `safe_local`
+/// names; `extras` holds raw ones (`class` against `class_`).
 pub(super) fn drop_closure_names(extras: &mut Vec<String>, closure: &[String]) {
     extras.retain(|k| !closure.contains(&crate::naming::safe_local(k)));
 }

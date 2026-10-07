@@ -489,7 +489,6 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
     // closure ivars, flash/defined? extras) are skipped.
     let mut extra_params = extra_params;
     if is_partial {
-        drop_closure_names(&mut extra_params, &closure_ivars);
         let keys_map = &lx.locals_keys;
         if let Some(keys) = view_key_of(view).and_then(|k| keys_map.get(&k).cloned()) {
             for k in keys {
@@ -501,6 +500,7 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
                 }
             }
         }
+        drop_closure_names(&mut extra_params, &closure_ivars);
     }
 
     // A bound form local is NOT interface (see `partial_form_bindings`):
@@ -2432,7 +2432,6 @@ pub(crate) fn partial_call_contracts(
                     .collect()
             })
             .unwrap_or_default();
-        drop_closure_names(&mut extras, &closure);
         if let Some(keys) = keys_map.get(&key) {
             for k in keys {
                 if k != &record && !closure.contains(k) && !extras.contains(k) {
@@ -2440,6 +2439,7 @@ pub(crate) fn partial_call_contracts(
                 }
             }
         }
+        drop_closure_names(&mut extras, &closure);
         out.insert(key, PartialCallContract { record, closure, extras, keyword_extras: false });
     }
     out
@@ -2607,7 +2607,6 @@ pub(super) fn partial_extras_map(
             .get(&key)
             .map(|ivs| ivs.iter().map(|s| crate::naming::safe_local(s.as_str())).collect())
             .unwrap_or_default();
-        drop_closure_names(&mut extras, &closure);
         if let Some(keys) = keys_map.get(&key) {
             for k in keys {
                 if k != &arg_name && !closure.contains(k) && !extras.contains(k) {
@@ -2615,6 +2614,7 @@ pub(super) fn partial_extras_map(
                 }
             }
         }
+        drop_closure_names(&mut extras, &closure);
         out.insert(key, extras);
     }
     // Mirror the def site's bound-form-local drop (the defined?-extras
