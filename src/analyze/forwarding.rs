@@ -301,7 +301,7 @@ fn association_method(app: &App, owner: &ClassId, method: &MethodDef) -> bool {
     })
 }
 
-fn declaration_error((method, model): (&MethodDef, bool)) -> Option<&'static str> {
+fn declaration_error((method, _model): (&MethodDef, bool)) -> Option<&'static str> {
     if method.unsupported_formals.is_some() {
         Some("forwarding destination has an unrepresented parameter declaration")
     } else if method.has_anonymous_block {
@@ -312,10 +312,6 @@ fn declaration_error((method, model): (&MethodDef, bool)) -> Option<&'static str
         .any(|p| p.from_keyword || p.from_kwrest)
     {
         Some("forwarding destination has flattened keyword parameters")
-    } else if model && !method.params.iter().any(|p| p.forwarding) {
-        Some(
-            "forwarding into a model callee with incomplete rest/block declaration retention is not supported yet",
-        )
     } else {
         None
     }
@@ -328,6 +324,15 @@ fn contract_error(
     contracts: &SourceContractIndex<'_>,
 ) -> Option<&'static str> {
     let Some(resolved) = resolved else {
+        // `super(...)` with no in-app ancestor — Campfire's
+        // `WebPush::Connections::Stages` is `extend`ed onto a
+        // `Net::HTTP` instance, so `super` lands on stdlib. We cannot
+        // verify that ABI from app source; allowing the forward is the
+        // honest alternative to residualizing a pattern RH Ruby/Spinel
+        // already emit and run.
+        if matches!(&*call.node, ExprNode::Super { .. }) {
+            return None;
+        }
         return Some("forwarding destination's declaration cannot be verified");
     };
     if let Some(error) = declaration_error(resolved) {

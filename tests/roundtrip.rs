@@ -53,12 +53,15 @@ fn tiny_blog_round_trips() {
     let post_model = Model {
         name: ClassId(Symbol::from("Post")),
         parent: None,
+        parent_span: Default::default(),
         table: TableRef(Symbol::from("posts")),
         primary_key: None,
         attributes: Row { fields: attrs, rest: None },
         body: vec![],
         enums: Default::default(),
         enum_defaults: Default::default(),
+        class_attr_defaults: Default::default(),
+        lexical_json_shadow: false,
         sti_subclass_names: Vec::new(),
         span: Span::synthetic(),
     };
@@ -94,6 +97,7 @@ fn tiny_blog_round_trips() {
     let posts_controller = Controller {
         name: ClassId(Symbol::from("PostsController")),
         parent: Some(ClassId(Symbol::from("ApplicationController"))),
+        parent_span: Default::default(),
         body: vec![roundhouse::ControllerBodyItem::Action {
             action: index_action,
             leading_comments: vec![],
@@ -115,6 +119,7 @@ fn tiny_blog_round_trips() {
         }],
         direct_helpers: vec![],
         redirects: vec![],
+        diagnostics: vec![],
     };
 
     let app = App {
@@ -140,16 +145,20 @@ fn tiny_blog_round_trips() {
         stylesheets: vec![],
         rbs_signatures: std::collections::HashMap::new(),
         gem_lock: None,
+        gem_boundary: Default::default(),
         content_helper_allowed_attributes: Vec::new(),
         helper_method_index: std::collections::HashMap::new(),
         view_visible_controller_methods: std::collections::BTreeSet::new(),
         global_id_locate_models: std::collections::BTreeSet::new(),
+        global_id_locate_signed_models: std::collections::BTreeSet::new(),
         attachable_unsigned_models: Vec::new(),
+        pending_attachment_on_load: Vec::new(),
         load_hook_class_macros: Vec::new(),
         partial_local_types: std::collections::HashMap::new(),
         view_ivar_types: std::collections::HashMap::new(),
         html_safe_methods: std::collections::BTreeSet::new(),
         time_formats: std::collections::BTreeMap::new(),
+        generated_helper_methods: std::collections::BTreeMap::new(),
         module_mixins: Vec::new(),
         rails_application: None,
         concern_filters: std::collections::HashMap::new(),
@@ -164,6 +173,7 @@ fn tiny_blog_round_trips() {
         sources: vec![],
         // Derived from `sources` and `serde(skip)`, like `binary_assets`.
         const_resolver: Default::default(),
+        source_index_required: false,
         root: String::new(),
         app_roots: vec!["app".to_string()],
     };

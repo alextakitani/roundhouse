@@ -166,6 +166,8 @@ pub fn synthesize_record_model(app: &mut App) {
             polymorphic_targets: Vec::new(),
             default: None,
             touch: None,
+            foreign_type: None,
+            primary_key: None,
         },
         leading_comments: Vec::new(),
         leading_blank_line: false,
@@ -175,6 +177,7 @@ pub fn synthesize_record_model(app: &mut App) {
         sti_subclass_names: Vec::new(),
         name: class,
         parent: Some(ClassId(Symbol::from("ApplicationRecord"))),
+        parent_span: Default::default(),
         table: TableRef(Symbol::from(RECORD_TABLE)),
         primary_key: None,
         attributes,
@@ -182,6 +185,8 @@ pub fn synthesize_record_model(app: &mut App) {
         span: Span::synthetic(),
         enums: indexmap::IndexMap::new(),
         enum_defaults: indexmap::IndexMap::new(),
+        class_attr_defaults: indexmap::IndexMap::new(),
+        lexical_json_shadow: false,
     });
 }
 

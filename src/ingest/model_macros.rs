@@ -1,22 +1,24 @@
-//! Specialize concern macros that define instance methods from symbols
+//! Specialize concern class-method macros that define instance methods
+//! from interned literal names (Symbol or String) via `define_method`,
 //! or from a statically interpolatable `class_eval` string/heredoc.
 //!
-//! Writebook's `positioned_within` closes over three symbol arguments in
-//! parameterless `define_method` blocks, then marks the helpers private.
-//! The same pass expands a class-body `class_eval <<-CODE` whose
-//! interpolations are those bound symbols — without executing Ruby.
-//! Dynamic `class_eval` (non-literal, unknown interpolations) stays
-//! unexpanded. This is deliberately not a Ruby evaluator: mutable
+//! A `class_methods do` / `module ClassMethods` macro with literal
+//! arguments is partial-evaluated at the call site: bound names
+//! substitute into parameterless `define_method` bodies, `send(:name)`
+//! / `send("name")` / `__send__` with a literal first argument collapse
+//! to a direct call, and named visibility applies to those definitions.
+//! Dynamic `class_eval`, non-literal `define_method`, and `send` with a
+//! computed name stay unexpanded. This is not a Ruby evaluator: mutable
 //! captures, block parameters, nested blocks, control flow, side
 //! effects outside the definitions and redefinitions stay unexpanded.
 
 use std::collections::{HashMap, HashSet};
 
+use crate::App;
 use crate::dialect::{MethodDef, MethodReceiver, MethodVisibility, ModelBodyItem};
 use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::{ClassId, Symbol};
 use crate::span::SourceFile;
-use crate::App;
 
 mod class_eval;
 
@@ -122,6 +124,17 @@ pub(crate) fn expand_model_macros(
             if recv
                 .as_ref()
                 .is_some_and(|r| !matches!(&*r.node, ExprNode::SelfRef))
+            {
+                continue;
+            }
+            // Bare `has_markdown :sym` is claimed by
+            // `lower::plain_text_attr` as Unknown DSL — same shape as
+            // `has_rich_text` — only when the Markdown storage table
+            // exists. Skip concern `class_eval` expansion so the
+            // leftover `has_one`/`scope` forms do not fail-close the
+            // whole expansion into an ingest gap.
+            if crate::lower::plain_text_attr::claims_call(method, args)
+                && crate::lower::plain_text_attr::record_table_present(&app.schema)
             {
                 continue;
             }
@@ -379,12 +392,12 @@ fn supported_source_call(expr: &Expr, sources: &[SourceFile]) -> bool {
         && call.block().is_none()
         && call.arguments().is_none_or(|args| {
             args.arguments().iter().all(|arg| {
-                arg.as_symbol_node().is_some()
+                interned_prism_name(&arg)
                     || arg.as_keyword_hash_node().is_some_and(|hash| {
                         hash.elements().iter().all(|entry| {
                             entry.as_assoc_node().is_some_and(|entry| {
                                 entry.key().as_symbol_node().is_some()
-                                    && entry.value().as_symbol_node().is_some()
+                                    && interned_prism_name(&entry.value())
                             })
                         })
                     })
@@ -432,6 +445,43 @@ pub(super) fn symbol(expr: &Expr) -> Option<&Symbol> {
     }
 }
 
+/// `define_method` / `send` names and bound macro arguments: interned
+/// Symbol or String literals. Interpolation and other literals stay out.
+pub(super) fn interned_name(expr: &Expr) -> Option<Symbol> {
+    match &*expr.node {
+        ExprNode::Lit {
+            value: Literal::Sym { value },
+        } => Some(value.clone()),
+        ExprNode::Lit {
+            value: Literal::Str { value },
+        } => Some(Symbol::from(value.as_str())),
+        _ => None,
+    }
+}
+
+fn interned_prism_name(arg: &ruby_prism::Node<'_>) -> bool {
+    arg.as_symbol_node().is_some() || arg.as_string_node().is_some()
+}
+
+fn valid_def_name(name: &Symbol) -> bool {
+    let header = format!("def {name}\nend\n");
+    let parsed = ruby_prism::parse(header.as_bytes());
+    let node = parsed.node();
+    let Some(program) = node.as_program_node() else {
+        return false;
+    };
+    let nodes: Vec<_> = program.statements().body().iter().collect();
+    let [node] = nodes.as_slice() else {
+        return false;
+    };
+    let Some(method_node) = node.as_def_node() else {
+        return false;
+    };
+    parsed.errors().next().is_none()
+        && method_node.receiver().is_none()
+        && method_node.name().as_slice() == name.as_str().as_bytes()
+}
+
 /// Required positionals plus required/optional keywords. Optional
 /// positionals, rest and forwarding need a fuller Ruby argument binder.
 /// Keywords retain their SOURCE kind even where library ingest flattened
@@ -472,12 +522,12 @@ pub(super) fn bindings(def: &MethodDef, args: &[Expr]) -> Option<HashMap<Symbol,
         let value = if param.keyword || param.from_keyword {
             match keywords.remove(&param.name) {
                 Some(value) => {
-                    symbol(&value)?;
+                    interned_name(&value)?;
                     value
                 }
                 None => match &param.default {
                     Some(default) => {
-                        if symbol(default).is_none() {
+                        if interned_name(default).is_none() {
                             continue;
                         }
                         default.clone()
@@ -488,10 +538,12 @@ pub(super) fn bindings(def: &MethodDef, args: &[Expr]) -> Option<HashMap<Symbol,
         } else {
             positional.next()?.clone()
         };
-        // Symbols are immutable/interned: replacing their reads cannot
-        // change capture identity or turn a shared mutable value into a
-        // fresh allocation on each method call.
-        symbol(&value)?;
+        // Symbols are interned, so substituting a bound Symbol as a
+        // value keeps capture identity. String literals are interned
+        // names only — a value read of a String binding declines
+        // (`string_binding_read_as_value`), because substitution would
+        // allocate a fresh unfrozen string on each call.
+        interned_name(&value)?;
         out.insert(param.name.clone(), value);
     }
     (positional.next().is_none() && keywords.is_empty()).then_some(out)
@@ -523,6 +575,9 @@ fn expand_define_methods(
     sources: &[SourceFile],
 ) -> Option<Vec<MethodDef>> {
     let bindings = bindings(def, args)?;
+    if string_binding_read_as_value(&def.body, &bindings) {
+        return None;
+    }
     let statements = match &*def.body.node {
         ExprNode::Seq { exprs } => exprs.as_slice(),
         _ => std::slice::from_ref(&def.body),
@@ -530,7 +585,7 @@ fn expand_define_methods(
     let mut methods: Vec<MethodDef> = Vec::new();
     for statement in statements {
         let ExprNode::Send {
-            recv: None,
+            recv,
             method,
             args,
             block,
@@ -539,26 +594,21 @@ fn expand_define_methods(
         else {
             return None;
         };
+        // Receiverless and `self.define_method` are the class-body
+        // forms; an explicit receiver is dynamic metaprogramming.
+        if recv
+            .as_ref()
+            .is_some_and(|r| !matches!(&*r.node, ExprNode::SelfRef))
+        {
+            return None;
+        }
         if method.as_str() == "define_method" {
             let [name] = args.as_slice() else { return None };
-            let name = substitute(name.clone(), &bindings)?;
-            let name = symbol(&name)?.clone();
-            // Ruby accepts arbitrary symbols in define_method, but an
-            // emitted `def` must have a syntactically valid method name.
-            let header = format!("def {name}\nend\n");
-            let parsed = ruby_prism::parse(header.as_bytes());
-            let node = parsed.node();
-            let program = node.as_program_node()?;
-            let nodes: Vec<_> = program.statements().body().iter().collect();
-            let [node] = nodes.as_slice() else {
-                return None;
-            };
-            let method_node = node.as_def_node()?;
-            if parsed.errors().next().is_some()
-                || method_node.receiver().is_some()
-                || method_node.name().as_slice() != name.as_str().as_bytes()
-                || methods.iter().any(|m| m.name == name)
-            {
+            let name = substitute(name.clone(), &bindings, &HashSet::new())?;
+            let name = interned_name(&name)?;
+            // Ruby accepts arbitrary interned names in define_method,
+            // but an emitted `def` must be syntactically valid.
+            if !valid_def_name(&name) || methods.iter().any(|m| m.name == name) {
                 return None;
             }
             let ExprNode::Lambda {
@@ -577,7 +627,7 @@ fn expand_define_methods(
                 return None;
             }
             let mut generated = def.clone();
-            generated.name = name;
+            generated.name = name.clone();
             generated.name_span = args[0].span;
             generated.receiver = MethodReceiver::Instance;
             generated.visibility = if matches!(
@@ -591,7 +641,14 @@ fn expand_define_methods(
             generated.params.clear();
             generated.block_param = None;
             generated.signature = None;
-            generated.body = substitute(body.clone(), &bindings)?;
+            // Same-expansion helpers (already defined in this macro, plus
+            // this name) may appear as `positioning_parent.send(:leaves)`.
+            // Only those call-chain roots collapse; bare `helper.send`
+            // stays reflective.
+            let mut helpers: HashSet<Symbol> =
+                methods.iter().map(|m| m.name.clone()).collect();
+            helpers.insert(name);
+            generated.body = substitute(body.clone(), &bindings, &helpers)?;
             methods.push(generated);
         } else {
             let visibility = match method.as_str() {
@@ -606,10 +663,11 @@ fn expand_define_methods(
             {
                 return None;
             }
+            let helpers = HashSet::new();
             for arg in args {
-                let name = substitute(arg.clone(), &bindings)?;
-                let name = symbol(&name)?;
-                methods.iter_mut().find(|m| &m.name == name)?.visibility = visibility;
+                let name = substitute(arg.clone(), &bindings, &helpers)?;
+                let name = interned_name(&name)?;
+                methods.iter_mut().find(|m| m.name == name)?.visibility = visibility;
             }
         }
     }
@@ -670,9 +728,10 @@ fn supported_source_statement(
     let Some(call) = node.as_call_node() else {
         return false;
     };
-    if call.receiver().is_some() || !call.arguments().is_some_and(|args| {
+    let recv_ok = call.receiver().is_none_or(|r| r.as_self_node().is_some());
+    if !recv_ok || !call.arguments().is_some_and(|args| {
         args.arguments().iter().all(|arg| {
-            arg.as_symbol_node().is_some()
+            interned_prism_name(&arg)
                 || arg.as_local_variable_read_node().is_some()
                 // This slice is parsed outside the enclosing def, so a
                 // bound local name may parse as a bare receiverless call.
@@ -693,7 +752,14 @@ fn supported_source_statement(
 /// The supported body grammar has no local writes/bindings or nested
 /// scopes. Never substitute by name through an arbitrary closure: ingest
 /// has not assigned distinct VarIds to shadowed bindings yet.
-fn substitute(mut expr: Expr, bindings: &HashMap<Symbol, Expr>) -> Option<Expr> {
+///
+/// `helpers` are method names defined by this same macro expansion —
+/// the only call-chain receivers safe to collapse through `send`.
+fn substitute(
+    mut expr: Expr,
+    bindings: &HashMap<Symbol, Expr>,
+    helpers: &HashSet<Symbol>,
+) -> Option<Expr> {
     match &mut *expr.node {
         ExprNode::Var { name, .. } => return bindings.get(name).cloned(),
         // Moving a constant reference into the includer changes its
@@ -702,7 +768,7 @@ fn substitute(mut expr: Expr, bindings: &HashMap<Symbol, Expr>) -> Option<Expr> 
         ExprNode::Send { block: None, .. } | ExprNode::Seq { .. } => {
             let mut valid = true;
             expr.node.for_each_child_mut(&mut |child| {
-                if let Some(replaced) = substitute(child.clone(), bindings) {
+                if let Some(replaced) = substitute(child.clone(), bindings, helpers) {
                     *child = replaced;
                 } else {
                     valid = false;
@@ -711,8 +777,130 @@ fn substitute(mut expr: Expr, bindings: &HashMap<Symbol, Expr>) -> Option<Expr> 
             if !valid {
                 return None;
             }
+            if !collapse_literal_send(&mut expr, helpers) {
+                return None;
+            }
         }
         _ => return None,
     }
     Some(expr)
+}
+
+fn is_string_lit(expr: &Expr) -> bool {
+    matches!(&*expr.node, ExprNode::Lit { value: Literal::Str { .. } })
+}
+
+/// A bound String used as a *value* (`define_method(:x) { field }` with
+/// `field` a String) would replace one captured object with a fresh
+/// literal. Name slots (`define_method(field)`, `send(field)`) are fine.
+fn string_binding_read_as_value(expr: &Expr, bindings: &HashMap<Symbol, Expr>) -> bool {
+    match &*expr.node {
+        ExprNode::Var { name, .. } => bindings.get(name).is_some_and(is_string_lit),
+        ExprNode::Send {
+            method,
+            args,
+            recv,
+            block,
+            ..
+        } => {
+            let first_is_name =
+                matches!(method.as_str(), "define_method" | "send" | "__send__" | "public_send");
+            recv.iter().any(|r| string_binding_read_as_value(r, bindings))
+                || args.iter().enumerate().any(|(i, a)| {
+                    if first_is_name && i == 0 {
+                        match &*a.node {
+                            ExprNode::Var { name, .. }
+                                if bindings.get(name).is_some_and(is_string_lit) =>
+                            {
+                                false
+                            }
+                            _ => string_binding_read_as_value(a, bindings),
+                        }
+                    } else {
+                        string_binding_read_as_value(a, bindings)
+                    }
+                })
+                || block
+                    .iter()
+                    .any(|b| string_binding_read_as_value(b, bindings))
+        }
+        _ => {
+            let mut found = false;
+            expr.node.for_each_child(&mut |child| {
+                found |= string_binding_read_as_value(child, bindings);
+            });
+            found
+        }
+    }
+}
+
+/// True when `recv` is rooted at a receiverless call to a method this
+/// same macro expansion defined (`positioning_parent.send(…)`).
+fn send_recv_is_expansion_helper(recv: &Expr, helpers: &HashSet<Symbol>) -> bool {
+    match &*recv.node {
+        ExprNode::Send {
+            recv: None,
+            method,
+            ..
+        } => helpers.contains(method),
+        ExprNode::Send {
+            recv: Some(inner), ..
+        } if !matches!(&*inner.node, ExprNode::SelfRef) => {
+            send_recv_is_expansion_helper(inner, helpers)
+        }
+        _ => false,
+    }
+}
+
+/// `send(:title)` / `send("title")` / `__send__` with a literal first
+/// argument is a renamed call. Collapse after substitution so a bound
+/// `send(field)` becomes `title`, not `send(:title)`. A leftover
+/// computed name declines the whole expansion.
+///
+/// Safe receivers: none / `self` (becomes a receiverless call, which
+/// can still invoke a private method on self), and call chains rooted
+/// at a same-expansion helper (`positioning_parent.send(:leaves)` →
+/// `positioning_parent.leaves`). Every other explicit receiver —
+/// including bare `helper.send(:secret)` (a receiverless Send, not a
+/// Var) and `@helper.send` — stays reflective. `public_send` is not
+/// this method.
+fn collapse_literal_send(expr: &mut Expr, helpers: &HashSet<Symbol>) -> bool {
+    loop {
+        let ExprNode::Send {
+            recv,
+            method,
+            args,
+            block: None,
+            parenthesized,
+        } = &*expr.node
+        else {
+            return true;
+        };
+        if !matches!(method.as_str(), "send" | "__send__") {
+            return true;
+        }
+        let recv = match recv {
+            None => None,
+            Some(r) if matches!(&*r.node, ExprNode::SelfRef) => None,
+            Some(r) if send_recv_is_expansion_helper(r, helpers) => Some(r.clone()),
+            Some(_) => return true,
+        };
+        if args.is_empty() {
+            return false;
+        }
+        let Some(name) = interned_name(&args[0]) else {
+            return false;
+        };
+        if !valid_def_name(&name) {
+            return false;
+        }
+        let rest = args[1..].to_vec();
+        *expr.node = ExprNode::Send {
+            recv,
+            method: name,
+            args: rest,
+            block: None,
+            parenthesized: *parenthesized,
+        };
+    }
 }

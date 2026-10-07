@@ -15,7 +15,7 @@ use crate::ingest::prism::parse_silent;
 use crate::ingest::util::constant_id_str;
 use crate::span::SourceFile;
 
-use super::{bindings, symbol, Expansion};
+use super::{Expansion, bindings, interned_name};
 
 pub(super) fn expand(
     def: &MethodDef,
@@ -26,7 +26,10 @@ pub(super) fn expand(
     let bindings = bindings(def, args)?;
     let mut idents = HashMap::new();
     for (k, v) in &bindings {
-        idents.insert(k.as_str().to_string(), symbol(v)?.as_str().to_string());
+        idents.insert(
+            k.as_str().to_string(),
+            interned_name(v)?.as_str().to_string(),
+        );
     }
     // Optional non-symbol kwargs are omitted from `bindings`. A later
     // receiverless read of that name must decline, not drop the option.
@@ -121,7 +124,7 @@ fn ingest_rewritten_body(
     let program = parsed.node().as_program_node()?;
     for stmt in program.statements().body().iter() {
         absorb_items(
-            ingest_model_body_items(&stmt, owner, file, Vec::new()).ok()?,
+            ingest_model_body_items(&stmt, owner, file, Vec::new(), None).ok()?,
             methods,
             items,
         );

@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use indexmap::IndexMap;
 use ruby_prism::parse;
 
 use crate::dialect::{LibraryClass, MethodDef, MethodReceiver, Param};
@@ -16,7 +17,7 @@ use crate::ident::VarId;
 use crate::span::Span;
 use crate::{ClassId, Symbol};
 
-use super::expr::ingest_expr;
+use super::expr::{ingest_expr, ingest_expr_strict};
 use super::visibility::{self, Visibility};
 use super::util::{
     class_name_path, constant_id_str, constant_path_of, find_all_classes_with_scope,
@@ -213,6 +214,10 @@ pub(super) fn library_class_and_struct_base(
     full_path.extend(name_path);
     let owner = ClassId(Symbol::from(full_path.join("::")));
 
+    let source_parent_span = class
+        .superclass()
+        .map(|n| super::util::node_span(&n, file))
+        .unwrap_or_default();
     let parent = class.superclass().and_then(|n| {
         constant_path_of(&n).map(|p| ClassId(Symbol::from(p.join("::"))))
     });
@@ -232,7 +237,7 @@ pub(super) fn library_class_and_struct_base(
         None => parent,
     };
 
-    let DeclBody { mut includes, mut methods, mut constants, mut unknown_calls, class_initializers } =
+    let DeclBody { mut includes, mut methods, mut constants, mut unknown_calls, class_initializers, class_attributes: _ } =
         walk_decl_body(class.body(), &owner, file, false)?;
 
     // A `T::Struct` is a class GENERATOR, not an annotation: `const
@@ -298,6 +303,13 @@ pub(super) fn library_class_and_struct_base(
             name: owner,
             is_module: false,
             parent,
+            // Struct.new bases replace the source superclass expression;
+            // keep the source span only when the Const parent survived.
+            parent_span: if struct_members.is_some() {
+                Span::synthetic()
+            } else {
+                source_parent_span
+            },
             includes,
             methods,
             nullable_columns: Vec::new(),
@@ -1026,6 +1038,7 @@ fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
         name: base,
         is_module: false,
         parent: None,
+        parent_span: Span::synthetic(),
         includes: Vec::new(),
         methods,
         nullable_columns: Vec::new(),
@@ -1045,7 +1058,7 @@ fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
 /// `is_module: true` and `parent: None`. The `is_module` flag is
 /// load-bearing: callers using `include` on the result need it to be
 /// emitted as `module`, not `class`, or Ruby will raise TypeError.
-fn library_class_from_module_node_with_scope(
+pub(super) fn library_class_from_module_node_with_scope(
     module: &ruby_prism::ModuleNode<'_>,
     scope: &[String],
     file: &str,
@@ -1059,12 +1072,13 @@ fn library_class_from_module_node_with_scope(
     let owner = ClassId(Symbol::from(full_path.join("::")));
 
     let visibility = Visibility::resolve(module.body().as_ref(), file, Some(&owner))?;
-    let DeclBody { includes, methods, constants, unknown_calls, class_initializers } =
+    let DeclBody { includes, methods, constants, unknown_calls, class_initializers, class_attributes: _ } =
         walk_decl_body_with_visibility(module.body(), &owner, file, false, &visibility)?;
     Ok(LibraryClass {
         name: owner,
         is_module: true,
         parent: None,
+        parent_span: Span::synthetic(),
         includes,
         methods,
         nullable_columns: Vec::new(),
@@ -1094,6 +1108,9 @@ struct DeclBody {
     constants: Vec<(Symbol, Expr)>,
     unknown_calls: Vec<Expr>,
     class_initializers: Vec<Expr>,
+    /// `mattr_*` / `cattr_*` attribute names declared in this body —
+    /// used when folding ClassMethods seeds onto the enclosing module.
+    class_attributes: HashSet<Symbol>,
 }
 
 impl DeclBody {
@@ -1103,59 +1120,71 @@ impl DeclBody {
         self.constants.extend(other.constants);
         self.unknown_calls.extend(other.unknown_calls);
         self.class_initializers.extend(other.class_initializers);
+        self.class_attributes.extend(other.class_attributes);
     }
 
     fn finalize_classvars(
         &mut self,
         class_attributes: &HashSet<Symbol>,
-        has_class_attr_default: bool,
+        class_attr_defaults: &IndexMap<Symbol, Expr>,
         file: &str,
     ) -> IngestResult<()> {
-        fn writes_classvar(expr: &Expr, class_attributes: Option<&HashSet<Symbol>>) -> bool {
-            if let ExprNode::Assign { target: LValue::Var { name, .. }, .. }
-                | ExprNode::OpAssign { target: LValue::Var { name, .. }, .. } = &*expr.node
-                && let Some(bare) = name.as_str().strip_prefix("@@")
-                && class_attributes.is_none_or(|attrs| attrs.iter().any(|attr| attr.as_str() == bare))
-            {
-                return true;
-            }
-            let mut found = false;
-            expr.node.for_each_child(&mut |child| found |= writes_classvar(child, class_attributes));
-            found
-        }
-        for m in &mut self.methods {
-            if writes_classvar(&m.body, Some(class_attributes)) {
-                return Err(IngestError::Unsupported {
-                    file: file.into(),
-                    message: "native class-variable writes alongside cattr/mattr storage are not modeled".into(),
-                });
-            }
-            if m.receiver == MethodReceiver::Class {
-                // Native @@ storage is shared with subclasses, unlike the
-                // per-class @ storage of the existing cattr approximation.
-                if writes_classvar(&m.body, None) {
-                    return Err(IngestError::Unsupported {
-                        file: file.into(),
-                        message: "class-variable writes in class methods require shared inheritance storage".into(),
-                    });
-                }
-                normalize_classvars_to_ivars(&mut m.body, class_attributes);
-            }
-        }
-        // Preserve standalone cattr/mattr approximation, but never erase
-        // initialization across a default: these effects depend on order.
-        if has_class_attr_default && !self.class_initializers.is_empty() {
+        // Mixing an explicit `default:` / block with a source-spanned @@
+        // initializer would drop or reorder the default — refuse.
+        // Synthetic seeds alone are fine.
+        if !class_attr_defaults.is_empty()
+            && self
+                .class_initializers
+                .iter()
+                .any(|expr| !expr.span.is_synthetic())
+        {
             return Err(IngestError::Unsupported {
                 file: file.into(),
                 message: "cattr/mattr defaults require source-order initialization".into(),
             });
         }
-        self.class_initializers.retain(|expr| !matches!(&*expr.node,
-            ExprNode::Assign { target: LValue::Var { name, .. }, .. }
-                if name.as_str().strip_prefix("@@").is_some_and(|bare|
-                    class_attributes.iter().any(|attr| attr.as_str() == bare))));
-        if !self.class_initializers.is_empty()
-            && (!self.unknown_calls.is_empty() || !self.constants.is_empty() || !self.includes.is_empty())
+        // Rails mattr/cattr uses @@ shared across the hierarchy. Seed
+        // `@@attr = <default>` when modeled, else `@@attr = nil` (matches
+        // `class_variable_set` in Module#mattr_reader).
+        let mut attrs: Vec<&Symbol> = class_attributes.iter().collect();
+        attrs.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        for attr in attrs {
+            let cvar = mattr_cvar_name(attr);
+            let already = self.class_initializers.iter().any(|expr| {
+                matches!(
+                    &*expr.node,
+                    ExprNode::Assign {
+                        target: LValue::Var { name, .. },
+                        ..
+                    } if name == &cvar
+                )
+            });
+            if !already {
+                // Rails `mattr_reader`: non-nil defaults always set; nil
+                // (including absent default) only when not already defined —
+                // so a subclass redeclaration does not wipe the parent.
+                let seed = class_attr_defaults
+                    .get(attr)
+                    .cloned()
+                    .filter(|value| {
+                        !matches!(&*value.node, ExprNode::Lit { value: Literal::Nil })
+                    })
+                    .map(|value| mattr_seed(attr, value))
+                    .unwrap_or_else(|| mattr_nil_seed(attr));
+                self.class_initializers.push(seed);
+            }
+        }
+        // Source-spanned @@ initializers still need a body with no other
+        // class-body buckets (ordering). Synthetic mattr seeds are
+        // order-insensitive relative to includes/constants.
+        let has_source_ordered_init = self
+            .class_initializers
+            .iter()
+            .any(|expr| !expr.span.is_synthetic());
+        if has_source_ordered_init
+            && (!self.unknown_calls.is_empty()
+                || !self.constants.is_empty()
+                || !self.includes.is_empty())
         {
             return Err(IngestError::Unsupported {
                 file: file.into(),
@@ -1164,6 +1193,24 @@ impl DeclBody {
         }
         Ok(())
     }
+}
+
+/// Synthetic mattr nil seeds, or source `@@attr = nil` for a declared
+/// mattr/cattr attr — safe to fold from `module ClassMethods` onto the
+/// enclosing module with the Class-receiver methods.
+fn is_relocatable_mattr_seed(expr: &Expr, class_attributes: &HashSet<Symbol>) -> bool {
+    if expr.span.is_synthetic() {
+        return true;
+    }
+    matches!(
+        &*expr.node,
+        ExprNode::Assign {
+            target: LValue::Var { name, .. },
+            value,
+        } if name.as_str().strip_prefix("@@").is_some_and(|bare| {
+            class_attributes.iter().any(|attr| attr.as_str() == bare)
+        }) && matches!(&*value.node, ExprNode::Lit { value: Literal::Nil })
+    )
 }
 
 /// Receiverless class-body calls that are NOT safe to capture into
@@ -1186,7 +1233,7 @@ impl DeclBody {
 /// `include T::Struct::ActsAsComparable` is deliberately NOT here: it
 /// gives a struct its `==`, which is behavior, and it goes when the
 /// struct itself is lowered.
-fn is_sorbet_annotation_mixin(call: &ruby_prism::CallNode<'_>) -> bool {
+pub(super) fn is_sorbet_annotation_mixin(call: &ruby_prism::CallNode<'_>) -> bool {
     let name = call.name();
     if !matches!(constant_id_str(&name), "extend" | "include") {
         return false;
@@ -1232,7 +1279,7 @@ fn constant_path_written(path: &ruby_prism::ConstantPathNode<'_>) -> String {
 /// constructor and a reader, not an annotation, and deleting it would
 /// leave a class that cannot be built. Those need lowering, not
 /// dropping.
-const SORBET_ANNOTATIONS: &[&str] = &[
+pub(super) const SORBET_ANNOTATIONS: &[&str] = &[
     "sig",
     "abstract!",
     "interface!",
@@ -1408,7 +1455,7 @@ fn walk_decl_body_with_visibility<'pr>(
 ) -> IngestResult<DeclBody> {
     let mut out = DeclBody::default();
     let mut class_attributes: HashSet<Symbol> = HashSet::new();
-    let mut has_class_attr_default = false;
+    let mut class_attr_defaults: IndexMap<Symbol, Expr> = IndexMap::new();
     // `module_function` (called bare inside a module body) marks every
     // subsequent direct `def` as a module-function — both an instance
     // method AND a class method. For our targets (which call these as
@@ -1633,10 +1680,13 @@ fn walk_decl_body_with_visibility<'pr>(
         if let Some(m) = stmt.as_module_node() {
             if module_name_path(&m).as_deref() == Some(&["ClassMethods".to_string()]) {
                 let class_methods = walk_decl_body_with_visibility(m.body(), owner, file, true, visibility)?;
-                // The recursive walk has already applied cattr/mattr handling.
-                // A surviving native initializer belongs to ClassMethods, not
-                // the enclosing module where these methods are materialized.
-                if !class_methods.class_initializers.is_empty() {
+                // ClassMethods methods materialize on the enclosing module.
+                // Mattr/cattr `@@attr = nil` seeds (synthetic or matching a
+                // declared class attribute) relocate with them. Any other
+                // native initializer stays owned by ClassMethods — refuse.
+                if class_methods.class_initializers.iter().any(|expr| {
+                    !is_relocatable_mattr_seed(expr, &class_methods.class_attributes)
+                }) {
                     return Err(IngestError::Unsupported {
                         file: file.into(),
                         message: "class-variable initialization in module ClassMethods is not modeled".into(),
@@ -1665,7 +1715,12 @@ fn walk_decl_body_with_visibility<'pr>(
             });
         }
         if let Some(call) = stmt.as_call_node() {
-            if call.receiver().is_none() {
+            // `include X` and `self.include(X)` are the same call: the
+            // explicit-self spelling is how a file that must satisfy a
+            // type checker writes it (`self #: as untyped` on the line
+            // before `.include(Rails.application.routes.url_helpers)`),
+            // and it means the body's own self, exactly as the bare form.
+            if call.receiver().is_none_or(|r| r.as_self_node().is_some()) {
                 let kw = constant_id_str(&call.name());
                 // `class_methods do … end` — ActiveSupport::Concern's
                 // class-side block: its defs become class methods of
@@ -1689,7 +1744,7 @@ fn walk_decl_body_with_visibility<'pr>(
                             // replays it, the rest see a class body they
                             // cannot model.
                             if args.arguments().iter().any(|arg| {
-                                constant_path_of(&arg).is_none() && !is_rails_url_helpers_chain(&arg)
+                                constant_path_of(&arg).is_none() && !crate::ingest::util::is_rails_url_helpers_chain(&arg)
                             }) {
                                 if let Ok(e) = ingest_expr(&stmt, file) {
                                     out.unknown_calls.push(e);
@@ -1711,7 +1766,7 @@ fn walk_decl_body_with_visibility<'pr>(
                                         continue;
                                     }
                                     out.includes.push(ClassId(Symbol::from(path.join("::"))));
-                                } else if is_rails_url_helpers_chain(&arg) {
+                                } else if crate::ingest::util::is_rails_url_helpers_chain(&arg) {
                                     // `include Rails.application.routes.
                                     // url_helpers` (lobsters' Routes class,
                                     // inside `class << self`) — the whole
@@ -1735,31 +1790,41 @@ fn walk_decl_body_with_visibility<'pr>(
                         //   attr_writer :foo  → def foo=(v); @foo = v; end
                         //   attr_accessor :foo → both
                         // The `cattr_*` / `mattr_*` (ActiveSupport class- and
-                        // module-level attribute accessors) generate the same
-                        // pair on the *singleton*, so a bare `Keybase.DOMAIN`
-                        // resolves; we model the class form (Rails also makes
-                        // instance-level copies, not needed by the corpus).
+                        // module-level attribute accessors) use @@ storage
+                        // shared across the class hierarchy. We model the
+                        // class form (Rails also makes instance-level
+                        // copies; models synthesize those separately).
                         let is_class_attr =
                             kw.starts_with("cattr_") || kw.starts_with("mattr_");
-                        let mut has_default = is_class_attr && call.block().is_some();
                         let mut names: Vec<Symbol> = Vec::new();
                         if let Some(args) = call.arguments() {
                             for arg in args.arguments().iter() {
                                 if let Some(s) = symbol_value(&arg) {
                                     names.push(Symbol::from(s));
                                 }
-                                if is_class_attr && let Some(hash) = arg.as_keyword_hash_node() {
-                                    has_default |= hash.elements().iter().any(|element| {
-                                        // A keyword splat can also carry a default.
-                                        element.as_assoc_node().is_none_or(|assoc|
-                                            symbol_value(&assoc.key()).as_deref() == Some("default"))
-                                    });
-                                }
                             }
                         }
-                        has_class_attr_default |= has_default;
+                        // Unmodeled mattr/cattr options (instance_*, splats,
+                        // uningestible defaults) stay as unknown_calls — same
+                        // honesty as model expand returning None — so a model
+                        // file's dual library pass cannot abort ingest.
                         if is_class_attr {
+                            match library_mattr_claim(&call, file)? {
+                                LibraryMattrClaim::Unmodeled => {
+                                    if let Ok(e) = ingest_expr(&stmt, file) {
+                                        out.unknown_calls.push(e);
+                                    }
+                                    continue;
+                                }
+                                LibraryMattrClaim::Plain => {}
+                                LibraryMattrClaim::Default(expr) => {
+                                    for name in &names {
+                                        class_attr_defaults.insert(name.clone(), expr.clone());
+                                    }
+                                }
+                            }
                             class_attributes.extend(names.iter().cloned());
+                            out.class_attributes.extend(names.iter().cloned());
                         }
                         let recv = if is_class_attr || force_class_receiver {
                             MethodReceiver::Class
@@ -1770,7 +1835,11 @@ fn walk_decl_body_with_visibility<'pr>(
                             let want_reader = kw.ends_with("_reader") || kw.ends_with("_accessor");
                             let want_writer = kw.ends_with("_writer") || kw.ends_with("_accessor");
                             if want_reader {
-                                let mut method = synth_attr_reader(owner, name, recv);
+                                let mut method = if is_class_attr {
+                                    synth_mattr_reader(owner, name, recv)
+                                } else {
+                                    synth_attr_reader(owner, name, recv)
+                                };
                                 visibility.apply(&statement, &mut method);
                                 // Skip when a `def` of this name already
                                 // walked (unusual order); a later `def`
@@ -1782,7 +1851,11 @@ fn walk_decl_body_with_visibility<'pr>(
                                 }
                             }
                             if want_writer {
-                                let mut method = synth_attr_writer(owner, name, recv);
+                                let mut method = if is_class_attr {
+                                    synth_mattr_writer(owner, name, recv)
+                                } else {
+                                    synth_attr_writer(owner, name, recv)
+                                };
                                 visibility.apply(&statement, &mut method);
                                 if !out.methods.iter().any(|e| {
                                     e.name == method.name && e.receiver == method.receiver
@@ -1942,52 +2015,111 @@ fn walk_decl_body_with_visibility<'pr>(
         }
     }
 
-    out.finalize_classvars(&class_attributes, has_class_attr_default, file)?;
+    out.finalize_classvars(&class_attributes, &class_attr_defaults, file)?;
     Ok(out)
 }
 
-/// Match the `Rails.application.routes.url_helpers` receiver chain (a
-/// nested CallNode ladder rooted at the `Rails` constant).
-fn is_rails_url_helpers_chain(node: &ruby_prism::Node<'_>) -> bool {
-    let mut expected = ["url_helpers", "routes", "application"].iter();
-    let mut cur = match node.as_call_node() {
-        Some(c) => c,
-        None => return false,
-    };
-    loop {
-        let Some(want) = expected.next() else { return false };
-        if cur.name().as_slice() != want.as_bytes() {
-            return false;
-        }
-        match cur.receiver() {
-            Some(r) => {
-                if let Some(cr) = r.as_constant_read_node() {
-                    return expected.next().is_none()
-                        && cr.name().as_slice() == b"Rails";
-                }
-                match r.as_call_node() {
-                    Some(next) => cur = next,
-                    None => return false,
-                }
-            }
-            None => return false,
-        }
-    }
+/// Outcome of claiming a library-class `mattr_*` / `cattr_*` declaration.
+enum LibraryMattrClaim {
+    /// No `default:` / block — expand accessors and nil-seed.
+    Plain,
+    /// Representable `default:` / block — expand and seed that value.
+    Default(Expr),
+    /// Options we do not model (splats, `instance_*`, uningestible
+    /// defaults). Leave the call in `unknown_calls` rather than nil-seed
+    /// over a dropped value.
+    Unmodeled,
 }
 
-/// Only declared cattr/mattr reads use the existing class-ivar approximation.
-/// Ordinary class-variable reads retain native shared inheritance storage.
-fn normalize_classvars_to_ivars(e: &mut Expr, class_attributes: &HashSet<Symbol>) {
-    match &mut *e.node {
-        ExprNode::Var { name, .. } if name.as_str().starts_with("@@")
-            && class_attributes.iter().any(|attr| attr.as_str() == &name.as_str()[2..]) => {
-            let bare = Symbol::from(&name.as_str()[2..]);
-            *e.node = ExprNode::Ivar { name: bare };
-        }
-        _ => {
-            e.node.for_each_child_mut(&mut |c| normalize_classvars_to_ivars(c, class_attributes));
+/// Parse a library-class `mattr_*` / `cattr_*` `default:` / block.
+fn library_mattr_claim(
+    call: &ruby_prism::CallNode<'_>,
+    file: &str,
+) -> IngestResult<LibraryMattrClaim> {
+    let mut default: Option<Expr> = None;
+    let mut other_kwargs = false;
+    let mut unmodeled = false;
+    if let Some(args) = call.arguments() {
+        for arg in args.arguments().iter() {
+            if symbol_value(&arg).is_some() {
+                continue;
+            }
+            if let Some(hash) = arg.as_keyword_hash_node() {
+                for element in hash.elements().iter() {
+                    let Some(assoc) = element.as_assoc_node() else {
+                        unmodeled = true;
+                        break;
+                    };
+                    match symbol_value(&assoc.key()).as_deref() {
+                        Some("default") if default.is_none() => {
+                            // Strict top-level + nested survey recovery:
+                            // recursive `ingest_expr` can still substitute
+                            // nil under survey — reject if the collector grew.
+                            let before = super::survey::recorded().len();
+                            match ingest_expr_strict(&assoc.value(), file) {
+                                Ok(expr)
+                                    if !super::survey::is_active()
+                                        || super::survey::recorded().len() == before =>
+                                {
+                                    default = Some(expr);
+                                }
+                                Ok(_) => unmodeled = true,
+                                Err(err) => {
+                                    if super::survey::is_active() {
+                                        super::survey::record(&err);
+                                    }
+                                    unmodeled = true;
+                                }
+                            }
+                        }
+                        Some("default") => unmodeled = true,
+                        // `instance_reader:` / friends are ignored when no
+                        // default is claimed; mixed with `default:` they
+                        // would silently drop half the declaration.
+                        _ => other_kwargs = true,
+                    }
+                }
+                continue;
+            }
+            unmodeled = true;
         }
     }
+    if let Some(block) = call.block() {
+        let Some(block_node) = block.as_block_node() else {
+            return Ok(LibraryMattrClaim::Unmodeled);
+        };
+        if block_node.parameters().is_some() || default.is_some() {
+            return Ok(LibraryMattrClaim::Unmodeled);
+        }
+        let Some(body) = block_node.body() else {
+            return Ok(LibraryMattrClaim::Unmodeled);
+        };
+        let before = super::survey::recorded().len();
+        match ingest_expr_strict(&body, file) {
+            Ok(expr)
+                if !super::survey::is_active()
+                    || super::survey::recorded().len() == before =>
+            {
+                default = Some(expr);
+            }
+            Ok(_) => return Ok(LibraryMattrClaim::Unmodeled),
+            Err(err) => {
+                if super::survey::is_active() {
+                    super::survey::record(&err);
+                }
+                return Ok(LibraryMattrClaim::Unmodeled);
+            }
+        }
+    }
+    if unmodeled || (default.is_some() && other_kwargs) {
+        return Ok(LibraryMattrClaim::Unmodeled);
+    }
+    // Other kwargs without a default stay expanded (pre-existing library
+    // surface); only a claimed default forces the unmodeled gate above.
+    Ok(match default {
+        Some(expr) => LibraryMattrClaim::Default(expr),
+        None => LibraryMattrClaim::Plain,
+    })
 }
 
 /// For `alias_method :new, :old`: the new name, and the index of the
@@ -2003,7 +2135,7 @@ pub(super) fn alias_keyword_name(node: &ruby_prism::Node<'_>) -> Option<String> 
         .map(|call| constant_id_str(&call.name()).to_string())
 }
 
-fn alias_source(
+pub(super) fn alias_source(
     call: &ruby_prism::CallNode<'_>,
     methods: &[MethodDef],
     class_side: bool,
@@ -2040,6 +2172,134 @@ pub(crate) fn synth_attr_reader(owner: &ClassId, name: &Symbol, receiver: Method
         is_async: false,
             mutates_self: false,
             block_param: None,
+    }
+}
+
+/// Class-variable name for a `mattr_*` / `cattr_*` attribute (`@@channel`).
+pub(crate) fn mattr_cvar_name(attr: &Symbol) -> Symbol {
+    Symbol::from(format!("@@{}", attr.as_str()))
+}
+
+/// Rails `mattr_*` / `cattr_*` seed: `@@attr = <value>`.
+pub(crate) fn mattr_seed(attr: &Symbol, value: Expr) -> Expr {
+    Expr::new(
+        Span::synthetic(),
+        ExprNode::Assign {
+            target: LValue::Var {
+                id: VarId(0),
+                name: mattr_cvar_name(attr),
+            },
+            value,
+        },
+    )
+}
+
+/// Rails `mattr_*` / `cattr_*` nil seed: `@@attr = nil` only when the
+/// class variable is not already defined. Matches
+/// `Module#mattr_reader`'s `class_variable_set` guard so a subclass
+/// redeclaration does not wipe an inherited value.
+///
+/// Uses `defined?(@@attr)` (not bare `class_variable_defined?`) so the
+/// class-body seed types cleanly without a Module-protocol receiver.
+pub(crate) fn mattr_nil_seed(attr: &Symbol) -> Expr {
+    let span = Span::synthetic();
+    let cvar = mattr_cvar_name(attr);
+    let assign = mattr_seed(
+        attr,
+        Expr::new(
+            span,
+            ExprNode::Lit {
+                value: Literal::Nil,
+            },
+        ),
+    );
+    let defined = Expr::new(
+        span,
+        ExprNode::Defined {
+            operand: Expr::new(
+                span,
+                ExprNode::Var {
+                    id: VarId(0),
+                    name: cvar,
+                },
+            ),
+        },
+    );
+    Expr::new(
+        span,
+        ExprNode::If {
+            cond: defined,
+            then_branch: Expr::new(span, ExprNode::Lit { value: Literal::Nil }),
+            else_branch: assign,
+        },
+    )
+}
+
+/// `def self.<name>; @@<name>; end` — Rails mattr/cattr class reader
+/// (shared across the inheritance hierarchy).
+pub(crate) fn synth_mattr_reader(owner: &ClassId, name: &Symbol, receiver: MethodReceiver) -> MethodDef {
+    let body = Expr::new(
+        Span::synthetic(),
+        ExprNode::Var {
+            id: VarId(0),
+            name: mattr_cvar_name(name),
+        },
+    );
+    MethodDef {
+        name_span: Span::synthetic(),
+        name: name.clone(),
+        receiver,
+        visibility: crate::dialect::MethodVisibility::Public,
+        params: Vec::new(),
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        body,
+        signature: None,
+        effects: EffectSet::default(),
+        enclosing_class: Some(owner.0.clone()),
+        kind: crate::dialect::AccessorKind::AttributeReader,
+        is_async: false,
+        mutates_self: false,
+        block_param: None,
+    }
+}
+
+/// `def self.<name>=(value); @@<name> = value; end` — Rails mattr/cattr
+/// writer; subclass writes update the declaring class's value.
+pub(crate) fn synth_mattr_writer(owner: &ClassId, name: &Symbol, receiver: MethodReceiver) -> MethodDef {
+    let value_param = Symbol::from("value");
+    let body = Expr::new(
+        Span::synthetic(),
+        ExprNode::Assign {
+            target: LValue::Var {
+                id: VarId(0),
+                name: mattr_cvar_name(name),
+            },
+            value: Expr::new(
+                Span::synthetic(),
+                ExprNode::Var {
+                    id: VarId(0),
+                    name: value_param.clone(),
+                },
+            ),
+        },
+    );
+    MethodDef {
+        name_span: Span::synthetic(),
+        name: Symbol::from(format!("{}=", name.as_str())),
+        receiver,
+        visibility: crate::dialect::MethodVisibility::Public,
+        params: vec![Param::positional(value_param)],
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        body,
+        signature: None,
+        effects: EffectSet::default(),
+        enclosing_class: Some(owner.0.clone()),
+        kind: crate::dialect::AccessorKind::AttributeWriter,
+        is_async: false,
+        mutates_self: false,
+        block_param: None,
     }
 }
 
@@ -2285,15 +2545,18 @@ pub(super) fn ingest_library_method(
     // `&block` rides in `MethodDef.block_param`, not the flat list —
     // it occupies the call-site `block:` slot, never `args:`. Mirrors
     // the runtime_src split (see runtime_src::method_params).
-    let block_param = def.parameters().and_then(|pn| pn.block()).map(|block| {
-        let name = block
-            .name()
-            .and_then(|loc| std::str::from_utf8(loc.as_slice()).ok())
-            // Ruby 3.4 anonymous block param (`def f(&)`) — synthesize a
-            // name so body-side bare-`&` forwarding (`__blk`) binds.
-            .unwrap_or("__blk");
-        Param::positional(Symbol::from(name))
-    });
+    let block_param = def
+        .parameters()
+        .and_then(|pn| pn.block())
+        .map(|block| {
+            let name = block
+                .name()
+                .and_then(|loc| std::str::from_utf8(loc.as_slice()).ok())
+                // Ruby 3.4 anonymous block param (`def f(&)`) — synthesize a
+                // name so body-side bare-`&` forwarding (`__blk`) binds.
+                .unwrap_or("__blk");
+            Param::positional(Symbol::from(name))
+        });
 
     let body = match def.body() {
         Some(b) => ingest_expr(&b, file)?,
@@ -3075,8 +3338,11 @@ fn unknown_is_block_callback(item: &crate::dialect::ModelBodyItem) -> bool {
 /// classifier doesn't claim, and most of what lands there really does
 /// belong to the module rather than to its includers.
 const CONCERN_MODEL_MACROS: &[&str] = &[
+    "generates_token_for",
     "has_one_attached",
+    "has_many_attached",
     "has_rich_text",
+    "has_markdown",
     "has_secure_token",
     "has_secure_password",
     "has_json",
@@ -3099,13 +3365,17 @@ fn unknown_is_model_macro(item: &crate::dialect::ModelBodyItem) -> bool {
     CONCERN_MODEL_MACROS.contains(&method.as_str())
 }
 
+/// Re-export: table payload lives next to [`super::model::EnumExpansion`].
+pub use super::model::ConcernEnumDecl;
+
 /// Second return value: `enum` columns declared inside an `included
 /// do`, keyed by the concern module. They belong to every includer
 /// exactly as the DSL items do; the splice folds them into each
-/// including model's own `enums` table.
+/// including model's own `enums` table (and `enum_defaults` when
+/// `default:` is present).
 pub type ConcernModelItems = (
     Vec<(ClassId, Vec<crate::dialect::ModelBodyItem>)>,
-    Vec<(ClassId, Vec<(Symbol, Vec<(String, crate::expr::Literal)>)>)>,
+    Vec<(ClassId, Vec<ConcernEnumDecl>)>,
 );
 
 fn walk_dsl_stmts<'pr>(body: ruby_prism::Node<'pr>, out: &mut Vec<ruby_prism::Node<'pr>>) {
@@ -3133,13 +3403,24 @@ pub(super) fn included_has_accessor(body: ruby_prism::Node<'_>, owner: &ClassId,
     walk_dsl_stmts(body, &mut stmts);
     super::survey::without_recording(|| {
         stmts.iter().any(|stmt| {
-            super::model::ingest_model_body_items(stmt, owner, file, Vec::new())
+            super::model::ingest_model_body_items(stmt, owner, file, Vec::new(), None)
                 .is_ok_and(|items| items.iter().any(super::concern_accessors::is_candidate))
         })
     })
 }
 
 pub fn ingest_concern_model_items(source: &[u8], file: &str) -> ConcernModelItems {
+    ingest_concern_model_items_with_constants(source, file, &super::model::EnumConstants::default())
+}
+
+/// Same as [`ingest_concern_model_items`], with the app-wide constant
+/// table so `types: Leafable::TYPES` / bare `TYPES` inside `included do`
+/// resolve the way model-side class-body DSL does.
+pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
+    source: &[u8],
+    file: &str,
+    enum_constants: &super::model::EnumConstants,
+) -> ConcernModelItems {
     use super::concern_accessors::{decline, is_candidate, is_supported};
     use crate::dialect::ModelBodyItem;
 
@@ -3152,10 +3433,18 @@ pub fn ingest_concern_model_items(source: &[u8], file: &str) -> ConcernModelItem
         let mut full_path: Vec<String> = scope.clone();
         full_path.extend(name_path);
         let id = ClassId(Symbol::from(full_path.join("::")));
+        let enum_owners = enum_constants
+            .nesting
+            .get(&(file.to_string(), module.location().start_offset()))
+            .cloned()
+            .unwrap_or_default();
+        let resolve_constant = |node: &ruby_prism::Node<'_>| {
+            enum_constants.resolve(node, &enum_owners)
+        };
 
         let Some(body) = module.body() else { continue };
         let mut items: Vec<ModelBodyItem> = Vec::new();
-        let mut enums: Vec<(Symbol, Vec<(String, crate::expr::Literal)>)> = Vec::new();
+        let mut enums: Vec<ConcernEnumDecl> = Vec::new();
         for stmt in flatten_statements(body) {
             let Some(call) = stmt.as_call_node() else { continue };
             if call.receiver().is_some() || constant_id_str(&call.name()) != "included" {
@@ -3175,11 +3464,25 @@ pub fn ingest_concern_model_items(source: &[u8], file: &str) -> ConcernModelItem
                 // User::Role. Expanded here for the same reason the
                 // model walk expands it: one statement, many items.
                 if let Some(call) = inner.as_call_node() {
-                    match super::model::expand_enum_decl(
-                        &call, file, &[], &|_| None,
+                    match super::model::expand_class_body_dsl(
+                        &call,
+                        file,
+                        &[],
+                        &super::model::ClassConsts::default(),
+                        &resolve_constant,
                     ) {
-                        Ok(Some(expanded)) => {
-                            enums.push((expanded.column, expanded.mapping));
+                        Ok(Some(super::model::ClassBodyExpansion::DelegatedType(expanded))) => {
+                            items.extend(expanded);
+                            continue;
+                        }
+                        Ok(Some(super::model::ClassBodyExpansion::Enum(expanded))) => {
+                            if let Some(mapping) = expanded.mapping {
+                                enums.push(ConcernEnumDecl {
+                                    column: expanded.column,
+                                    mapping,
+                                    default: expanded.default,
+                                });
+                            }
                             items.extend(expanded.items);
                             continue;
                         }
@@ -3196,7 +3499,7 @@ pub fn ingest_concern_model_items(source: &[u8], file: &str) -> ConcernModelItem
                 // per attribute, and a concern splices ALL of them into
                 // every includer — keeping only the first would fault
                 // one field of several.
-                match super::model::ingest_model_body_items(&inner, &id, file, Vec::new()) {
+                match super::model::ingest_model_body_items(&inner, &id, file, Vec::new(), None) {
                     Ok(parsed) => {
                         for mut item in parsed {
                             match item {

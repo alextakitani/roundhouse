@@ -453,6 +453,97 @@ fn article_lowers_dependent_destroy_to_before_destroy() {
     assert!(block_present, "each call should carry a block");
 }
 
+/// `has_one …, autosave: true` folds `_autosave_<name>` into `after_save`.
+#[test]
+fn has_one_autosave_folds_into_after_save() {
+    use roundhouse::ingest::{ingest_model, ingest_schema};
+
+    let schema = ingest_schema(
+        br#"
+ActiveRecord::Schema[7.1].define(version: 1) do
+  create_table "users", force: :cascade do |t|
+    t.string "name"
+  end
+  create_table "profiles", force: :cascade do |t|
+    t.integer "user_id"
+    t.string "bio"
+  end
+end
+"#,
+        "db/schema.rb",
+    )
+    .expect("ingest schema");
+    let model = ingest_model(
+        b"class User < ApplicationRecord\n  has_one :profile, autosave: true\nend\n",
+        "app/models/user.rb",
+        &schema,
+        &Default::default(),
+    )
+    .expect("ingest")
+    .expect("model");
+    let lc = lower_model_to_library_class(&model, &schema);
+    assert!(
+        lc.methods.iter().any(|m| m.name.as_str() == "_autosave_profile"),
+        "expected _autosave_profile"
+    );
+    assert!(
+        lc.methods.iter().any(|m| m.name.as_str() == "profile="),
+        "expected has_one writer"
+    );
+    let after = lc
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "after_save")
+        .expect("after_save present for autosave");
+    let dump = format!("{:?}", after.body);
+    assert!(
+        dump.contains("_autosave_profile"),
+        "after_save should call _autosave_profile: {dump}"
+    );
+}
+
+/// Polymorphic `as:` autosave writes the type column in the lowered body.
+#[test]
+fn polymorphic_has_one_autosave_sets_type_column() {
+    use roundhouse::ingest::{ingest_model, ingest_schema};
+
+    let schema = ingest_schema(
+        br#"
+ActiveRecord::Schema[7.1].define(version: 1) do
+  create_table "users", force: :cascade do |t|
+    t.string "name"
+  end
+  create_table "avatars", force: :cascade do |t|
+    t.integer "imageable_id"
+    t.string "imageable_type"
+    t.string "url"
+  end
+end
+"#,
+        "db/schema.rb",
+    )
+    .expect("ingest schema");
+    let model = ingest_model(
+        b"class User < ApplicationRecord\n  has_one :avatar, as: :imageable, autosave: true\nend\n",
+        "app/models/user.rb",
+        &schema,
+        &Default::default(),
+    )
+    .expect("ingest")
+    .expect("model");
+    let lc = lower_model_to_library_class(&model, &schema);
+    let autosave = lc
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "_autosave_avatar")
+        .expect("_autosave_avatar");
+    let dump = format!("{:?}", autosave.body);
+    assert!(
+        dump.contains("imageable_type=") || dump.contains("\"User\""),
+        "autosave should assign polymorphic type: {dump}"
+    );
+}
+
 /// `has_one …, dependent: :destroy` cascades the single child, not
 /// a collection `each`. Nil child is the else branch so destroy of an
 /// owner with no row does not raise.
@@ -1487,11 +1578,13 @@ fn unclaimed_model_dsl_reports_spanned_warning() {
     use roundhouse::ingest::ingest_model;
     use roundhouse::schema::Schema;
 
-    // `has_many_attached` is the unclaimed one; `has_one_attached` is
-    // claimed by lower::attached and must not report beside it.
+    // `unclaimed_macro` stands in for any Unknown DSL; `has_one_attached`
+    // and `has_many_attached` are both claimed by lower::attached and
+    // must not report beside it.
     let source = br#"class Clip < ApplicationRecord
   has_one_attached :audio
   has_many_attached :stems
+  unclaimed_macro :flag
 
   validates :name, presence: true
 end
@@ -1507,13 +1600,13 @@ end
     let unsupported: Vec<_> = diags
         .iter()
         .filter(|d| matches!(&d.kind, DiagnosticKind::Unsupported { construct, .. }
-            if construct.as_str() == "has_many_attached"))
+            if construct.as_str() == "unclaimed_macro"))
         .collect();
     assert_eq!(unsupported.len(), 1, "exactly one report: {diags:?}");
     assert!(
         !diags.iter().any(|d| matches!(&d.kind, DiagnosticKind::Unsupported { construct, .. }
-            if construct.as_str() == "has_one_attached")),
-        "has_one_attached is claimed by lower::attached and must not report: {diags:?}"
+            if construct.as_str() == "has_one_attached" || construct.as_str() == "has_many_attached")),
+        "has_*_attached are claimed by lower::attached and must not report: {diags:?}"
     );
     let d = unsupported[0];
     assert_eq!(d.severity, Severity::Warning, "tolerable per-app: warning, not error");
@@ -1535,7 +1628,6 @@ fn unclaimed_model_class_writes_report_spanned_warnings() {
     for (statement, setter) in [
         ("self.probe_flag = true", "probe_flag="),
         ("self.table_name_prefix = computed_prefix", "table_name_prefix="),
-        ("self.table_name_prefix = \"custom_\"", "table_name_prefix="),
     ] {
         let source = format!("class Widget < ApplicationRecord\n  {statement}\nend\n");
         let model = ingest_model(
@@ -1570,6 +1662,7 @@ fn claimed_model_settings_and_method_body_writes_do_not_warn() {
 
     let source = br#"class Widget < ApplicationRecord
   self.table_name = "custom_widgets"
+  self.table_name_prefix = "custom_"
   self.primary_key = :uuid
   FLAG = true
 
