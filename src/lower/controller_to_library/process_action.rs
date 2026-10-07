@@ -8,6 +8,7 @@ use crate::ident::{Symbol, VarId};
 use crate::span::Span;
 use crate::ty::Ty;
 
+use super::rewrites;
 use super::util::method_name_for_action;
 
 /// A statement in the synthesized before_action preamble — the filter
@@ -429,11 +430,22 @@ fn cond_from_guards(
     if let Some(name) = unless_cond {
         conds.push(negate(predicate(name)));
     }
+    // Same `request.format.<pred>?` → `self.request_format == :<pred>`
+    // rewrite action bodies already get (see `rewrites::
+    // rewrite_request_format`'s doc comment: the Request object's own
+    // `format` answers a bare String with no predicates, or on the
+    // CRuby overlay doesn't exist at all). A filter's `if:`/`unless:`
+    // lambda body is spliced straight into this guard rather than
+    // flowing through the action-body rewrite pipeline, so without
+    // this it stayed the one place that literal call survived —
+    // `protect_from_forgery unless: -> { request.format.json? }`
+    // (Rails' own API-controller guide idiom) raised NoMethodError on
+    // every dispatched action, before the action body ever ran.
     if let Some(c) = if_cond_expr {
-        conds.push(c.clone());
+        conds.push(rewrites::rewrite_request_format(c));
     }
     if let Some(c) = unless_cond_expr {
-        conds.push(negate(c.clone()));
+        conds.push(negate(rewrites::rewrite_request_format(c)));
     }
     conds.into_iter().reduce(|l, r| {
         syn(ExprNode::BoolOp {
