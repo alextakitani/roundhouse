@@ -402,7 +402,11 @@ fn resource_and_harness_helpers_preserve_failures_and_contracts() {
 
 #[test]
 fn routing_and_required_results_reject_false_green() {
-    for test in ["tests/ci_plan_test.py", "tests/ci_archive_evidence_test.py"] {
+    for test in [
+        "tests/ci_plan_test.py",
+        "tests/ci_plan_focus_test.py",
+        "tests/ci_archive_evidence_test.py",
+    ] {
         let result = std::process::Command::new("python3")
             .args(["-B", test, "-v"])
             .output()
@@ -422,15 +426,45 @@ fn compact_and_extra_compare_share_commands_but_not_results() {
         serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
     let jobs = &ci["jobs"];
     assert_eq!(
-        jobs["compare"]["strategy"]["matrix"]["target"],
-        serde_yaml_ng::from_str::<serde_yaml_ng::Value>("[rust, typescript]").unwrap()
+        jobs["compare"]["strategy"]["matrix"]["target"].as_str(),
+        Some("${{ fromJSON(needs.plan.outputs.compare) }}")
     );
     assert_eq!(jobs["compare"]["steps"], jobs["compare-extra"]["steps"]);
     assert_eq!(
         jobs["compare-extra"]["strategy"]["max-parallel"].as_u64(),
         Some(7)
     );
+    assert_eq!(
+        jobs["compare-extra"]["continue-on-error"].as_str(),
+        Some("${{ needs.plan.outputs.extras-advisory == 'true' }}")
+    );
     assert_eq!(jobs["smoke"]["strategy"]["max-parallel"].as_u64(), Some(6));
+    assert_eq!(
+        jobs["smoke-extra"]["strategy"]["matrix"]["target"].as_str(),
+        Some("${{ fromJSON(needs.plan.outputs.smoke-extra) }}")
+    );
+    assert_eq!(
+        jobs["smoke-extra"]["continue-on-error"].as_str(),
+        Some("${{ needs.plan.outputs.extras-advisory == 'true' }}")
+    );
+    assert_eq!(jobs["smoke"]["steps"], jobs["smoke-extra"]["steps"]);
+    let spinel_coe = "${{ needs.plan.outputs.spinel-advisory == 'true' }}";
+    for name in [
+        "build-spinel",
+        "toolchain-spinel",
+        "compare-spinel",
+        "framework-tests-spinel",
+    ] {
+        assert_eq!(
+            jobs[name]["continue-on-error"].as_str(),
+            Some(spinel_coe),
+            "{name} CoE must follow plan spinel-advisory"
+        );
+    }
+    assert_eq!(
+        ci["jobs"]["plan"]["outputs"]["spinel-advisory"].as_str(),
+        Some("${{ steps.plan.outputs.spinel-advisory }}")
+    );
     let smoke_guard = jobs["smoke"]["if"].as_str().unwrap();
     for condition in [
         "!cancelled()",
