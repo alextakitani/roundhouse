@@ -116,7 +116,9 @@ class RhVerifyTest < Minitest::Test
     assert_equal 'planned', report['status']
     assert_equal ['docs/guide/verify.md', 'src/emit/go.rs', 'wasm/new file.txt'], report['changes']
     if python_available?
-      assert_includes report['hosted_coverage']['smoke'], 'go'
+      # Path-owned extra SDKs ride smoke_extra (ledger); floor smoke stays empty.
+      assert_includes report['hosted_coverage']['smoke_extra'], 'go'
+      assert_equal [], report['hosted_coverage']['smoke']
       assert report['hosted_coverage']['wasm']
       assert_equal false, report['hosted_coverage']['publish']
     else
