@@ -1358,8 +1358,15 @@ for lane in "${LANES[@]}"; do
     csrf=""
     csrf_enc=""
     csrf_html="$LOG_DIR/csrf-$lane.html"
+    # A full page, layout included: the first GET in the list, or, for a
+    # POST-only list, the room the POST writes to. POST:/rooms/2/messages
+    # stripped of its verb is the messages fragment, which has neither the
+    # stylesheet links nor the meta tag.
+    scrape_ep=""
+    for scrape_e in "${ENDPOINTS[@]}"; do ep_is_post "$scrape_e" || { scrape_ep="$scrape_e"; break; }; done
+    [[ -n "$scrape_ep" ]] || { scrape_ep="$(ep_path "${ENDPOINTS[0]}")"; scrape_ep="${scrape_ep%/messages}"; }
     curl -s -H 'Accept-Encoding: identity' -b "$LOG_DIR/jar-$lane.txt" \
-        -o "$csrf_html" "http://127.0.0.1:$port$(ep_path "${ENDPOINTS[0]}")"
+        -o "$csrf_html" "http://127.0.0.1:$port$(ep_path "$scrape_ep")"
     csrf="$(csrf_token_from "$csrf_html")"
     BENCH_AVATAR="$(scrape_from "$csrf_html" avatar)"
     BENCH_CSS="$(scrape_from "$csrf_html" css)"
