@@ -180,6 +180,84 @@ end
 }
 
 #[test]
+fn empty_registry_still_types_sibling_methods_beside_block_contracts() {
+    // Empty caller registry + a block method must not leave a sparse
+    // ClassInfo that collapses `send(name)` to Nil or hides siblings.
+    let ruby = r#"
+class Dyn
+  def rows
+    yield 1
+    nil
+  end
+
+  def label
+    "x"
+  end
+
+  def pick(name)
+    send(name)
+  end
+end
+"#;
+    let rbs = r#"
+class Dyn
+  def rows: () { (Integer) -> void } -> nil
+  def label: () -> String
+  def pick: (Symbol name) -> untyped
+end
+"#;
+    let methods =
+        parse_methods_with_rbs_in_ctx(ruby, rbs, &HashMap::new()).expect("runtime parses");
+    let pick = method(&methods, "pick");
+    assert_eq!(pick.body.ty, Some(Ty::Untyped));
+    assert_no_inference_gaps(&pick.body);
+    assert_emitted_ruby(
+        &methods,
+        "Dyn",
+        "raise 'wrong label' unless Dyn.new.pick(:label) == 'x'",
+    );
+}
+
+#[test]
+fn instance_block_receiver_sees_sibling_methods() {
+    let ruby = r#"
+class Counter
+  def each
+    yield self
+    nil
+  end
+
+  def value
+    3
+  end
+
+  def consume
+    total = 0
+    each { |me| total = total + me.value }
+    total
+  end
+end
+"#;
+    let rbs = r#"
+class Counter
+  def each: () { (instance) -> void } -> nil
+  def value: () -> Integer
+  def consume: () -> Integer
+end
+"#;
+    let methods =
+        parse_methods_with_rbs_in_ctx(ruby, rbs, &HashMap::new()).expect("runtime parses");
+    let consume = method(&methods, "consume");
+    assert_eq!(consume.body.ty, Some(Ty::Int));
+    assert_no_inference_gaps(&consume.body);
+    assert_emitted_ruby(
+        &methods,
+        "Counter",
+        "raise 'wrong sum' unless Counter.new.consume == 3",
+    );
+}
+
+#[test]
 fn class_side_blocks_win_when_instance_shares_the_name() {
     // Registry already has an instance `rows` block contract. Same-file
     // class-side `rows` overlays the class table. Class-object calls must

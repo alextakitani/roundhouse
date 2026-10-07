@@ -734,29 +734,43 @@ fn seed_well_known_classes(
 /// Private typing view: re-attach this file's full `Ty::Fn` for methods
 /// that declare a block. Shared registries are often return-only
 /// (`ret` stripped); `block_params_for` needs the Fn. Non-block entries
-/// are left alone so cross-file / seeded return types still win.
+/// already present in `classes` still win (registry-seeded returns).
+///
+/// When the caller registry lacks the enclosing class, `or_default`
+/// would otherwise build a sparse `ClassInfo` with only block-bearing
+/// methods — `send(name)` then unions to `Nil` instead of `Untyped`,
+/// and `{ (instance) -> void }` siblings stay unresolved. For those
+/// classes, also fill non-block local signatures with `or_insert`.
 /// Never mutates `classes`.
 fn typing_classes_with_local_block_contracts(
     classes: &std::collections::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo>,
     methods: &[MethodDef],
 ) -> std::collections::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo> {
+    let declares_block: std::collections::HashSet<&Symbol> = methods
+        .iter()
+        .filter(|m| matches!(m.signature, Some(Ty::Fn { block: Some(_), .. })))
+        .filter_map(|m| m.enclosing_class.as_ref())
+        .collect();
+
     let mut typing_classes = classes.clone();
     for m in methods {
-        let (Some(enclosing), Some(sig @ Ty::Fn { block: Some(_), .. })) =
-            (&m.enclosing_class, &m.signature)
-        else {
+        let (Some(enclosing), Some(sig)) = (&m.enclosing_class, &m.signature) else {
             continue;
         };
+        if !declares_block.contains(enclosing) {
+            continue;
+        }
         let info = typing_classes
             .entry(crate::ident::ClassId(enclosing.clone()))
             .or_default();
-        match m.receiver {
-            MethodReceiver::Instance => {
-                info.instance_methods.insert(m.name.clone(), sig.clone());
-            }
-            MethodReceiver::Class => {
-                info.class_methods.insert(m.name.clone(), sig.clone());
-            }
+        let table = match m.receiver {
+            MethodReceiver::Instance => &mut info.instance_methods,
+            MethodReceiver::Class => &mut info.class_methods,
+        };
+        if matches!(sig, Ty::Fn { block: Some(_), .. }) {
+            table.insert(m.name.clone(), sig.clone());
+        } else {
+            table.entry(m.name.clone()).or_insert_with(|| sig.clone());
         }
     }
     typing_classes
