@@ -4018,6 +4018,15 @@ pub const RUBY_FAMILY_RUNTIME_CONSTANTS: &[&str] = &[
 /// Ruby/Spinel bundled library objects (`bundled_constant`), and
 /// ruby-family runtime exception stubs (`ruby_family_runtime_constant`).
 fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'static str> {
+    // Spinel supplies the other bundled and ruby-family class values,
+    // but recognizes GeneratorError only as a literal rescue name.
+    if target == "spinel" {
+        return if name == "JSON::GeneratorError" {
+            Some("bundled_constant")
+        } else {
+            None
+        };
+    }
     if RUBY_FAMILY_RUNTIME_CONSTANTS.iter().any(|n| *n == name) {
         // JRuby ships the same runtime files as CRuby.
         return if target == "jruby" {
@@ -4030,7 +4039,10 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
         "URI::HTTP" | "URI::InvalidURIError" | "Net::OpenTimeout" | "Net::ReadTimeout"
         | "Net::HTTPRedirection" | "Net::HTTPOK" | "StringIO" | "OpenSSL::OpenSSLError"
         | "Rails::HTML5::SafeListSanitizer" | "JSON" | "JSON::ParserError"
-        | "Struct" | "Mutex");
+        | "Struct" | "Mutex" | "Queue" | "SizedQueue"
+        | "Thread::Queue" | "Thread::SizedQueue" | "Thread::Mutex"
+        | "ThreadError" | "ClosedQueueError" | "Comparable" | "Enumerable"
+        | "JSON::GeneratorError");
     if !bundled {
         return None;
     }
@@ -4086,10 +4098,29 @@ fn report_unavailable_class_value(
 /// lowers-added exception Consts surveyed from a throwaway controller
 /// lower (emit still lowers controllers after this gate today).
 fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
-    if matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Spinel | BuildTarget::Roda) {
+    if matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Roda) {
         return;
     }
     fn visit(expr: &crate::expr::Expr, app: &App, target: &str) {
+        // Spinel matches this exception by its rescue name, but does not
+        // expose its class as a constant. Keep the value guard below while
+        // permitting the supported literal rescue clause, including ::JSON.
+        if target == "spinel" {
+            if let crate::expr::ExprNode::BeginRescue { rescues, .. } = &*expr.node {
+                expr.node.for_each_child(&mut |child| {
+                    let named_rescue = rescues.iter().any(|rescue| rescue.classes.iter().any(|class| {
+                        std::ptr::eq(child, class)
+                            && matches!(&*class.node, crate::expr::ExprNode::Const { path }
+                                if path.iter().map(|part| part.as_str()).filter(|part| !part.is_empty())
+                                    .eq(["JSON", "GeneratorError"]))
+                    }));
+                    if !named_rescue {
+                        visit(child, app, target);
+                    }
+                });
+                return;
+            }
+        }
         if matches!(&*expr.node, crate::expr::ExprNode::Const { .. }) {
             if let Some(crate::ty::Ty::Class { id, .. }) = &expr.ty {
                 report_unavailable_class_value(app, target, id.0.as_str(), expr.span);
