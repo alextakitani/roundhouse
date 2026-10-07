@@ -445,18 +445,18 @@ module ActionController
     # Rails' `controller_name` / `controller_path`: the demodulized
     # underscored leaf (`ArticlesController` → `"articles"`) and the
     # path form that keeps namespaces (`Admin::UsersController` →
-    # `"admin/users"`). Derived from the class name so every controller
-    # answers without a dispatch-time assign.
+    # `"admin/users"`). Defaults answer for `ActionController::Base`
+    # itself. Each concrete controller's lowerer overrides both with
+    # string literals — AOT targets cannot host `self.class.to_s`
+    # reflection, and a shared ActiveSupport char-walk (`underscore`
+    # / `demodulize`) does not yet compile on every strict-target
+    # string emit.
     def controller_name
-      leaf = ActiveSupport.demodulize(self.class.to_s)
-      leaf = leaf[0, leaf.length - 10].to_s if leaf.end_with?("Controller")
-      ActiveSupport.underscore(leaf)
+      "base"
     end
 
     def controller_path
-      path = self.class.to_s
-      path = path[0, path.length - 10].to_s if path.end_with?("Controller")
-      ActiveSupport.underscore(path)
+      "action_controller/base"
     end
 
     # Subclasses override. Error message omits `self.class.name` —

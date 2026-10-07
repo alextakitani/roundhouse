@@ -1365,6 +1365,9 @@ impl<'a> BodyTyper<'a> {
                 if let Some(t) = self.assoc_extension_ty(recv.as_ref(), method) {
                     return t;
                 }
+                if let Some(t) = self.assoc_loaded_ty(recv.as_ref(), method) {
+                    return t;
+                }
                 // `x.attr = v` evaluates to `v` — Ruby's rule for an
                 // attribute assignment, whatever the writer's body
                 // returns. Same fact the harvest declares for a setter's

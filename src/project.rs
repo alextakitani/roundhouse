@@ -2453,6 +2453,14 @@ fn ruby_family_runtime_files(
                         require \"tempfile\"\n"
                 .to_string();
         }
+        // `Timeout`: default gem on CRuby/JRuby; the port is for Spinel.
+        if path == "runtime/timeout.rb" {
+            *content = "# Ruby's own timeout — see `project::ruby_runtime_files`.\n\
+                        # The port at runtime/ruby/timeout.rb exists for Spinel,\n\
+                        # which has no stdlib timeout package.\n\
+                        require \"timeout\"\n"
+                .to_string();
+        }
         // `Resolv`: the same swap as ipaddr, and for both of ipaddr's
         // reasons at once. net/http loads the stdlib's resolver over
         // here, so a second `Resolv` beside it is a superclass mismatch
@@ -3215,6 +3223,18 @@ fn apply_global_id_locate(files: &mut [(String, String)], app: &App) {
         generated.push_str(&format!(
             "    def self.locate_{suffix}(gid_param)\n\
              \x20     parts = parts_from(gid_param)\n\
+             \x20     return nil if parts.nil?\n\
+             \x20     return nil unless parts[1] == \"{name}\"\n\n\
+             \x20     {name}.find(cast_id(parts[2]))\n\
+             \x20   end\n",
+        ));
+    }
+    for model in &app.global_id_locate_signed_models {
+        let name = model.as_str();
+        let suffix = crate::lower::global_id_locate::entry_point_suffix(name);
+        generated.push_str(&format!(
+            "    def self.locate_signed_{suffix}(sgid, purpose)\n\
+             \x20     parts = parts_from_signed(sgid, purpose)\n\
              \x20     return nil if parts.nil?\n\
              \x20     return nil unless parts[1] == \"{name}\"\n\n\
              \x20     {name}.find(cast_id(parts[2]))\n\
@@ -4609,6 +4629,10 @@ fn spinel_files(app: &App, fixture: &Path) -> Result<(Vec<(String, String)>, Vec
         "inflector",
         "inflector_ext",
         "json_builder",
+        // Pure string ActiveSupport helpers for the Ruby/Spinel
+        // scaffold (strict targets literalize controller_name/path).
+        // Listed before active_support_ext so require_relative resolves.
+        "active_support_inflections",
         "active_support_ext",
         "security_utils",
         "params",
@@ -4663,6 +4687,10 @@ fn spinel_files(app: &App, fixture: &Path) -> Result<(Vec<(String, String)>, Vec
         // targets with no zlib to bind to, swapped for Ruby's own on
         // the CRuby/JRuby trees below.
         "zlib",
+        // `Timeout.timeout` / `Timeout::Error` — Campfire unfurl + video
+        // previewer capture. Port for Spinel; CRuby/JRuby swap to the
+        // default gem below. BUNDLED also lists Timeout → "timeout".
+        "timeout",
     ] {
         let rb = format!("runtime/ruby/{stem}.rb");
         let content = crate::runtime_files::read_to_string(&rb)?;
@@ -6276,7 +6304,7 @@ fn apply_bundled_gem_wiring(files: &mut [(String, String)]) {
 /// Constant → bundled library that provides it. One table, read by
 /// both the pass that writes the requires and the gate that checks a
 /// tree for missing ones — a second copy is how the rule drifts.
-const BUNDLED: [(&str, &str); 14] = [
+const BUNDLED: [(&str, &str); 15] = [
     // INERT in our trees, and deliberately: `runtime/spinel/base64.rb`
     // defines `Base64` without requiring the library, which the second
     // condition below reads as "the program defines it" and drops the
@@ -6323,6 +6351,10 @@ const BUNDLED: [(&str, &str); 14] = [
     // first write (`Account::Joinable#generate_join_code`) raised
     // `undefined method 'join' for unknown`.
     ("SecureRandom", "securerandom"),
+    // `Timeout.timeout` / `Timeout::Error` — Campfire unfurl deadline and
+    // TimeLimitedVideoPreviewer#capture. Default gem on CRuby/JRuby;
+    // Spinel takes `runtime/ruby/timeout.rb` via spinel_files.
+    ("Timeout", "timeout"),
 ];
 
 /// Every gap in a tree, as `(file index, require line)`. One walk,

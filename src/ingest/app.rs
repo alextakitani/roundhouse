@@ -823,21 +823,35 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                 methods.append(&mut synth);
             }
         }
-        // `config.active_storage.variable_content_types -= %w[…]` — an
-        // initializer trimming the image types a variant may be made
-        // from (campfire drops bmp/ico/psd: loaders it does not trust).
-        // The runtime answers `variable?` from Rails' default list
-        // minus this one, so a bmp avatar falls back to initials here
-        // exactly as it does there. Synthesized as
-        // `active_storage_excluded_content_types` on the reopen, over
-        // the framework default (`[]`) in runtime/ruby/rails.rb.
+        // Active Storage initializer lifts — one walk of
+        // `config/initializers` for the cluster that shares that
+        // directory: variable_content_types trim, video_preview_arguments,
+        // and previewers VideoPreviewer → replacement Const map.
         {
             let init_dir = dir.join("config/initializers");
             let mut excluded: Vec<String> = Vec::new();
+            let mut video_args: Option<String> = None;
+            let mut previewer_replacement: Option<String> = None;
             if vfs.is_dir(&init_dir) {
                 for entry in read_rb_files(vfs, &init_dir)? {
                     if let Ok(bytes) = vfs.read(&entry) {
                         excluded.extend(extract_variable_content_type_exclusions(&bytes));
+                        match extract_video_preview_arguments(&bytes) {
+                            VideoPreviewArgsExtract::Value(a) => video_args = Some(a),
+                            VideoPreviewArgsExtract::Unsupported => {
+                                // A later computed assignment must not leave an
+                                // earlier literal override in effect.
+                                video_args = None;
+                                survey::record(&IngestError::Unsupported {
+                                    file: entry.display().to_string(),
+                                    message: "config.active_storage.video_preview_arguments is not a string-literal concatenation; the emitted app keeps the framework default".to_string(),
+                                });
+                            }
+                            VideoPreviewArgsExtract::Absent => {}
+                        }
+                        if let Some(name) = extract_video_previewer_replacement(&bytes) {
+                            previewer_replacement = Some(name);
+                        }
                     }
                 }
             }
@@ -850,6 +864,28 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                 if let Ok(mut synth) = crate::runtime_src::parse_methods(&format!(
                     "def active_storage_excluded_content_types
   [{literal}]
+end
+"
+                )) {
+                    methods.append(&mut synth);
+                }
+            }
+            // One Rails knob → one Application override. The vf filter
+            // is peeled at `ActiveStorage.video_preview_vf_filter`.
+            if let Some(arguments) = video_args {
+                if let Ok(mut synth) = crate::runtime_src::parse_methods(&format!(
+                    "def active_storage_video_preview_arguments
+  {arguments:?}
+end
+"
+                )) {
+                    methods.append(&mut synth);
+                }
+            }
+            if let Some(replacement) = previewer_replacement {
+                if let Ok(mut synth) = crate::runtime_src::parse_methods(&format!(
+                    "def active_storage_previewers
+  [{replacement}]
 end
 "
                 )) {
@@ -1717,6 +1753,7 @@ end
     // later pass reads methods.
     super::channel_callbacks::lower_channel_callbacks(&mut app);
     super::channel_callbacks::lower_channel_names(&mut app);
+    super::on_load_reopen::apply_pending(&mut app);
     splice_concerns_into_models(&mut app);
     splice_concern_class_methods_into_includers(&mut app, &concern_class_method_spans);
     super::model_macros::expand_model_macros(&mut app, &sources)?;
@@ -1780,6 +1817,17 @@ end
     // `app.models` before anything downstream enumerates models.
     crate::lower::rich_text::synthesize_record_model(&mut app);
     crate::lower::plain_text_attr::synthesize_record_model(&mut app);
+    crate::lower::attachment_model::synthesize_attachment_model(&mut app);
+    // Second chance for `on_load(:active_storage_attachment)` includes
+    // whose target was only synthesized above; then splice ONLY those
+    // models so `has_many_attached` from the concern lands — a full
+    // re-splice would duplicate every concern already expanded at the
+    // first pass (doubled scopes, unique-constraint failures at run).
+    let late_on_load = super::on_load_reopen::apply_pending(&mut app);
+    if !late_on_load.is_empty() {
+        splice_concerns_into_models_named(&mut app, &late_on_load);
+    }
+    super::on_load_reopen::drain_pending(&mut app);
     app.const_resolver = crate::timings::phase("rubydex: wait", || const_resolver.finish());
     // Admission needs complete controller permit demand and model DSL,
     // including declarations contributed by either kind of Concern,
@@ -1865,10 +1913,24 @@ fn walk_binary_assets<V: Vfs + ?Sized>(vfs: &V, root: &Path, dir: &Path, app: &m
 /// Strict targets get the DSL items the same way; module
 /// methods-via-include remain their separate, ledger-visible gap.
 fn splice_concerns_into_models(app: &mut App) {
+    splice_concerns_into_models_named(app, &[]);
+}
+
+/// Splice concern `included do` bodies into models.
+///
+/// When `only` is empty, every model is visited (the first pass). When
+/// non-empty, only models whose [`ClassId`] name is listed — the late
+/// `on_load(:active_storage_attachment)` path after Attachment /
+/// Markdown synthesis, which must not re-expand includes already
+/// spliced on the first pass.
+fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol]) {
     use crate::dialect::ModelBodyItem;
     use crate::expr::ExprNode;
 
     for model in &mut app.models {
+        if !only.is_empty() && !only.iter().any(|n| n == &model.name.0) {
+            continue;
+        }
         // Concerns already spliced into this model. A spliced item may
         // itself be an `include` (a concern's `included do include
         // Other end`), whose own items are spliced in turn; a concern
@@ -5935,6 +5997,203 @@ fn quoted_after_key_label(text: &str) -> Option<String> {
     let inner = &rest[1..];
     let end = inner.find(quote)?;
     Some(inner[..end].to_string())
+}
+
+/// Result of scanning an initializer for `video_preview_arguments`.
+enum VideoPreviewArgsExtract {
+    Absent,
+    Value(String),
+    /// Assignment present but not a pure string-literal concatenation.
+    Unsupported,
+}
+
+/// `config.active_storage.video_preview_arguments = "…" \ "…"` —
+/// concatenated quoted string literals after the `=` (double or single),
+/// the way campfire tip writes the `-vf … -frames:v 1 -f image2` argv.
+/// Returns the joined runtime string. Computed RHS forms (`+ ENV…`) are
+/// `Unsupported` rather than a wrong joined literal.
+fn extract_video_preview_arguments(source: &[u8]) -> VideoPreviewArgsExtract {
+    let source = String::from_utf8_lossy(source);
+    let mut lines = source.lines().peekable();
+    while let Some(line) = lines.next() {
+        let t = line.trim_start();
+        if t.starts_with('#') {
+            continue;
+        }
+        let Some(idx) = t.find("active_storage.video_preview_arguments") else {
+            continue;
+        };
+        let rest = t[idx + "active_storage.video_preview_arguments".len()..].trim_start();
+        let Some(rest) = rest.strip_prefix('=') else {
+            continue;
+        };
+        let mut text = rest.to_string();
+        // Line continuations (`\`), RHS starting on the next line, and
+        // further quoted pieces until a blank / next config assignment.
+        while text.trim_end().ends_with('\\')
+            || ruby_string_literals_unclosed(&text)
+            || (!text.contains('"') && !text.contains('\'') && lines.peek().is_some())
+        {
+            let Some(next) = lines.next() else { break };
+            let n = next.trim();
+            if n.is_empty() || n.starts_with("config.") {
+                break;
+            }
+            text.push(' ');
+            text.push_str(n);
+        }
+        if !rhs_is_only_string_literals_and_continuations(&text) {
+            return VideoPreviewArgsExtract::Unsupported;
+        }
+        let out = join_ruby_string_literals(&text);
+        if !out.is_empty() {
+            return VideoPreviewArgsExtract::Value(out);
+        }
+        // Recognized the assignment but found no quoted pieces.
+        return VideoPreviewArgsExtract::Unsupported;
+    }
+    VideoPreviewArgsExtract::Absent
+}
+
+/// True when `text` is only `'…'` / `"…"` literals, whitespace, and `\`.
+fn rhs_is_only_string_literals_and_continuations(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let mut saw_literal = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() || b == b'\\' {
+            i += 1;
+            continue;
+        }
+        if b != b'"' && b != b'\'' {
+            return false;
+        }
+        saw_literal = true;
+        let q = b;
+        i += 1;
+        while i < bytes.len() {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == q {
+                i += 1;
+                break;
+            }
+            i += 1;
+        }
+    }
+    saw_literal
+}
+
+/// True when `text` ends inside an unclosed `'…'` or `"…"` literal.
+fn ruby_string_literals_unclosed(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let mut open: Option<u8> = None;
+    while i < bytes.len() {
+        if let Some(q) = open {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == q {
+                open = None;
+            }
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'"' || bytes[i] == b'\'' {
+            open = Some(bytes[i]);
+        }
+        i += 1;
+    }
+    open.is_some()
+}
+
+/// Join adjacent `'…'` / `"…"` literals in an RHS.
+/// Double-quoted: `\\X` → `X`. Single-quoted: only `\\` → `\` and
+/// `\'` → `'`; other backslashes (e.g. `\,` in ffmpeg filters) stay.
+fn join_ruby_string_literals(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let q = bytes[i];
+        if q != b'"' && q != b'\'' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        while i < bytes.len() {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                let next = bytes[i + 1];
+                if q == b'\'' {
+                    if next == b'\\' || next == b'\'' {
+                        out.push(next as char);
+                        i += 2;
+                        continue;
+                    }
+                    out.push('\\');
+                    out.push(next as char);
+                    i += 2;
+                    continue;
+                }
+                out.push(next as char);
+                i += 2;
+                continue;
+            }
+            if bytes[i] == q {
+                i += 1;
+                break;
+            }
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Replacement Const from
+/// `config.active_storage.previewers = ….map` that swaps
+/// `ActiveStorage::Previewer::VideoPreviewer` for another class
+/// (`previewer == …VideoPreviewer ? Replacement : previewer`).
+/// Returns the replacement's written name (e.g. `TimeLimitedVideoPreviewer`).
+/// Full-line comments are stripped so a commented-out swap cannot match;
+/// the assignment + `.map` form is required (not a bare class mention).
+fn extract_video_previewer_replacement(source: &[u8]) -> Option<String> {
+    let source = String::from_utf8_lossy(source);
+    let active: String = source
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let Some(assign_at) = active.find("active_storage.previewers") else {
+        return None;
+    };
+    let after_name = active[assign_at + "active_storage.previewers".len()..].trim_start();
+    let Some(after_eq) = after_name.strip_prefix('=') else {
+        return None;
+    };
+    if !after_eq.contains(".map") {
+        return None;
+    }
+    let marker = "ActiveStorage::Previewer::VideoPreviewer";
+    let Some(idx) = after_eq.find(marker) else {
+        return None;
+    };
+    let after = after_eq[idx + marker.len()..].trim_start();
+    let after = after.strip_prefix('?')?.trim_start();
+    // `? TimeLimitedVideoPreviewer : previewer` or multiline.
+    let name: String = after
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == ':' || *c == '_')
+        .collect();
+    if name.is_empty() || name == "previewer" {
+        return None;
+    }
+    Some(name)
 }
 
 /// The MIME types a `config.active_storage.variable_content_types -=

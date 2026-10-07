@@ -6822,6 +6822,8 @@ end
 mod relation_finders;
 #[path = "emit_and_run/attach_hash.rs"]
 mod attach_hash;
+#[path = "emit_and_run/many_attached.rs"]
+mod many_attached;
 
 /// A controller under `ActionController::API`, the base `rails new
 /// --api` writes, dispatches (#163). The runtime defined only `Base`,
@@ -7713,5 +7715,129 @@ fn controller_name_instance_variable_set_runs_on_show() {
             "    def set_article\n      instance_variable_set(\"@#{controller_name.singularize}\", Article.find(params.expect(:id)))\n    end\n",
         )
         .run_test("test/controllers/articles_controller_test.rb")
+        .assert_passes();
+}
+
+#[test]
+fn campfire_capture_stdlib_consts_run() {
+    // Campfire tip's TimeLimitedVideoPreviewer#capture and web-push pool
+    // name IO / Timeout / Process. Registering them clears check errors;
+    // this pin proves the emitted Ruby actually runs those Consts
+    // (invariant 6) — without claiming the full ActiveStorage capture
+    // path (#557 lands VideoPreviewer separately).
+    emit_and_run::real_blog()
+        .write(
+            "app/models/capture_stdlib_probe.rb",
+            r#"class CaptureStdlibProbe
+  def self.exercise
+    timed_out = false
+    begin
+      Timeout.timeout(0.05) { sleep 1 }
+    rescue Timeout::Error
+      timed_out = true
+    end
+    raise "Timeout.timeout did not fire" unless timed_out
+
+    pid = Process.pid
+    raise "Process.pid" unless pid.is_a?(Integer) && pid > 0
+
+    clock = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    raise "CLOCK_MONOTONIC" unless clock.is_a?(Float)
+
+    out = IO.popen(["echo", "hi"], in: IO::NULL, err: IO::NULL) { |io| io.read }
+    raise "IO.popen" unless out.to_s.include?("hi")
+
+    killed = false
+    IO.popen(["sleep", "30"]) do |io|
+      Process.kill(:KILL, io.pid)
+      killed = true
+    end
+    raise "Process.kill" unless killed
+
+    src = StringIO.new("xy")
+    dst = StringIO.new
+    n = IO.copy_stream(src, dst)
+    raise "IO.copy_stream" unless n == 2 && dst.string == "xy"
+
+    rescued = false
+    begin
+      raise SystemCallError, "x"
+    rescue SystemCallError
+      rescued = true
+    end
+    raise "SystemCallError" unless rescued
+
+    rescued = false
+    begin
+      raise OpenSSL::SSL::SSLError, "x"
+    rescue OpenSSL::SSL::SSLError
+      rescued = true
+    end
+    raise "OpenSSL::SSL::SSLError" unless rescued
+
+    # Vips::Error is registered for Campfire's attachment rescue; the
+    # constant is supplied by ruby-vips at runtime, not by this probe.
+
+    "ok"
+  end
+end
+"#,
+        )
+        .run_ruby(
+            r#"
+raise "probe" unless CaptureStdlibProbe.exercise == "ok"
+"#,
+        )
+        .assert_passes();
+}
+
+#[test]
+fn campfire_video_preview_config_runs() {
+    // Campfire tip initializer sets video_preview_arguments (gte(t,5))
+    // and swaps previewers VideoPreviewer → TimeLimitedVideoPreviewer.
+    // Suite asserts ActiveStorage.previewers / video_preview_arguments;
+    // poster reads the vf filter from the same config.
+    emit_and_run::real_blog()
+        .write(
+            "lib/rails_ext/time_limited_video_previewer.rb",
+            r#"class TimeLimitedVideoPreviewer < ActiveStorage::Previewer::VideoPreviewer
+  TIME_LIMIT = 10
+end
+"#,
+        )
+        .write(
+            "config/initializers/extensions.rb",
+            r#"Dir[Rails.root.join("lib/rails_ext/*.rb")].sort.each { |f| require f }
+"#,
+        )
+        .write(
+            "config/initializers/active_storage.rb",
+            r#"require "rails_ext/time_limited_video_previewer"
+
+Rails.application.configure do
+  config.active_storage.video_preview_arguments =
+    "-vf 'select=eq(n\\,0)+eq(key\\,1)+gt(scene\\,0.015)+gte(t\\,5),loop=loop=-1:size=2,trim=start_frame=1'" \
+    " -frames:v 1 -f image2"
+
+  config.active_storage.previewers = config.active_storage.previewers.map do |previewer|
+    previewer == ActiveStorage::Previewer::VideoPreviewer ? TimeLimitedVideoPreviewer : previewer
+  end
+end
+"#,
+        )
+        .run_ruby(
+            r#"
+raise "args" unless ActiveStorage.video_preview_arguments.include?("gte(t\\,5)")
+raise "filter" unless ActiveStorage.video_preview_vf_filter.include?("gte(t\\,5)")
+raise "previewers include" unless ActiveStorage.previewers.include?(TimeLimitedVideoPreviewer)
+raise "previewers exclude" if ActiveStorage.previewers.include?(ActiveStorage::Previewer::VideoPreviewer)
+
+# `-vf` must match as a whole option, not a prefix of `-vframes`.
+def ActiveStorage.video_preview_arguments
+  "-vframes 1 -vf 'scale=320:240' -f image2"
+end
+raise "vf vs vframes" unless ActiveStorage.video_preview_vf_filter == "scale=320:240"
+"#,
+        )
         .assert_passes();
 }

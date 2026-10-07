@@ -40,6 +40,7 @@ mod registry;
 mod test_module;
 mod render;
 mod ivar_set;
+pub(crate) use ivar_set::controller_name_of;
 mod effects;
 mod diagnostics;
 pub(crate) mod forwarding;
@@ -597,6 +598,42 @@ impl Analyzer {
                     args: vec![],
                 });
             }
+            for (_span, attr) in crate::lower::attached::many_attached_attrs(model) {
+                cls.instance_methods.entry(attr).or_insert(Ty::Class {
+                    id: ClassId(Symbol::from("ActiveStorage::AttachedMany")),
+                    args: vec![],
+                });
+            }
+            // `ActiveStorage::Attachment` helpers synthesized by
+            // `lower::attachment_model::push_attachment_record_methods`
+            // at the emit seam — register here so `attachment.url` /
+            // `.filename` resolve in check the same way the reader
+            // macros do.
+            if crate::lower::attachment_model::is_attachment_model(model) {
+                let blob = Ty::Class {
+                    id: ClassId(Symbol::from("ActiveStorage::Blob")),
+                    args: vec![],
+                };
+                let filename = Ty::Class {
+                    id: ClassId(Symbol::from("ActiveStorage::Filename")),
+                    args: vec![],
+                };
+                let nilable = |ty: Ty| Ty::Union {
+                    variants: vec![ty, Ty::Nil],
+                };
+                cls.instance_methods
+                    .entry(Symbol::from("blob"))
+                    .or_insert(nilable(blob));
+                cls.instance_methods
+                    .entry(Symbol::from("url"))
+                    .or_insert(Ty::Str);
+                cls.instance_methods
+                    .entry(Symbol::from("filename"))
+                    .or_insert(nilable(filename));
+                cls.instance_methods
+                    .entry(Symbol::from("content_type"))
+                    .or_insert(nilable(Ty::Str));
+            }
             // `attr_accessor :x` — and `attr_accessor *CONST`, which is
             // how campfire's `Opengraph::Metadata` names its four. The
             // reader/writer pair is synthesized by
@@ -716,6 +753,14 @@ impl Analyzer {
                             .entry((name.clone(), m.name.clone()))
                             .or_insert(Ty::Untyped);
                     }
+                    // Flat `<name>_loaded?` — same Bool `model_to_library`
+                    // synthesizes for emit. Registered here so `check`
+                    // (no post-analyze lower) can type
+                    // `message.boosts.loaded?` via `assoc_loaded_ty`
+                    // without cataloguing Relation `#loaded?`.
+                    cls.instance_methods
+                        .entry(Symbol::from(format!("{}_loaded?", name.as_str())))
+                        .or_insert(Ty::Bool);
                 }
                 cls.instance_methods.insert(name, ty.clone());
                 cls.instance_methods.entry(writer).or_insert(ty);
@@ -753,6 +798,17 @@ impl Analyzer {
                             ModelBodyItem::Association { assoc, .. } => {
                                 let (name, ty) = association_member_ty(assoc);
                                 let writer = Symbol::from(format!("{}=", name.as_str()));
+                                if matches!(
+                                    assoc,
+                                    crate::dialect::Association::HasMany { .. }
+                                ) {
+                                    cls.instance_methods
+                                        .entry(Symbol::from(format!(
+                                            "{}_loaded?",
+                                            name.as_str()
+                                        )))
+                                        .or_insert(Ty::Bool);
+                                }
                                 cls.instance_methods.entry(name).or_insert(ty.clone());
                                 cls.instance_methods.entry(writer).or_insert(ty);
                                 for (name, ty) in association_builder_members(assoc) {
@@ -4023,6 +4079,7 @@ impl Analyzer {
                 method.name.as_str(),
                 "generates_token_for"
                     | "has_one_attached"
+                    | "has_many_attached"
                     | "has_rich_text"
                     | "has_markdown"
                     | "has_secure_token"
