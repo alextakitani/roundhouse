@@ -439,20 +439,29 @@ impl<'a> BodyTyper<'a> {
                     for c in std::iter::once(cls)
                         .chain(cls.includes.iter().filter_map(|m| self.classes().get(m)))
                     {
-                        // Prefer the receiver-side table, but if that
-                        // entry is only a return seed (`Nil` / bare
-                        // `Fn` without `block`) while the other side
-                        // still carries the RBS/sig block contract,
-                        // take the block-bearing Fn. Dual-name both-
-                        // sides-with-block keeps the receiver side.
+                        // Prefer the receiver-side table. The fixpoint
+                        // often seeds that side with a bare return
+                        // (`Nil` / `Str` / …) while the RBS block
+                        // contract still lives on the other side —
+                        // take the other side's block-bearing Fn only
+                        // then. A real receiver-side `Fn` without a
+                        // block must not steal the opposite method's
+                        // block (dispatch still picks the receiver
+                        // side). Dual-name both-sides-with-block keeps
+                        // the receiver side.
                         let (preferred, other) = if class_object_receiver {
                             (&c.class_methods, &c.instance_methods)
                         } else {
                             (&c.instance_methods, &c.class_methods)
                         };
+                        let return_seed = |ty: &Ty| !matches!(ty, Ty::Fn { .. });
                         let sig = match (preferred.get(method), other.get(method)) {
                             (Some(s @ Ty::Fn { block: Some(_), .. }), _) => Some(s),
-                            (_, Some(s @ Ty::Fn { block: Some(_), .. })) => Some(s),
+                            (pref, Some(s @ Ty::Fn { block: Some(_), .. }))
+                                if pref.map_or(true, return_seed) =>
+                            {
+                                Some(s)
+                            }
                             (Some(s), _) => Some(s),
                             (None, o) => o,
                         };
