@@ -49,6 +49,22 @@ fn a_class_side_call_does_not_feed_the_instance_method_of_the_same_name() {
     assert_eq!(params[1], caller);
 }
 
+/// Same shape when the class also defines `def self.get`: the shared
+/// params key must still not take `self.class.get`'s args as instance
+/// evidence.
+#[test]
+fn both_sides_class_call_still_does_not_feed_the_instance_method() {
+    let params = params_of_get(
+        "class Client\n  def self.get(url, options = {})\n    [url, options]\n  end\n\n  def get(path, params = {})\n    options = { query: params }\n    self.class.get(path, options)\n  end\nend\n",
+    );
+    let unknown = || Ty::Var { var: roundhouse::ident::TyVar(0) };
+    let caller = Ty::Hash {
+        key: Box::new(Ty::Union { variants: vec![Ty::Sym, unknown()] }),
+        value: Box::new(Ty::Union { variants: vec![Ty::Int, unknown()] }),
+    };
+    assert_eq!(params[1], caller);
+}
+
 /// A mailer's class-side call is how its instance method runs. Under
 /// `Devise::Mailer` (mastodon's `UserMailer`) no class-side forwarder is
 /// registered, so the call is the instance method's only evidence.

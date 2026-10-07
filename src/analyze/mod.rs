@@ -5683,10 +5683,14 @@ impl Analyzer {
                         .into_iter()
                         .collect(),
                 };
-                // The params table keys by name alone, so `self.class.get(url, opts)`
-                // (HTTParty's class-side `get`) would feed an instance `def get`. Only an
-                // `x.class` receiver: `UserMailer.welcome(user)` and an `extend self`
-                // module's `GlobalPath.cdn_path(p)` are how their instance methods run.
+                // The params table keys by (class, name) with no side, so
+                // `self.class.get(url, opts)` (HTTParty's class-side `get`)
+                // would feed an instance `def get` — and still would when
+                // the class also defines `def self.get`. Drop an `x.class`
+                // site for any receiver that has that name as an instance
+                // method. Constant receivers stay: `UserMailer.welcome(user)`
+                // and an `extend self` module's `GlobalPath.cdn_path(p)` are
+                // how their instance methods run.
                 let via_class = recv.as_ref().is_some_and(|r| {
                     matches!(&*r.node, ExprNode::Send { method, args, .. }
                         if method.as_str() == "class" && args.is_empty())
@@ -5694,7 +5698,7 @@ impl Analyzer {
                 if via_class {
                     recv_classes.retain(|c| {
                         !self.classes.get(c).is_some_and(|k| {
-                            k.instance_methods.contains_key(method) && !k.class_methods.contains_key(method)
+                            k.instance_methods.contains_key(method)
                         })
                     });
                 }
