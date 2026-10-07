@@ -7839,3 +7839,86 @@ raise "vf vs vframes" unless ActiveStorage.video_preview_vf_filter == "scale=320
         )
         .assert_passes();
 }
+
+/// `params.expect(article: …)` with the resource key missing or not a
+/// Hash raises `ActionController::ParameterMissing`, which Rails answers
+/// with 400 when the app does not rescue it. Form-encoded posts, which
+/// Rails never wraps, to the scaffold's `create`; measured on the
+/// fixture under Rails 8.1.4: 400, 400, and 201 for the nested form.
+#[test]
+fn a_missing_resource_key_answers_400() {
+    emit_and_run::real_blog()
+        .run_ruby(
+            r#"
+require "stringio"
+# CSRF off, as Rails' test environment has it (the Rails measurements
+# above were taken that way); this is about the action, not the token.
+ActionController::Base.allow_forgery_protection = false
+def post_form(path, body)
+  env = {
+    "REQUEST_METHOD" => "POST", "PATH_INFO" => path, "QUERY_STRING" => "",
+    "CONTENT_TYPE" => "application/x-www-form-urlencoded",
+    "CONTENT_LENGTH" => body.bytesize.to_s, "HTTP_ACCEPT" => "application/json"
+  }
+  status, _body = Main.dispatch_core(env, StringIO.new(body))
+  status
+end
+status = post_form("/articles.json", "title=Flat&body=A+body+long+enough")
+raise "no article key: expected 400 as Rails answers, got #{status.inspect}" unless status == 400
+status = post_form("/articles.json", "article=oops")
+raise "article is a scalar: expected 400 as Rails answers, got #{status.inspect}" unless status == 400
+status = post_form("/articles.json", "article%5Btitle%5D=Nested&article%5Bbody%5D=A+body+long+enough")
+raise "article nested: expected 201 as Rails answers, got #{status.inspect}" unless status == 201
+raise "the nested article was not created" unless Article.find_by(title: "Nested")
+puts "missing resource key answers 400"
+"#,
+        )
+        .assert_passes();
+}
+
+/// `params.require(:article).permit(…)` refuses less than `expect`, as
+/// in Rails: a missing key raises `ParameterMissing` (400), a hash of
+/// only unpermitted keys passes and fails validation (422), and a scalar
+/// reaches `permit`, which a String does not have (500). Measured on the
+/// fixture with its `article_params` switched to this form, Rails 8.1.4:
+/// 400, 500, 422, 201.
+#[test]
+fn require_permit_refuses_like_rails() {
+    emit_and_run::real_blog()
+        .edit(
+            "app/controllers/articles_controller.rb",
+            "params.expect(article: [ :title, :body ])",
+            "params.require(:article).permit(:title, :body)",
+        )
+        .run_ruby(
+            r##"
+require "stringio"
+# CSRF off, as Rails' test environment has it (the Rails measurements
+# above were taken that way); this is about the action, not the token.
+ActionController::Base.allow_forgery_protection = false
+def post_form(path, body)
+  env = {
+    "REQUEST_METHOD" => "POST", "PATH_INFO" => path, "QUERY_STRING" => "",
+    "CONTENT_TYPE" => "application/x-www-form-urlencoded",
+    "CONTENT_LENGTH" => body.bytesize.to_s, "HTTP_ACCEPT" => "application/json"
+  }
+  status, _body = Main.dispatch_core(env, StringIO.new(body))
+  status
+rescue NoMethodError
+  500
+end
+expected = [
+  ["no article key", "title=Flat&body=A+body+long+enough", 400],
+  ["article is a scalar", "article=oops", 500],
+  ["only unpermitted keys", "article%5Bother%5D=1", 422],
+  ["article nested", "article%5Btitle%5D=Nested&article%5Bbody%5D=A+body+long+enough", 201],
+]
+expected.each do |label, body, want|
+  status = post_form("/articles.json", body)
+  raise "#{label}: expected #{want} as Rails answers, got #{status.inspect}" unless status == want
+end
+puts "require.permit refuses like Rails"
+"##,
+        )
+        .assert_passes();
+}

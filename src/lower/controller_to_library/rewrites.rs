@@ -2879,7 +2879,7 @@ fn params_require_permit(resource: Symbol, fields: Vec<Symbol>, span: Span) -> E
             style: ArrayStyle::Brackets,
         },
     );
-    Expr::new(
+    let mut permit = Expr::new(
         span,
         ExprNode::Send {
             recv: Some(require_call),
@@ -2888,7 +2888,11 @@ fn params_require_permit(resource: Symbol, fields: Vec<Symbol>, span: Span) -> E
             block: None,
             parenthesized: true,
         },
-    )
+    );
+    // Remember the source form: `expect` and `require.permit` refuse a
+    // malformed request differently (see `FROM_PARAMS_EXPECT`).
+    permit.decisions |= crate::expr::FROM_PARAMS_EXPECT;
+    permit
 }
 
 fn nil_expr(span: Span) -> Expr {

@@ -1933,7 +1933,14 @@ pub fn params_class_info(lc: &LibraryClass) -> crate::analyze::ClassInfo {
 /// `specs` carries the (resource, class_id) mapping; expressions whose
 /// resource isn't in `specs` (shouldn't happen — we collected from
 /// these same bodies) fall through unchanged.
-pub fn rewrite_to_from_raw(expr: &Expr, specs: &ParamsSpecs) -> Expr {
+///
+/// `guard` (the tree raises `ParameterMissing`, see
+/// `FormatBreadth::raises_param_missing`) hands the factory
+/// `Params.expect_present(@params, …)` / `Params.require_present(@params,
+/// …)` instead of `@params`: Rails refuses a missing or malformed
+/// resource there, and the two forms refuse differently, which the shared
+/// `<Resource>Params` class cannot know - so the check sits at the call.
+pub fn rewrite_to_from_raw(expr: &Expr, specs: &ParamsSpecs, guard: bool) -> Expr {
     map_expr(expr, &|e| {
         // `<permit-chain>.compact` — DROP the `.compact`. Rails' version
         // removes nil-valued keys, and a presence-aware `from_raw`
@@ -1945,7 +1952,8 @@ pub fn rewrite_to_from_raw(expr: &Expr, specs: &ParamsSpecs) -> Expr {
             if method.as_str() == "compact" && args.is_empty() {
                 if let Some((resource, fields)) = match_permit_call(recv) {
                     if let Some(spec) = specs.find(&resource, &fields) {
-                        return Some(build_from_raw_call(&spec.class_id, e.span));
+                        let arg = factory_arg(recv, guard, e.span);
+                        return Some(build_from_raw_call(&spec.class_id, e.span, arg));
                     }
                 }
             }
@@ -1960,12 +1968,13 @@ pub fn rewrite_to_from_raw(expr: &Expr, specs: &ParamsSpecs) -> Expr {
                 let (resource, fields) = match_permit_call(e)?;
                 let spec = specs.find(&resource, &fields)?;
                 let ExprNode::Hash { entries, .. } = &*args[0].node else { return None };
-                return Some(build_from_raw_merge(&spec.class_id, entries, e.span));
+                let arg = factory_arg(recv, guard, e.span);
+                return Some(build_from_raw_merge(&spec.class_id, entries, e.span, arg));
             }
         }
         let (resource, fields) = match_permit_call(e)?;
         let spec = specs.find(&resource, &fields)?;
-        Some(build_from_raw_call(&spec.class_id, e.span))
+        Some(build_from_raw_call(&spec.class_id, e.span, factory_arg(e, guard, e.span)))
     })
 }
 
@@ -1980,13 +1989,13 @@ pub fn rewrite_to_from_raw(expr: &Expr, specs: &ParamsSpecs) -> Expr {
 /// never mentioned it. (The `<field>=` writer can't do this itself —
 /// emitters collapse an `AttributeWriter` into a plain field and drop
 /// its body, so every producer sets the flag explicitly.)
-fn build_from_raw_merge(class_id: &ClassId, entries: &[(Expr, Expr)], span: Span) -> Expr {
+fn build_from_raw_merge(class_id: &ClassId, entries: &[(Expr, Expr)], span: Span, arg: Expr) -> Expr {
     let p = |()| Expr::new(span, ExprNode::Var { id: VarId(0), name: Symbol::from("_p") });
     let mut stmts = vec![Expr::new(
         span,
         ExprNode::Assign {
             target: LValue::Var { id: VarId(0), name: Symbol::from("_p") },
-            value: build_from_raw_call(class_id, span),
+            value: build_from_raw_call(class_id, span, arg),
         },
     )];
     for (k, v) in entries {
@@ -2012,7 +2021,71 @@ fn build_from_raw_merge(class_id: &ClassId, entries: &[(Expr, Expr)], span: Span
     Expr::new(span, ExprNode::Seq { exprs: stmts })
 }
 
-fn build_from_raw_call(class_id: &ClassId, span: Span) -> Expr {
+/// The factory's argument for the permit chain `chain`: `@params`, or,
+/// under `guard`, `@params` behind the refusal its source form makes in
+/// Rails - `Params.expect_present(@params, "<r>", [scalar keys],
+/// [array keys])` for `params.expect(r: [...])`, `Params.require_present(
+/// @params, "<r>")` for `params.require(:r).permit(...)`. A `.merge(...)`
+/// on top refuses as the chain it extends.
+fn factory_arg(chain: &Expr, guard: bool, span: Span) -> Expr {
+    let params_ivar = Expr::new(span, ExprNode::Ivar { name: Symbol::from("params") });
+    if !guard {
+        return params_ivar;
+    }
+    let str_lit = |v: &str| Expr::new(span, ExprNode::Lit { value: Literal::Str { value: v.to_string() } });
+    let str_array = |items: &[Symbol]| Expr::new(
+        span,
+        ExprNode::Array {
+            elements: items.iter().map(|s| str_lit(s.as_str())).collect(),
+            style: crate::expr::ArrayStyle::default(),
+        },
+    );
+    let params_call = |method: &str, args: Vec<Expr>| Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(Expr::new(span, ExprNode::Const { path: vec![Symbol::from("Params")] })),
+            method: Symbol::from(method),
+            args,
+            block: None,
+            parenthesized: true,
+        },
+    );
+    let mut node = chain;
+    loop {
+        let ExprNode::Send { recv: Some(recv), method, args, .. } = &*node.node else {
+            return params_ivar;
+        };
+        match method.as_str() {
+            "merge" => node = recv,
+            "expect" if is_bare_params(recv) && args.len() == 1 => {
+                let ExprNode::Hash { entries, .. } = &*args[0].node else { return params_ivar };
+                let [(k, v)] = entries.as_slice() else { return params_ivar };
+                let (Some(resource), Some((scalars, arrays))) = (sym_of(k), sym_array(v)) else {
+                    return params_ivar;
+                };
+                return params_call(
+                    "expect_present",
+                    vec![params_ivar, str_lit(resource.as_str()), str_array(&scalars), str_array(&arrays)],
+                );
+            }
+            "permit" => {
+                let Some((resource, ())) = match_require_chain(recv) else { return params_ivar };
+                // `params.expect(r: [...])`, respelled by `rewrite_params`.
+                if node.decisions & crate::expr::FROM_PARAMS_EXPECT != 0 {
+                    let Some((scalars, arrays)) = collect_permit_args(args) else { return params_ivar };
+                    return params_call(
+                        "expect_present",
+                        vec![params_ivar, str_lit(resource.as_str()), str_array(&scalars), str_array(&arrays)],
+                    );
+                }
+                return params_call("require_present", vec![params_ivar, str_lit(resource.as_str())]);
+            }
+            _ => return params_ivar,
+        }
+    }
+}
+
+fn build_from_raw_call(class_id: &ClassId, span: Span, arg: Expr) -> Expr {
     let class_const = Expr::new(
         span,
         ExprNode::Const { path: vec![class_id.0.clone()] },
@@ -2020,13 +2093,12 @@ fn build_from_raw_call(class_id: &ClassId, span: Span) -> Expr {
     // `@params` directly — the synthesized `from_raw` dives into the
     // nested resource key itself (`sub = params.fetch("<resource>", {})`),
     // so the call site doesn't need a `.require(:r).to_h` chain.
-    let params_ivar = Expr::new(span, ExprNode::Ivar { name: Symbol::from("params") });
     Expr::new(
         span,
         ExprNode::Send {
             recv: Some(class_const),
             method: Symbol::from("from_raw"),
-            args: vec![params_ivar],
+            args: vec![arg],
             block: None,
             parenthesized: true,
         },

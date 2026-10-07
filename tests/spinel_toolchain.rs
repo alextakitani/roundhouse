@@ -39,6 +39,8 @@ mod class_attribute;
 mod class_configuration;
 #[path = "support/rails_root_join.rs"]
 mod rails_root_join;
+#[path = "support/native_http.rs"]
+mod native_http;
 
 #[test]
 #[ignore = "requires the Spinel toolchain, run in its CI lane"]
@@ -111,6 +113,33 @@ puts "rails health contract passed"
     assert!(run.stdout.contains("rails health contract passed"));
     let main = std::fs::read_to_string(run.emitted.join("main.rb")).expect("main.rb");
     assert!(main.contains("when :rails_health then Rails::HealthController.new"), "{main}");
+}
+
+/// The native half of `emit_and_run::a_missing_resource_key_answers_400`:
+/// real-blog's `params.expect(article: [:title, :body])` refuses a
+/// request without a usable `article` hash, and the server answers 400
+/// as Rails does. Statuses measured on the same fixture under Rails 8.1.4.
+#[test]
+#[ignore = "requires the Spinel toolchain, run in its CI lane"]
+fn strong_params_refusals_answer_like_rails_natively() {
+    const FORM: &str = "application/x-www-form-urlencoded";
+    let (tree, errors) = emit_and_run::real_blog().emit(roundhouse::project::BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:?}");
+    native_http::build(&tree);
+    let mut server = native_http::Server::start(&tree);
+    server.take_session("/articles/new");
+    let cases = [
+        ("no article key", FORM, "title=Flat&body=A+body+long+enough", 400),
+        ("article is a scalar", FORM, "article=oops", 400),
+        ("article nested", FORM, "article%5Btitle%5D=Nested&article%5Bbody%5D=A+body+long+enough", 201),
+    ];
+    for (name, content_type, body, status) in cases {
+        let response = server.post("/articles.json", content_type, body);
+        assert_eq!(response.status, status, "{name}: {}\n{}", response.body, server.log());
+    }
+    // The token is what lets the requests above through.
+    let response = server.post_without_session("/articles.json", FORM, cases[2].2);
+    assert_eq!(response.status, 422, "without a CSRF token: {}", response.body);
 }
 
 fn scratch_dir(tag: &str) -> PathBuf {
