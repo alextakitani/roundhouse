@@ -14,7 +14,7 @@ use crate::span::Span;
 use crate::ty::{Row, Ty};
 use crate::{ClassId, Symbol, TableRef};
 
-use super::expr::ingest_expr;
+use super::expr::{ingest_expr, ingest_expr_strict};
 use super::visibility::{self, Visibility};
 use super::util::{
     class_name_path, collect_comments, constant_id_str, constant_path_of, drain_comments_before,
@@ -589,9 +589,16 @@ fn expand_mattr_cattr(
                     };
                     match symbol_value(&assoc.key()).as_deref() {
                         Some("default") if default.is_none() => {
-                            match ingest_expr(&assoc.value(), file) {
+                            // Strict: survey-mode nil substitution must not
+                            // become a claimed `class_attr_defaults` seed.
+                            match ingest_expr_strict(&assoc.value(), file) {
                                 Ok(expr) => default = Some(expr),
-                                Err(_) => unsupported = true,
+                                Err(err) => {
+                                    if super::survey::is_active() {
+                                        super::survey::record(&err);
+                                    }
+                                    unsupported = true;
+                                }
                             }
                         }
                         _ => unsupported = true,
@@ -612,9 +619,14 @@ fn expand_mattr_cattr(
         let Some(body) = block_node.body() else {
             return Ok(None);
         };
-        match ingest_expr(&body, file) {
+        match ingest_expr_strict(&body, file) {
             Ok(expr) => default = Some(expr),
-            Err(_) => return Ok(None),
+            Err(err) => {
+                if super::survey::is_active() {
+                    super::survey::record(&err);
+                }
+                return Ok(None);
+            }
         }
     }
     if unsupported || names.is_empty() {

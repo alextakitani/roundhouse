@@ -1343,7 +1343,9 @@ fn synthesize_controller_string_method(
     name: &str,
     value: &str,
 ) -> MethodDef {
-    let span = crate::span::Span::synthetic();
+    // Inherit a real controller-file span (same contract as process_action /
+    // Params synth): synthetic Lit spans fail span-preservation gates.
+    let span = controller_provenance_span(controller);
     MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
         unsupported_formals: None,
@@ -1368,6 +1370,30 @@ fn synthesize_controller_string_method(
         mutates_self: false,
         block_param: None,
     }
+}
+
+/// Prefer the superclass path span, else the first body item with a
+/// non-synthetic span — enough for empty-bodied bases like
+/// `ApplicationController < ActionController::Base`.
+fn controller_provenance_span(controller: &Controller) -> Span {
+    if !controller.parent_span.is_synthetic() {
+        return controller.parent_span;
+    }
+    for item in &controller.body {
+        let span = match item {
+            ControllerBodyItem::Action { action, .. } => action.name_span,
+            ControllerBodyItem::ClassMethod { method, .. } => method.name_span,
+            ControllerBodyItem::ClassIvarInit { expr, .. } => expr.span,
+            ControllerBodyItem::Unknown { expr, .. } => expr.span,
+            ControllerBodyItem::Filter { .. } | ControllerBodyItem::PrivateMarker { .. } => {
+                continue;
+            }
+        };
+        if !span.is_synthetic() {
+            return span;
+        }
+    }
+    Span::synthetic()
 }
 
 /// Names a controller marks with `helper_method :x` whose public
