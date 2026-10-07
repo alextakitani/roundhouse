@@ -42,10 +42,15 @@
 # open (or failed) rolls it back before the connection is reused, and a
 # connection whose session ended is reopened on next use.
 #
-# Not here yet: a sharded pool with named statements cached per
-# connection, and a request query cache. The SQLite-only entry points
-# the server boot calls are no-ops, except `seed_from_file`, which
-# raises (see below).
+# Pooling follows db.rb: DATABASE_POOL_SIZE connections split into
+# shards, a thread assigned one shard for its life, connections opened
+# lazily. `prepare` runs through a named statement cached per physical
+# connection (Parse once, then Bind/Execute), bounded and least recently
+# used, closed on the server when evicted; `prepare_uncached` uses the
+# unnamed statement. Finalizing a read releases its handle, never the
+# named statement. Not here yet: the request query cache. The
+# SQLite-only entry points the server boot calls are no-ops, except
+# `seed_from_file`, which raises (see below).
 #
 # The SQL-functions hook: project.rs installs an app's SQLite functions
 # by patching a connection-open anchor in runtime/db.rb. This file does
@@ -185,9 +190,10 @@ end
 # parallel null-flag array so the element type stays String), and once
 # it has run, the buffered result and the current row.
 class PgStmt
-  def initialize(handle, sql)
+  def initialize(handle, sql, cached)
     @handle = handle
     @sql = sql
+    @cached = cached
     @vals = [""]
     @vals.delete_at(0)
     @nulls = [0]
@@ -213,6 +219,11 @@ class PgStmt
 
   def sql
     @sql
+  end
+
+  # Whether the read runs through the connection's named statement.
+  def cached
+    @cached
   end
 
   def ran
@@ -290,6 +301,22 @@ class PgStmt
   end
 end
 
+# One cached named statement: the SQL and its server-side name.
+class PgNamed
+  def initialize(sql, name)
+    @sql = sql
+    @name = name
+  end
+
+  def sql
+    @sql
+  end
+
+  def name
+    @name
+  end
+end
+
 # One server session, opened on first use. Owns the handles prepared on
 # it until they are finalized or the lease that took it ends.
 #
@@ -312,6 +339,9 @@ class PgConn
     @changes = 0
     @last_tag = ""
     @last_insert_table = ""
+    # Named statements, least recently used first.
+    @named = []
+    @name_serial = 0
   end
 
   def client
@@ -332,14 +362,14 @@ class PgConn
     @last_tag
   end
 
-  def open_stmt(sql)
+  def open_stmt(sql, cached)
     @serial = @serial + 1
     slot = @stmts.length
     if @free_slots.length > 0
       slot = @free_slots.delete_at(@free_slots.length - 1)
     end
     h = (@serial << SLOT_BITS) + slot
-    st = PgStmt.new(h, sql)
+    st = PgStmt.new(h, sql, cached)
     if slot == @stmts.length
       @stmts.push(st)
     else
@@ -391,13 +421,122 @@ class PgConn
 
   def run(st)
     begin
-      r = client.exec_params(st.sql, st.params)
-      st.finish(r)
+      if st.cached
+        st.finish(run_named(st))
+      else
+        st.finish(client.exec_params(st.sql, st.params))
+      end
     rescue PG::Error => e
       PgErrors.raise_mapped(e.result.error_field(PG::PG_DIAG_SQLSTATE).to_s, e.message)
       raise e
     end
     nil
+  end
+
+  # ── Named statements ──
+
+  def named_count
+    @named.length
+  end
+
+  # Whether `sql` has a named statement on this session.
+  def named?(sql)
+    named_index(sql) >= 0
+  end
+
+  def named_index(sql)
+    i = @named.length - 1
+    while i >= 0
+      return i if @named[i].sql == sql
+      i -= 1
+    end
+    -1
+  end
+
+  # The server-side name for `sql`, parsed now if this session has none.
+  # A hit moves to the most-recent end; a miss past the bound closes the
+  # least recently used statement on the server.
+  def named_for(sql)
+    i = named_index(sql)
+    if i >= 0
+      e = @named[i]
+      last = @named.length - 1
+      while i < last
+        @named[i] = @named[i + 1]
+        i += 1
+      end
+      @named[last] = e
+      return e.name
+    end
+    @name_serial = @name_serial + 1
+    name = "rh_s" + @name_serial.to_s
+    client.prepare(name, sql)
+    @named.push(PgNamed.new(sql, name))
+    evict_over(Db.statement_cache_cap)
+    name
+  end
+
+  # Close the oldest statements until at most `cap` remain. A Close the
+  # server refuses (an aborted transaction) still forgets the entry; the
+  # statement then lives until the session ends.
+  def evict_over(cap)
+    while @named.length > cap
+      e = @named[0]
+      keep = []
+      i = 1
+      while i < @named.length
+        keep.push(@named[i])
+        i += 1
+      end
+      @named = keep
+      begin
+        client.close_prepared(e.name)
+      rescue PG::Error
+        nil
+      end
+    end
+    nil
+  end
+
+  def forget_named(sql)
+    i = named_index(sql)
+    return nil if i < 0
+    keep = []
+    j = 0
+    while j < @named.length
+      keep.push(@named[j]) if j != i
+      j += 1
+    end
+    @named = keep
+    nil
+  end
+
+  # Bind/Execute the cached statement. If the server no longer has it
+  # (26000, e.g. after DEALLOCATE ALL) or its plan went stale after DDL
+  # (0A000), forget it and, outside a transaction, parse it again and
+  # retry once. Inside one the error has already failed the transaction,
+  # so it is raised; the next use after ROLLBACK parses afresh.
+  def run_named(st)
+    name = named_for(st.sql)
+    begin
+      r = client.exec_prepared(name, st.params)
+      return r
+    rescue PG::Error => e
+      code = e.result.error_field(PG::PG_DIAG_SQLSTATE).to_s
+      raise e if code != "26000" && code != "0A000"
+      forget_named(st.sql)
+      if code == "0A000"
+        begin
+          client.close_prepared(name)
+        rescue PG::Error
+          nil
+        end
+      end
+      raise e if client.transaction_status != PG::PQTRANS_IDLE
+    end
+    name = named_for(st.sql)
+    r2 = client.exec_prepared(name, st.params)
+    r2
   end
 
   def exec(sql)
@@ -423,7 +562,7 @@ class PgConn
   # A handle over a write's returned rows, already in hand.
   def returning(sql)
     r = simple(sql)
-    h = open_stmt(sql)
+    h = open_stmt(sql, false)
     stmt(h).finish(r)
     h
   end
@@ -457,6 +596,7 @@ class PgConn
   def drop
     c = @client
     @client = nil
+    @named = []
     release_all
     begin
       c.close if !c.nil?
@@ -497,14 +637,14 @@ class PgConn
   def close
     c = @client
     @client = nil
+    @named = []
     release_all
     c.close if !c.nil?
     nil
   end
 end
 
-# One pool of connections opened lazily, leased per request. A plain
-# pool for now: no shards, no per-connection statement cache.
+# One shard of the pool: connections opened lazily, leased per request.
 class PgPool
   def initialize(config, n)
     @conns = []
@@ -563,7 +703,12 @@ class PgPool
 end
 
 module Db
-  @pool = nil
+  # Shards (see configure); empty until configured.
+  @pools = []
+  @assign_lock = Mutex.new
+  @next_pool = 0
+  # Named statements kept per connection (db.rb's DbConn::CAP).
+  @statement_cache_cap = 128
   # Query-log capture (issue #27), in parity with db.rb.
   @query_log = nil
   # RH_SQL_TRACE=1 prints each SQL string to stderr as `  SQL ...`.
@@ -580,16 +725,60 @@ module Db
       n = ev.to_i
     end
     n = 1 if n < 1
-    pool = PgPool.new(PgConfig.new(url.to_s), n)
-    pool.first.client
-    @pool = pool
+    # Sharded as db.rb's pool is, for the same reason: one lock per
+    # thread rather than per request. At least 4 connections a shard,
+    # at most 8 shards.
+    stripes = n / 4
+    stripes = 1 if stripes < 1
+    stripes = 8 if stripes > 8
+    per = n / stripes
+    per = 1 if per < 1
+    config = PgConfig.new(url.to_s)
+    pools = []
+    i = 0
+    while i < stripes
+      pools.push(PgPool.new(config, per))
+      i += 1
+    end
+    pools[0].first.client
+    @pools = pools
+    @next_pool = 0
     nil
   end
 
+  def self.statement_cache_cap
+    @statement_cache_cap
+  end
+
+  # Tests shrink the bound to exercise eviction.
+  def self.statement_cache_cap=(n)
+    @statement_cache_cap = n
+  end
+
+  # The first shard: where scripts and boot run outside any lease.
   def self.pool
-    p = @pool
-    raise "Db: not configured (call Db.configure first)" if p.nil?
-    p
+    raise "Db: not configured (call Db.configure first)" if @pools.empty?
+    @pools[0]
+  end
+
+  def self.shard_count
+    @pools.length
+  end
+
+  # The shard this thread leases from, chosen once (round-robin) and
+  # remembered, as in db.rb.
+  def self.pool_for_thread
+    raise "Db: not configured (call Db.configure first)" if @pools.empty?
+    pi = Thread.current[:db_pg_pool]
+    return @pools[pi] if !pi.nil? && pi < @pools.length
+    n = 0
+    @assign_lock.synchronize do
+      n = @next_pool
+      @next_pool = n + 1
+    end
+    pi = n % @pools.length
+    Thread.current[:db_pg_pool] = pi
+    @pools[pi]
   end
 
   # The leased connection, or the pool's first one for single-threaded
@@ -610,7 +799,7 @@ module Db
     # Re-entrant: a nested lease, or one inside a transaction a BEGIN
     # outside any lease pinned, keeps the thread's connection.
     return yield if !Thread.current[:db_conn].nil?
-    pool = Db.pool
+    pool = Db.pool_for_thread
     idx = pool.lease
     conn = pool.conn(idx)
     Thread.current[:db_conn] = conn
@@ -637,10 +826,20 @@ module Db
   end
 
   def self.close
-    p = @pool
-    return nil if p.nil?
-    @pool = nil
-    p.close_all
+    pools = @pools
+    return nil if pools.empty?
+    @pools = []
+    error = nil
+    i = 0
+    while i < pools.length
+      begin
+        pools[i].close_all
+      rescue StandardError => e
+        error = e if error.nil?
+      end
+      i += 1
+    end
+    raise error if !error.nil?
     nil
   end
 
@@ -721,18 +920,19 @@ module Db
     h
   end
 
+  # A read through the connection's cached named statement for `sql`.
   def self.prepare(sql)
     sql = sql.to_s
     record_query(sql)
-    h = current_conn.open_stmt(sql)
+    h = current_conn.open_stmt(sql, true)
     h
   end
 
-  # No statement cache yet, so a cached and an uncached read are the same.
+  # Reads with too many SQL shapes to cache run as the unnamed statement.
   def self.prepare_uncached(sql)
     sql = sql.to_s
     record_query(sql)
-    h = current_conn.open_stmt(sql)
+    h = current_conn.open_stmt(sql, false)
     h
   end
 

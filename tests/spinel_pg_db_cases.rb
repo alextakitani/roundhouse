@@ -34,20 +34,28 @@ end
 
 $checks = 0
 
+# Report on stderr and exit, rather than raise: an exception's message
+# can come back stale on Spinel once its storage is reused, and a
+# failing gate should name the check that failed.
+def fail_check(text)
+  $stderr.puts "FAIL " + text
+  exit 1
+end
+
 def check(label, ok)
-  raise "FAIL " + label if !ok
+  fail_check(label) if !ok
   $checks += 1
   nil
 end
 
 def check_int(label, want, got)
-  raise "FAIL " + label + ": want " + want.to_s + ", got " + got.to_s if want != got
+  fail_check(label + ": want " + want.to_s + ", got " + got.to_s) if want != got
   $checks += 1
   nil
 end
 
 def check_str(label, want, got)
-  raise "FAIL " + label + ": want " + want.inspect + ", got " + got.inspect if want != got
+  fail_check(label + ": want " + want.inspect + ", got " + got.inspect) if want != got
   $checks += 1
   nil
 end
@@ -60,7 +68,7 @@ def check_raises(label, fragment)
     message = e.message
   end
   if !message.include?(fragment)
-    raise "FAIL " + label + ": want an error containing " + fragment.inspect + ", got " + message.inspect
+    fail_check(label + ": want an error containing " + fragment.inspect + ", got " + message.inspect)
   end
   $checks += 1
   nil
@@ -548,6 +556,181 @@ def case_19(s, schema)
   nil
 end
 
+# Named statements this session holds on the server. Read through the
+# unnamed statement, which pg_prepared_statements does not list.
+def server_named
+  h = Db.prepare_uncached("SELECT count(*) FROM pg_prepared_statements WHERE name LIKE 'rh_s%'")
+  Db.step?(h)
+  n = Db.column_int(h, 0)
+  Db.finalize(h)
+  n
+end
+
+def cached_read(s, id)
+  h = Db.prepare("SELECT name FROM " + s + "widgets WHERE id = $1")
+  Db.bind_int(h, 1, id)
+  found = Db.step?(h)
+  Db.finalize(h)
+  found
+end
+
+def case_20(s, schema)
+  # ── Named statements: reuse, and finalize keeps them ──
+
+  Db.with_connection do
+    conn = Db.current_conn
+    base = server_named
+    i = 0
+    found = 0
+    while i < 100
+      found += 1 if cached_read(s, 1 + (i % 2))
+      i += 1
+    end
+    check_int("100 cached reads", 100, found)
+    check_int("one named statement for one shape", base + 1, server_named)
+    check("the shape is cached", conn.named?("SELECT name FROM " + s + "widgets WHERE id = $1"))
+    check_int("finalize released every handle", 0, conn.open_count)
+    h = Db.prepare_uncached("SELECT name FROM " + s + "widgets WHERE id = $1 AND id > 0")
+    Db.bind_int(h, 1, 1)
+    check("uncached read", Db.step?(h))
+    Db.finalize(h)
+    check_int("an uncached read names nothing", base + 1, server_named)
+  end
+  nil
+end
+
+def case_21(s, schema)
+  # ── Leases: handles never leak, statements stay cached ──
+
+  leased = Db.current_conn
+  before = 0
+  Db.with_connection do
+    leased = Db.current_conn
+    before = server_named
+    h = Db.prepare("SELECT id FROM " + s + "widgets WHERE id >= $1 ORDER BY id")
+    Db.bind_int(h, 1, 1)
+    Db.step?(h)
+    check_int("open inside the lease", 1, leased.open_count)
+  end
+  check_int("no handle survives the lease", 0, leased.open_count)
+  Db.with_connection do
+    check("the same connection comes back", Db.current_conn == leased)
+    check_int("its statement survived the lease", before + 1, server_named)
+    h = Db.prepare("SELECT id FROM " + s + "widgets WHERE id >= $1 ORDER BY id")
+    Db.bind_int(h, 1, 2)
+    check("reused across leases", Db.step?(h))
+    check_int("reuse parses nothing new", before + 1, server_named)
+    Db.finalize(h)
+  end
+
+  # A second thread leases its own connection.
+  Db.with_connection do
+    mine = Db.current_conn
+    other = Thread.new do
+      same = true
+      Db.with_connection do
+        same = Db.current_conn == mine
+      end
+      same
+    end
+    check("another thread's lease is another connection", !other.value)
+  end
+  nil
+end
+
+def case_22(s, schema)
+  # ── Eviction closes on the server ──
+
+  Db.statement_cache_cap = 3
+  Db.with_connection do
+    conn = Db.current_conn
+    i = 0
+    while i < 5
+      h = Db.prepare("SELECT " + i.to_s + " AS n, name FROM " + s + "widgets WHERE id = $1")
+      Db.bind_int(h, 1, 1)
+      Db.step?(h)
+      Db.finalize(h)
+      i += 1
+    end
+    check_int("the cache holds its bound", 3, conn.named_count)
+    check_int("evicted statements are closed on the server", 3, server_named)
+    check("the oldest shape was evicted", !conn.named?("SELECT 0 AS n, name FROM " + s + "widgets WHERE id = $1"))
+    check("the newest shape stays", conn.named?("SELECT 4 AS n, name FROM " + s + "widgets WHERE id = $1"))
+  end
+  Db.statement_cache_cap = 128
+  nil
+end
+
+def case_23(s, schema)
+  # ── Recovery ──
+
+  Db.with_connection do
+    conn = Db.current_conn
+    shape = "SELECT name FROM " + s + "widgets WHERE id = $1"
+    check("warm", cached_read(s, 1))
+
+    # Deallocated behind the cache's back: parsed again, outside a
+    # transaction, without the caller seeing it.
+    Db.exec("DEALLOCATE ALL")
+    check("read after DEALLOCATE ALL", cached_read(s, 1))
+    check_int("re-parsed once", 1, server_named)
+
+    # An error inside a transaction: the named statement fails with the
+    # transaction, a new shape is not recorded, and both work after
+    # ROLLBACK, the old one without a new Parse.
+    Db.exec("BEGIN")
+    check("cached read in a transaction", cached_read(s, 2))
+    check_str("an error fails the transaction", "22012", sqlstate_of { Db.exec("SELECT 1/0") })
+    check_str("the named statement is refused", "25P02", sqlstate_of { cached_read(s, 1) })
+    fresh = "SELECT id FROM " + s + "widgets WHERE name = $1"
+    check_str("a new shape is refused", "25P02", sqlstate_of do
+      h = Db.prepare(fresh)
+      Db.bind_text(h, 1, "third")
+      Db.step?(h)
+    end)
+    check("a refused Parse is not cached", !conn.named?(fresh))
+    Db.exec("ROLLBACK")
+    named = server_named
+    check("reuse after ROLLBACK", cached_read(s, 1))
+    check_int("no new Parse after ROLLBACK", named, server_named)
+    h = Db.prepare(fresh)
+    Db.bind_text(h, 1, "gädget ✓ \\ back")
+    check("the refused shape parses after ROLLBACK", Db.step?(h))
+    Db.finalize(h)
+
+    # Deallocated inside a transaction: the error fails the transaction
+    # and the entry is forgotten, so after ROLLBACK it parses again.
+    Db.exec("BEGIN")
+    Db.exec("DEALLOCATE ALL")
+    check_str("a vanished statement inside a transaction", "26000", sqlstate_of { cached_read(s, 1) })
+    check("forgotten", !conn.named?(shape))
+    Db.exec("ROLLBACK")
+    check("re-parsed after ROLLBACK", cached_read(s, 1))
+    check("cached again", conn.named?(shape))
+  end
+
+  # A backend the server terminated takes its statements with it.
+  leased = Db.current_conn
+  pid = 0
+  Db.with_connection do
+    leased = Db.current_conn
+    check("warm before terminate", cached_read(s, 1))
+    check("named before terminate", leased.named_count > 0)
+    h = Db.prepare_uncached("SELECT pg_backend_pid()")
+    Db.step?(h)
+    pid = Db.column_int(h, 0)
+    Db.finalize(h)
+    Db.pool.first.exec("SELECT pg_terminate_backend(" + pid.to_s + ")")
+    check_raises("terminated mid-lease", "connection") { cached_read(s, 1) }
+  end
+  check_int("a dropped session forgets its statements", 0, leased.named_count)
+  Db.with_connection do
+    check("reopened read parses afresh", cached_read(s, 1))
+    check_int("one statement on the new session", 1, server_named)
+  end
+  nil
+end
+
 begin
   case_01(s, schema)
   case_02(s, schema)
@@ -568,6 +751,10 @@ begin
   case_17(s, schema)
   case_18(s, schema)
   case_19(s, schema)
+  case_20(s, schema)
+  case_21(s, schema)
+  case_22(s, schema)
+  case_23(s, schema)
 ensure
   # Close every session first: a failed case can leave one holding locks
   # the DROP would otherwise wait on forever.
@@ -578,4 +765,13 @@ end
 
 Db.close
 check_raises("closed", "not configured") { Db.exec("SELECT 1") }
+# A larger pool is sharded: four connections a shard.
+Db.configure(url, pool_size: 8)
+check_int("two shards for eight connections", 2, Db.shard_count)
+Db.with_connection do
+  h = Db.prepare_uncached("SELECT 1")
+  check("a sharded lease reads", Db.step?(h))
+  Db.finalize(h)
+end
+Db.close
 puts "spinel_pg_db: " + $checks.to_s + " checks passed"

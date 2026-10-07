@@ -96,6 +96,11 @@ in `src/project.rs`. Shape notes worth knowing:
     class through `runtime/spinel/pg_errors.rb`.
   - A transaction keeps its connection, and a lease that ends inside
     one rolls it back.
+  - The pool is sharded per thread, as `runtime/spinel/db.rb`'s is.
+    `Db.prepare` runs through a named statement cached per connection
+    (at most 128, closed on the server when evicted); finalizing a read
+    releases its handle and keeps the statement. There is no request
+    query cache yet.
   - The SQLite-only boot hooks (read snapshot, checkpointer) do
     nothing there, and `seed_from_file` raises.
 

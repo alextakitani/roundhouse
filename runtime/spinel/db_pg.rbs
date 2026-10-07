@@ -27,17 +27,19 @@ end
 class PgStmt
   @handle: Integer
   @sql: String
+  @cached: bool
   @vals: Array[String]
   @nulls: Array[Integer]
   @result: PgResult?
   @ran: bool
   @row: Integer
   @alive: bool
-  def initialize: (Integer handle, String sql) -> void
+  def initialize: (Integer handle, String sql, bool cached) -> void
   def handle: () -> Integer
   def alive: () -> bool
   def kill: () -> nil
   def sql: () -> String
+  def cached: () -> bool
   def ran: () -> bool
   def bind: (Integer idx, String? value) -> nil
   def params: () -> Array[String?]
@@ -45,6 +47,14 @@ class PgStmt
   def result: () -> PgResult
   def advance: () -> bool
   def value: (Integer i) -> String?
+end
+
+class PgNamed
+  @sql: String
+  @name: String
+  def initialize: (String sql, String name) -> void
+  def sql: () -> String
+  def name: () -> String
 end
 
 class PgConn
@@ -57,18 +67,27 @@ class PgConn
   @serial: Integer
   @changes: Integer
   @last_tag: String
+  @named: Array[PgNamed]
+  @name_serial: Integer
   @last_insert_table: String
   def initialize: (PgConfig config) -> void
   def client: () -> PgClientCore
   def changes: () -> Integer
   def last_tag: () -> String
-  def open_stmt: (String sql) -> Integer
+  def open_stmt: (String sql, bool cached) -> Integer
   def slot_of: (Integer h) -> Integer
   def stmt: (Integer h) -> PgStmt
   def close_stmt: (Integer h) -> nil
   def release_all: () -> nil
   def open_count: () -> Integer
   def run: (PgStmt st) -> nil
+  def named_count: () -> Integer
+  def named?: (String sql) -> bool
+  def named_index: (String sql) -> Integer
+  def named_for: (String sql) -> String
+  def evict_over: (Integer cap) -> nil
+  def forget_named: (String sql) -> nil
+  def run_named: (PgStmt st) -> PgResult
   def exec: (String sql) -> nil
   def simple: (String sql) -> PgResult
   def returning: (String sql) -> Integer
@@ -93,6 +112,10 @@ end
 
 module Db
   def self.pool: () -> PgPool
+  def self.statement_cache_cap: () -> Integer
+  def self.statement_cache_cap=: (Integer n) -> Integer
+  def self.shard_count: () -> Integer
+  def self.pool_for_thread: () -> PgPool
   def self.current_conn: () -> PgConn
   def self.in_lease?: () -> bool
   def self.pin_transaction: (PgConn conn) -> nil
