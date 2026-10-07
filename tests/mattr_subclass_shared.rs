@@ -44,16 +44,28 @@ fn library_mattr_reader_uses_class_variable_storage() {
     );
     assert!(
         classes[0].class_ivar_initializers.iter().any(|expr| {
+            // Nil seeds are conditional: `@@attr = nil unless defined?`
+            // so subclass redeclarations do not wipe the parent.
             matches!(
                 &*expr.node,
-                ExprNode::Assign {
-                    target: LValue::Var { name, .. },
-                    value,
-                } if name.as_str() == "@@channel"
-                    && matches!(&*value.node, ExprNode::Lit { value: roundhouse::expr::Literal::Nil })
+                ExprNode::If {
+                    else_branch,
+                    ..
+                } if matches!(
+                    &*else_branch.node,
+                    ExprNode::Assign {
+                        target: LValue::Var { name, .. },
+                        value,
+                    } if name.as_str() == "@@channel"
+                        && matches!(
+                            &*value.node,
+                            ExprNode::Lit { value: roundhouse::expr::Literal::Nil }
+                        )
+                )
             )
         }),
-        "expected @@channel = nil seed"
+        "expected conditional @@channel = nil seed: {:?}",
+        classes[0].class_ivar_initializers
     );
 }
 
@@ -188,6 +200,37 @@ raise "lib cattr subclass" unless SpecialChannelConfig.banner == "hi"
 SpecialChannelConfig.banner = "yo"
 raise "lib cattr write-through" unless ChannelConfig.banner == "yo"
 puts "library_mattr_cattr_subclass_ok"
+"#,
+        )
+        .assert_passes();
+}
+
+#[test]
+fn subclass_redeclaration_preserves_inherited_value() {
+    // Rails: redeclaring mattr/cattr (plain or default: nil) must not
+    // wipe a value already set on the shared @@ storage.
+    emit_and_run::real_blog()
+        .write(
+            "app/services/channel_config.rb",
+            r#"class ChannelConfig
+  mattr_accessor :channel
+  cattr_accessor :banner
+end
+class SpecialChannelConfig < ChannelConfig
+  mattr_accessor :channel
+  cattr_accessor :banner, default: nil
+end
+"#,
+        )
+        .run_ruby(
+            r#"
+ChannelConfig.channel = "news"
+ChannelConfig.banner = "hi"
+raise "redeclare wiped mattr" unless SpecialChannelConfig.channel == "news"
+raise "redeclare wiped cattr" unless SpecialChannelConfig.banner == "hi"
+raise "parent mattr intact" unless ChannelConfig.channel == "news"
+raise "parent cattr intact" unless ChannelConfig.banner == "hi"
+puts "subclass_redeclaration_preserves_ok"
 "#,
         )
         .assert_passes();

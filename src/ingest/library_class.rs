@@ -1160,9 +1160,15 @@ impl DeclBody {
                 )
             });
             if !already {
+                // Rails `mattr_reader`: non-nil defaults always set; nil
+                // (including absent default) only when not already defined —
+                // so a subclass redeclaration does not wipe the parent.
                 let seed = class_attr_defaults
                     .get(attr)
                     .cloned()
+                    .filter(|value| {
+                        !matches!(&*value.node, ExprNode::Lit { value: Literal::Nil })
+                    })
                     .map(|value| mattr_seed(attr, value))
                     .unwrap_or_else(|| mattr_nil_seed(attr));
                 self.class_initializers.push(seed);
@@ -2188,17 +2194,44 @@ pub(crate) fn mattr_seed(attr: &Symbol, value: Expr) -> Expr {
     )
 }
 
-/// Rails `mattr_*` / `cattr_*` seed: `@@attr = nil` when no default is set
-/// (`Module#mattr_reader` calls `class_variable_set` so first read is nil).
+/// Rails `mattr_*` / `cattr_*` nil seed: `@@attr = nil` only when the
+/// class variable is not already defined. Matches
+/// `Module#mattr_reader`'s `class_variable_set` guard so a subclass
+/// redeclaration does not wipe an inherited value.
+///
+/// Uses `defined?(@@attr)` (not bare `class_variable_defined?`) so the
+/// class-body seed types cleanly without a Module-protocol receiver.
 pub(crate) fn mattr_nil_seed(attr: &Symbol) -> Expr {
-    mattr_seed(
+    let span = Span::synthetic();
+    let cvar = mattr_cvar_name(attr);
+    let assign = mattr_seed(
         attr,
         Expr::new(
-            Span::synthetic(),
+            span,
             ExprNode::Lit {
                 value: Literal::Nil,
             },
         ),
+    );
+    let defined = Expr::new(
+        span,
+        ExprNode::Defined {
+            operand: Expr::new(
+                span,
+                ExprNode::Var {
+                    id: VarId(0),
+                    name: cvar,
+                },
+            ),
+        },
+    );
+    Expr::new(
+        span,
+        ExprNode::If {
+            cond: defined,
+            then_branch: Expr::new(span, ExprNode::Lit { value: Literal::Nil }),
+            else_branch: assign,
+        },
     )
 }
 

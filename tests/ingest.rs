@@ -2071,6 +2071,15 @@ fn mattr_and_native_classvar_writes_share_storage() {
                         target: LValue::Var { name, .. },
                         ..
                     } if name.as_str() == "@@count"
+                ) || matches!(
+                    &*expr.node,
+                    ExprNode::If { else_branch, .. } if matches!(
+                        &*else_branch.node,
+                        ExprNode::Assign {
+                            target: LValue::Var { name, .. },
+                            ..
+                        } if name.as_str() == "@@count"
+                    )
                 )
             }),
             "mattr seeds @@count = nil: {:?}",
@@ -2098,34 +2107,42 @@ fn cattr_defaults_cannot_be_silently_dropped_with_native_initializers() {
             let source = format!("class Probe; {call}; end");
             let classes = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
                 .expect("standalone class-attribute default must seed");
-            let seed = classes[0].class_ivar_initializers.iter().find(|expr| {
-                matches!(
-                    &*expr.node,
+            let seed_value = classes[0].class_ivar_initializers.iter().find_map(|expr| {
+                match &*expr.node {
                     ExprNode::Assign {
                         target: LValue::Var { name, .. },
-                        ..
-                    } if name.as_str() == "@@count"
-                )
-            });
-            assert!(seed.is_some(), "missing @@count seed for {call}: {:?}", classes[0].class_ivar_initializers);
-            match &*seed.unwrap().node {
-                ExprNode::Assign { value, .. } => {
-                    let expected_nil = default == "default: nil";
-                    assert_eq!(
-                        matches!(&*value.node, ExprNode::Lit { value: Literal::Nil }),
-                        expected_nil,
-                        "{call}: {:?}",
-                        value.node
-                    );
-                    if default == "default: 41" || default.is_empty() {
-                        assert!(
-                            matches!(&*value.node, ExprNode::Lit { value: Literal::Int { value: 41 } }),
-                            "{call}: {:?}",
-                            value.node
-                        );
-                    }
+                        value,
+                    } if name.as_str() == "@@count" => Some(value),
+                    // Nil defaults are conditional (`unless class_variable_defined?`).
+                    ExprNode::If { else_branch, .. } => match &*else_branch.node {
+                        ExprNode::Assign {
+                            target: LValue::Var { name, .. },
+                            value,
+                        } if name.as_str() == "@@count" => Some(value),
+                        _ => None,
+                    },
+                    _ => None,
                 }
-                other => panic!("expected assign seed, got {other:?}"),
+            });
+            assert!(
+                seed_value.is_some(),
+                "missing @@count seed for {call}: {:?}",
+                classes[0].class_ivar_initializers
+            );
+            let value = seed_value.unwrap();
+            let expected_nil = default == "default: nil";
+            assert_eq!(
+                matches!(&*value.node, ExprNode::Lit { value: Literal::Nil }),
+                expected_nil,
+                "{call}: {:?}",
+                value.node
+            );
+            if default == "default: 41" || default.is_empty() {
+                assert!(
+                    matches!(&*value.node, ExprNode::Lit { value: Literal::Int { value: 41 } }),
+                    "{call}: {:?}",
+                    value.node
+                );
             }
         }
         for default in ["**{default: 41}", "**options", "instance_reader: false, default: 41"] {
@@ -2405,9 +2422,19 @@ fn nested_class_methods_cannot_relocate_native_initializers() {
                     target: roundhouse::expr::LValue::Var { name, .. },
                     ..
                 } if name.as_str() == "@@flag"
+            ) || matches!(
+                &*expr.node,
+                roundhouse::expr::ExprNode::If { else_branch, .. } if matches!(
+                    &*else_branch.node,
+                    roundhouse::expr::ExprNode::Assign {
+                        target: roundhouse::expr::LValue::Var { name, .. },
+                        ..
+                    } if name.as_str() == "@@flag"
+                )
             )
         }),
-        "ClassMethods cattr must seed @@flag on Probe"
+        "ClassMethods cattr must seed @@flag on Probe: {:?}",
+        probe.class_ivar_initializers
     );
     assert!(probe.methods.iter().any(|m| m.name.as_str() == "flag"));
 }
