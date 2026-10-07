@@ -1336,6 +1336,37 @@ fn upsert_controller_string_method(
     methods.push(synthesize_controller_string_method(controller, name, value));
 }
 
+/// A real span in this controller's source file — same provenance rule
+/// as `process_action` (first action body), with fallbacks for
+/// action-less bases like `ApplicationController` (superclass path,
+/// then any non-synthetic body item). Whole-cloth AOT literals must
+/// not leave `Span::synthetic` in lowered controller method bodies.
+fn controller_provenance_span(controller: &Controller) -> Option<Span> {
+    for action in controller.actions() {
+        if !action.body.span.is_synthetic() {
+            return Some(action.body.span);
+        }
+    }
+    if !controller.parent_span.is_synthetic() {
+        return Some(controller.parent_span);
+    }
+    for item in &controller.body {
+        let span = match item {
+            ControllerBodyItem::Action { action, .. } => action.body.span,
+            ControllerBodyItem::ClassMethod { method, .. } => method.body.span,
+            ControllerBodyItem::ClassIvarInit { expr, .. }
+            | ControllerBodyItem::Unknown { expr, .. } => expr.span,
+            ControllerBodyItem::Filter { .. } | ControllerBodyItem::PrivateMarker { .. } => {
+                continue;
+            }
+        };
+        if !span.is_synthetic() {
+            return Some(span);
+        }
+    }
+    None
+}
+
 /// Instance method returning a String literal — AOT-safe override of
 /// Base's `controller_name` / `controller_path`.
 fn synthesize_controller_string_method(
@@ -1343,23 +1374,28 @@ fn synthesize_controller_string_method(
     name: &str,
     value: &str,
 ) -> MethodDef {
-    let span = crate::span::Span::synthetic();
+    let mut body = Expr::new(
+        Span::synthetic(),
+        ExprNode::Lit {
+            value: Literal::Str {
+                value: value.to_string(),
+            },
+        },
+    );
+    // Attribute the literal to controller source (not synthetic) so
+    // span-preservation gates and LSP provenance stay honest.
+    if let Some(span) = controller_provenance_span(controller) {
+        body.inherit_span(span);
+    }
     MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
         unsupported_formals: None,
         has_anonymous_block: false,
-        name_span: span,
+        name_span: Span::synthetic(),
         name: Symbol::from(name),
         receiver: MethodReceiver::Instance,
         params: vec![],
-        body: Expr::new(
-            span,
-            ExprNode::Lit {
-                value: crate::expr::Literal::Str {
-                    value: value.to_string(),
-                },
-            },
-        ),
+        body,
         signature: Some(crate::lower::typing::fn_sig(vec![], Ty::Str)),
         effects: EffectSet::default(),
         enclosing_class: Some(controller.name.0.clone()),
