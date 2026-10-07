@@ -287,6 +287,15 @@ pub(super) fn synthesize_process_action(
         body.inherit_span(first.body.span);
     }
 
+    // Action bodies already run `rewrite_request_format` through
+    // `lower_action_body`. Everything *spliced into* this dispatcher —
+    // filter `if:`/`unless:` lambdas, block-form filter bodies
+    // (`before_action -> { … }`), and `rescue_from` handlers — skips
+    // that pipeline. One pass over the finished body closes the class
+    // of gap (map_expr walks If / Seq / Lambda / BeginRescue). The
+    // transform is idempotent on already-rewritten action-arm Sends.
+    body = rewrites::rewrite_request_format(&body);
+
     let param_sym = Symbol::from(param);
     MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
@@ -430,22 +439,16 @@ fn cond_from_guards(
     if let Some(name) = unless_cond {
         conds.push(negate(predicate(name)));
     }
-    // Same `request.format.<pred>?` → `self.request_format == :<pred>`
-    // rewrite action bodies already get (see `rewrites::
-    // rewrite_request_format`'s doc comment: the Request object's own
-    // `format` answers a bare String with no predicates, or on the
-    // CRuby overlay doesn't exist at all). A filter's `if:`/`unless:`
-    // lambda body is spliced straight into this guard rather than
-    // flowing through the action-body rewrite pipeline, so without
-    // this it stayed the one place that literal call survived —
-    // `protect_from_forgery unless: -> { request.format.json? }`
-    // (Rails' own API-controller guide idiom) raised NoMethodError on
-    // every dispatched action, before the action body ever ran.
+    // `request.format.<pred>?` in these exprs is rewritten once over
+    // the finished `process_action` body in `synthesize_process_action`
+    // (same helper action bodies get via `lower_action_body`). Do not
+    // re-apply here — that would special-case only the guard combiner
+    // and leave block-form filter / rescue bodies still raw.
     if let Some(c) = if_cond_expr {
-        conds.push(rewrites::rewrite_request_format(c));
+        conds.push(c.clone());
     }
     if let Some(c) = unless_cond_expr {
-        conds.push(negate(rewrites::rewrite_request_format(c)));
+        conds.push(negate(c.clone()));
     }
     conds.into_iter().reduce(|l, r| {
         syn(ExprNode::BoolOp {

@@ -751,8 +751,10 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
     },
     // ---- Instance-method writes ----
     // Mutations on a loaded record. Rails bangs-vs-non-bangs
-    // convention: non-bang returns Bool (success/failure);
-    // bang returns Self or raises on failure.
+    // convention: non-bang returns Bool (success/failure); bangs that
+    // share the compiled `Base` method (`save!`/`destroy`/`destroy!`)
+    // return `ActiveRecord::Base` per the sidecar (not Self — see
+    // `save!` below); monomorphized constructors stay SelfType.
     CatalogedMethod {
         name: "save",
         receiver: ReceiverContext::Instance,

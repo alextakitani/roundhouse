@@ -4331,22 +4331,23 @@ honest gap"); `request.format` is answered from `request_format`
 instead of reopening that gap.
 
 **Where the gap was.** `rewrite_request_format` ran over action bodies
-only. A filter's `if:`/`unless:` lambda body (`protect_from_forgery`'s,
-or any `before_action -> { … }, if:`/`unless:`'s) is captured once at
-ingest (`ingest::controller::parse_forgery_macro`'s `if_cond_expr` /
-`unless_cond_expr`) and spliced directly into the synthesized
-`process_action` guard by `cond_from_guards`
-(`lower::controller_to_library::process_action`) — bypassing the
-action-body rewrite pipeline entirely, so this was the one
-`request.format.<pred>?` call shape the rewrite never reached.
+only (`lower_action_body`). Expressions spliced into the synthesized
+`process_action` — filter `if:`/`unless:` lambdas (`protect_from_forgery`
+and any `before_action …, if:`/`unless:`), block-form filter bodies
+(`before_action -> { … }`), and `rescue_from` handlers — bypass that
+pipeline. The guide idiom
+`protect_from_forgery unless: -> { request.format.json? }` was the
+first shape that surfaced; structurally every dispatcher-embedded expr
+had the same hole.
 
-**Fix.** `cond_from_guards` now runs `rewrite_request_format` over
-`if_cond_expr`/`unless_cond_expr` before splicing them into the guard,
-same as every other `request.format.<pred>?` site. One function, which
-every filter's guard — Symbol-target and lambda-target alike — already
-funnels through.
+**Fix.** `synthesize_process_action` runs `rewrite_request_format` once
+over the finished dispatcher body (after rescue wrapping). `map_expr`
+walks guards, block-form filter bodies, and rescue handlers in one
+pass — the same helper action bodies already get, applied at the
+dispatcher boundary rather than bolted into `cond_from_guards` alone.
 
-**What was verified.** `tests/emit_and_run.rs`'s
+**What was verified.**
+`tests/protect_from_forgery_unless_request_format.rs`'s
 `protect_from_forgery_unless_request_format_json_does_not_raise`: a
 `:json`-formatted dispatch skips the forgery check and runs the action
 (previously `NoMethodError`); an html POST with no token still hits
