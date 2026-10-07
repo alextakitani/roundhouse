@@ -1429,6 +1429,33 @@ pub fn target_files(
             return Err(format!("class-instance-variable initialization is not supported ({})", target.as_str()));
         }
     }
+    // Spinel binds a repeated method name to its final implementation even
+    // in an earlier class initializer. CRuby/JRuby execute each definition
+    // in order; refuse this shape before producing a silently different app.
+    if target == BuildTarget::Spinel {
+        // Ingest keeps reopened declarations separate, but they share the
+        // same class object and method table, including its initializers.
+        let mut classes = std::collections::BTreeMap::new();
+        for lc in &app.library_classes {
+            classes.entry(&lc.name).or_insert_with(Vec::new).push(lc);
+        }
+        for (name, declarations) in classes {
+            // Synthetic mattr/cattr `@@` seeds are not the Spinel ordering
+            // hazard — only direct source `@ivar` initialization is.
+            if declarations.iter().all(|lc| !lc.has_source_ivar_initializers()) {
+                continue;
+            }
+            let mut methods = std::collections::HashSet::new();
+            for m in declarations.iter().flat_map(|lc| &lc.methods) {
+                if !methods.insert((m.receiver == crate::dialect::MethodReceiver::Class, &m.name)) {
+                    return Err(format!(
+                        "class-instance-variable initialization with method redefinition is not supported (spinel): {}.{}",
+                        name.0, m.name,
+                    ));
+                }
+            }
+        }
+    }
     let files = crate::timings::phase(format_args!("emit {}: assemble", target.as_str()), || match target {
         BuildTarget::Blog => blog_files(fixture),
         BuildTarget::Spinel => spinel_files_with_source_markers(app, fixture).and_then(|(mut files, _)| {

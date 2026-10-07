@@ -2439,6 +2439,35 @@ fn nested_class_methods_cannot_relocate_native_initializers() {
     assert!(probe.methods.iter().any(|m| m.name.as_str() == "flag"));
 }
 
+#[test]
+fn direct_class_and_module_compound_ivar_writes_are_initializers() {
+    use roundhouse::expr::OpAssignOp;
+    use roundhouse::ingest::ingest_library_classes;
+
+    for kind in ["class", "module"] {
+        let source = format!("{kind} Probe\n  @cache ||= 7\n  @cache &&= 8\n  @cache += 1\n  \
+            class << self\n    @singleton_cache ||= 9\n  end\n  def self.cache; @cache; end\nend\n");
+        let classes = ingest_library_classes(source.as_bytes(), "probe.rb").unwrap();
+        let probe = classes.iter().find(|class| class.name.0.as_str() == "Probe").unwrap();
+        assert!(probe.unknown_calls.is_empty(), "compound writes belong to the initializer list");
+        assert_eq!(probe.class_ivar_initializers.len(), 3, "{kind} body loses a compound write");
+        for (initializer, expected_op) in probe.class_ivar_initializers.iter()
+            .zip([OpAssignOp::OrOr, OpAssignOp::AndAnd, OpAssignOp::Add])
+        {
+            assert!(matches!(&*initializer.node,
+                ExprNode::OpAssign { target: LValue::Ivar { name }, op, .. }
+                    if name.as_str() == "cache" && *op == expected_op));
+            assert_eq!(&source[initializer.span.start as usize..initializer.span.end as usize],
+                match expected_op {
+                    OpAssignOp::OrOr => "@cache ||= 7",
+                    OpAssignOp::AndAnd => "@cache &&= 8",
+                    OpAssignOp::Add => "@cache += 1",
+                    _ => unreachable!(),
+                });
+        }
+    }
+}
+
 /// Parameters after a rest (`->(*, payload)`, `|*rest, a, b|`) used to
 /// vanish: Lambda IR has no slot for them, so `->(*, payload) {
 /// payload[:sql] }` emitted as `-> { payload[:sql] }`, a body reading a
