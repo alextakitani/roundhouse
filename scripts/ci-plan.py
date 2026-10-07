@@ -549,6 +549,11 @@ def finish(
             *(["spinel"] if "spinel-smoke" in jobs else []),
         ]
     )
+    # ci:spinel focus selects build-site / archive-results without spinel-smoke
+    # (Campfire Spinel11 stays off). Still emit the spinel browse archive so
+    # `roundhouse --archives` is never called with an empty list (#592).
+    if hard_spinel and "build-site" in jobs and "spinel" not in archives:
+        archives = [*archives, "spinel"]
     advisory = set(ADVISORY)
     if hard_spinel:
         # Focused CORE Spinel is merge-gate required for the fix round.
