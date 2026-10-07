@@ -429,6 +429,29 @@ fn ruby_family_shims_declare_optional_binds() {
     }
 }
 
+/// `exec_returning` (roundhouse#91): a write with a RETURNING clause
+/// that answers a handle over the returned rows. Declared once in the
+/// ruby-family contract, so every Ruby-family shim implements it; a
+/// SQLite without RETURNING (before 3.35) raises rather than being
+/// exempted.
+const RUBY_FAMILY_RETURNING_SHIMS: &[&str] = &[
+    "runtime/spinel/db.rb",
+    "runtime/spinel/db_cruby.rb",
+    "runtime/spinel/db_jruby.rb",
+];
+
+#[test]
+fn ruby_family_shims_implement_exec_returning() {
+    let rbs = read_shim("runtime/ruby/db.rbs");
+    assert!(defines_in_rbs(&rbs, "exec_returning"), "missing RBS: exec_returning");
+    for path in RUBY_FAMILY_RETURNING_SHIMS {
+        assert!(
+            defines_with(&read_shim(path), "exec_returning", &["def self."], false, false),
+            "{path}: exec_returning"
+        );
+    }
+}
+
 #[test]
 fn every_ruby_family_shim_defines_the_request_lifecycle_hooks() {
     let mut missing: Vec<String> = Vec::new();
