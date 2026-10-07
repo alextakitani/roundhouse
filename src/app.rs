@@ -189,6 +189,12 @@ pub struct App {
     /// as it is in stock Rails.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachable_unsigned_models: Vec<Symbol>,
+    /// Pending `on_load(:active_storage_attachment)` includes-only
+    /// reopens: `(model_name, module_paths)`. File order can visit the
+    /// load-hook file before the model; ingest applies these once
+    /// `app.models` is complete, just before the concern splice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_attachment_on_load: Vec<(Symbol, Vec<Symbol>)>,
     /// Modules `include`d inside `ActiveSupport.on_load(:active_record)`
     /// that provide class-method macros. Mixin instance methods are not
     /// installed. Expansion treats these as an explicit provider origin
@@ -714,6 +720,7 @@ impl App {
             global_id_locate_models: BTreeSet::new(),
             global_id_locate_signed_models: BTreeSet::new(),
             attachable_unsigned_models: Vec::new(),
+            pending_attachment_on_load: Vec::new(),
             load_hook_class_macros: Vec::new(),
             partial_local_types: HashMap::new(),
             view_ivar_types: HashMap::new(),
