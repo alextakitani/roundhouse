@@ -590,7 +590,9 @@ jobs:
       # policy. CRuby binds through FFI, so the library is enough; headers
       # are the compiled Spinel job.
       - name: System libvips for the emitted ruby-vips processor
-        timeout-minutes: 8
+        # libvips42 pulls a large dep tree; slow Azure apt burned 8m on
+        # campfire-conformance in Full validation 37689396098 (libvips42+ffmpeg).
+        timeout-minutes: 20
         run: |
           "$GITHUB_WORKSPACE/scripts/ci-apt-install" libvips42
       # One gem process: three sequential `gem install` steps were paying
@@ -1067,7 +1069,8 @@ jobs:
     # upload cannot skip into a green compact gate (#317).
     if: ${{ contains(fromJSON(needs.plan.outputs.jobs), 'campfire-compare') && needs.build-roundhouse.outputs.roundhouse-bin-artifact-id != '' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    # 55m: leave room after a slow 20m libvips42 apt for oracle/emit.
+    timeout-minutes: 55
 
     services:
       redis:
@@ -1112,7 +1115,8 @@ jobs:
       # app's own hardening line.
       # CRuby binds libvips through FFI; only compiled Spinel needs headers.
       - name: System libvips
-        timeout-minutes: 8
+        # Same slow-mirror bound as libvips-dev (#590) / campfire-conformance.
+        timeout-minutes: 20
         run: |
           "$GITHUB_WORKSPACE/scripts/ci-apt-install" libvips42 sqlite3
       - name: Cache the prepared oracle
@@ -1477,7 +1481,8 @@ jobs:
     # upload cannot skip into a green compact gate (#317).
     if: ${{ contains(fromJSON(needs.plan.outputs.jobs), 'campfire-conformance') && needs.build-roundhouse.outputs.roundhouse-bin-artifact-id != '' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    # 55m: libvips42+ffmpeg apt alone can take ~20m on a slow Azure day.
+    timeout-minutes: 55
 
     steps:
       - uses: actions/checkout@v7
@@ -1590,7 +1595,9 @@ jobs:
       #             and `Message::AttachmentTest` posts a .mov and asserts
       #             the poster frame got attached.
       - name: Install libvips (ruby-vips binds it through FFI) and ffmpeg
-        timeout-minutes: 8
+        # Full validation 37689396098: timed out at 8m mid-Get: on Azure apt
+        # (~libvips42 + ffmpeg). Match the 20m libvips-dev budget from #590.
+        timeout-minutes: 20
         run: |
           "$GITHUB_WORKSPACE/scripts/ci-apt-install" libvips42 ffmpeg
       #   concurrent-ruby, net-http-persistent, web-push — also from the
