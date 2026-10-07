@@ -504,35 +504,33 @@ fn declaration_only_forwarders_are_gated_on_unverified_targets() {
 
 #[test]
 fn unpreserved_controller_and_test_entry_declarations_are_rejected() {
-    let controller = roundhouse::ingest::ingest_controller(
-        b"class ProbeController < ApplicationController\n def call(...)\n 11\n end\nend",
-        "probe_controller.rb",
-    )
-    .expect_err("controller forwarding is outside this slice");
-    assert!(controller.to_string().contains("forwarding declaration"));
-    for name in ["setup", "test_forwarding"] {
-        let source =
-            format!("class ProbeTest < ActiveSupport::TestCase\n def {name}(...)\n 11\n end\nend");
-        let err = roundhouse::ingest::ingest_test_file(source.as_bytes(), "probe_test.rb")
-            .expect_err("test entrypoint forwarding is outside this slice");
-        assert!(err.to_string().contains("forwarding declaration"));
+    for formal in ["...", "**"] {
+        let source = format!("class ProbeController < ApplicationController\n def call({formal})\n 11\n end\nend");
+        let controller = roundhouse::ingest::ingest_controller(source.as_bytes(), "probe_controller.rb")
+            .expect_err("controller forwarding is outside this slice");
+        assert!(controller.to_string().contains("forwarding declaration"));
+        for name in ["setup", "test_forwarding"] {
+            let source = format!("class ProbeTest < ActiveSupport::TestCase\n def {name}({formal})\n 11\n end\nend");
+            let err = roundhouse::ingest::ingest_test_file(source.as_bytes(), "probe_test.rb")
+                .expect_err("test entrypoint forwarding is outside this slice");
+            assert!(err.to_string().contains("forwarding declaration"));
+        }
     }
 }
 
 #[test]
-fn anonymous_keyword_call_forwarding_is_still_a_separate_gap() {
-    // The declaration is retained. The bare `**` call is not a working
-    // forward: the callee's keyword rest is flattened, so this stays a
-    // gap rather than a claim that `target(**)` runs.
-    let source = "class Probe\n def call(__fwd_kwargs, **)\n target(__fwd_kwargs, **)\n end\n def target(**params)\n params\n end\nend";
-    let run = emit_and_run::real_blog()
-        .write("app/lib/probe.rb", source)
-        .run_ruby("puts 1");
-    let emitted = std::fs::read_to_string(run.emitted.join("app/models/probe.rb")).unwrap();
-    assert!(
-        !emitted.contains("def target(**params)"),
-        "bare ** forwarding is not implemented, so the callee must not claim a keyword rest:\n{emitted}"
-    );
+fn anonymous_keyword_forwarding_refuses_unverified_keyword_abis() {
+    for source in [
+        "class Probe; def call(__fwd_kwargs, **); missing(__fwd_kwargs, **); end; end",
+        "class Probe; def target(**options); options; end; def call(**); target(**); end; end",
+        "class Probe; def target; 7; end; def call(**); target(**); end; end",
+    ] {
+        let mut app = analyzed(source);
+        let lower = roundhouse::session::analyze_and_lower(&mut app);
+        let errors: Vec<_> = diagnose(&app).into_iter().chain(lower)
+            .filter(|d| d.severity == Severity::Error).collect();
+        assert!(errors.iter().any(|d| d.message.contains("keyword forwarding")), "{source}: {errors:?}");
+    }
 }
 
 #[test]
@@ -995,4 +993,50 @@ fn runtime_full_declarations_refuse_both_entry_paths_and_project_legacy_keywords
     let emitted = roundhouse::emit::ruby::emit_method(&method);
     assert!(emitted.contains("target(kw)"), "{emitted}");
     assert!(!emitted.contains("**kw"), "{emitted}");
+}
+
+#[test]
+fn extend_module_super_forwarding_is_not_residual() {
+    // Campfire WebPush::Connections::Stages: module extended onto Net::HTTP,
+    // `super(...)` lands outside app source. Must not residual tip check.
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    let files: [(&str, &str); 3] = [
+        (
+            "app/models/pool.rb",
+            r#"class Pool
+  module Stages
+    def begin_transport(...)
+      super
+    end
+    def connect(...)
+      super(...)
+    end
+  end
+end
+"#,
+        ),
+        (
+            "config/routes.rb",
+            "Rails.application.routes.draw do\nend\n",
+        ),
+        ("db/schema.rb", "ActiveRecord::Schema.define do\nend\n"),
+    ];
+    let tree: HashMap<PathBuf, Vec<u8>> = files
+        .iter()
+        .map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec()))
+        .collect();
+    let mut app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+    let mut analyzer = roundhouse::analyze::Analyzer::new(&app);
+    analyzer.analyze(&mut app);
+    let diags = roundhouse::analyze::diagnose(&app);
+    let forwards = diags
+        .iter()
+        .filter(|d| d.to_string().contains("full argument forwarding"))
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        forwards.is_empty(),
+        "extend-module super(...) must not residual: {forwards:?}"
+    );
 }

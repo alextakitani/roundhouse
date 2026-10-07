@@ -231,7 +231,7 @@ fn walk_children(e: &mut Expr) {
                 walk(e, false);
             }
         }
-        ExprNode::ForwardArgs => {}
+        ExprNode::ForwardArgs | ExprNode::ForwardKeywords | ExprNode::Defined { .. } => {}
     }
 }
 

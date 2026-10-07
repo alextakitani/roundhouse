@@ -719,7 +719,8 @@ cmd_socket_seed() {
 cmd_login() {
     mkdir -p "$(dirname "$JAR")"; rm -f "$JAR"
     local token
-    token="$(curl -sS -c "$JAR" "http://127.0.0.1:$PORT/session/new" \
+    token="$(curl -sS -H 'Accept-Encoding: identity' -c "$JAR" \
+             "http://127.0.0.1:$PORT/session/new" \
              | grep -o 'name="authenticity_token" value="[^"]*"' | head -1 \
              | sed 's/.*value="//; s/"$//')"
     [[ -n "$token" ]] || die "no CSRF token at /session/new — is the server up on :$PORT?"

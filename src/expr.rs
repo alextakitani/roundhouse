@@ -21,6 +21,15 @@ use crate::ty::Ty;
 /// The source reference names a modeled class or module. The Ruby emitter
 /// uses its resolved `Ty::Class` when it changes lexical nesting.
 pub const RESOLVED_CLASS_REF: u64 = 1 << 2;
+/// The value is a proven class/module object, rather than a nominal instance.
+pub const CLASS_OBJECT_VALUE: u64 = 1 << 5;
+/// This receiver's operator call is backed by a registered method definition.
+pub const RESOLVED_OPERATOR_RECEIVER: u64 = 1 << 6;
+/// The cast's type was declared by source, rather than synthesized by lowering.
+pub const SOURCE_TYPE_ASCRIPTION: u64 = 1 << 7;
+/// A generated constant may borrow a source span for diagnostics/layout;
+/// that position is not a written Ruby constant reference to index.
+pub const GENERATED_CONST_REF: u64 = 1 << 4;
 
 /// An admitted library-class Data factory with its exact declaration identity.
 pub const RESOLVED_DATA_FACTORY: u64 = 1 << 3;
@@ -70,10 +79,6 @@ pub enum IrHint {
     /// On a string `Lit` ingested from `+"literal"` (an unfrozen copy).
     MutableStringLiteral,
 }
-
-/// A `Const` that is only the operand of `defined?(Foo)` or
-/// `defined?(A::B)`. It is not evaluated, resolved, or autoloaded.
-pub const DEFINED_CONSTANT: u64 = 1 << 3;
 
 /// The core typed λ-calculus. Ruby's ~80 AST node kinds collapse into ~15 here;
 /// everything else lives in the Rails dialect or is handled by normalization.
@@ -172,6 +177,9 @@ impl Expr {
     /// threading a span argument through every small IR constructor.
     pub fn inherit_span(&mut self, enclosing: Span) {
         if self.span.is_synthetic() {
+            if matches!(&*self.node, ExprNode::Const { .. }) {
+                self.decisions |= GENERATED_CONST_REF;
+            }
             self.span = enclosing;
         }
         let here = self.span;
@@ -450,6 +458,14 @@ pub enum ExprNode {
     /// positional/keyword/block provenance; never a user variable or
     /// an ordinary positional hash. Requires a forwarding formal.
     ForwardArgs,
+    /// Anonymous keyword forwarding (`**`) in call argument position.
+    /// This is an opaque packet sourced from the enclosing anonymous
+    /// keyword-rest formal, not a value or a synthetic local binding.
+    ForwardKeywords,
+    /// Native Ruby syntax query. The operand is syntax, not a value child:
+    /// generic typing/lowering must not resolve or rewrite it. Reachability
+    /// may inspect it to retain methods whose existence is being queried.
+    Defined { operand: Expr },
     /// Source keyword argument group containing `**expression`.
     /// The one value child is the existing ordered hash merge expression;
     /// it evaluates once. This is not a positional `{**hash}` literal.
@@ -552,6 +568,8 @@ impl ExprNode {
             ExprNode::Redo => "Redo",
             ExprNode::Splat { .. } => "Splat",
             ExprNode::ForwardArgs => "ForwardArgs",
+            ExprNode::ForwardKeywords => "ForwardKeywords",
+            ExprNode::Defined { .. } => "Defined",
             ExprNode::KeywordSplat { .. } => "KeywordSplat",
             ExprNode::MultiAssign { .. } => "MultiAssign",
             ExprNode::While { .. } => "While",
@@ -600,6 +618,8 @@ impl ExprNode {
             | ExprNode::Retry
             | ExprNode::Redo
             | ExprNode::ForwardArgs
+            | ExprNode::ForwardKeywords
+            | ExprNode::Defined { .. }
             | ExprNode::SelfRef => {}
             ExprNode::Hash { entries, .. } => {
                 for (k, v) in entries {
@@ -804,6 +824,8 @@ impl ExprNode {
             | ExprNode::Retry
             | ExprNode::Redo
             | ExprNode::ForwardArgs
+            | ExprNode::ForwardKeywords
+            | ExprNode::Defined { .. }
             | ExprNode::SelfRef => {}
             ExprNode::Hash { entries, .. } => {
                 for (k, v) in entries {

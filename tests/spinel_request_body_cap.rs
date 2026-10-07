@@ -24,11 +24,12 @@ fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn run_driver(cap: Option<&str>, checks: usize) {
+/// `cap` is the TEP_MAX_BODY_BYTES override and the cap it must produce.
+fn run_driver(cap: Option<(&str, u64)>, checks: usize) {
     let mut cmd = Command::new("ruby");
     cmd.arg(root().join("tests/spinel_request_body_cap.rb"));
     match cap {
-        Some(v) => cmd.env("TEP_MAX_BODY_BYTES", v),
+        Some((v, expect)) => cmd.env("TEP_MAX_BODY_BYTES", v).env("EXPECT_CAP", expect.to_string()),
         None => cmd.env_remove("TEP_MAX_BODY_BYTES"),
     };
     let out = cmd.output().expect("ruby is on PATH");
@@ -51,10 +52,26 @@ fn run_driver(cap: Option<&str>, checks: usize) {
 
 #[test]
 fn an_oversized_or_malformed_body_is_refused_from_the_headers() {
-    run_driver(None, 25);
+    run_driver(None, 26);
 }
 
 #[test]
 fn tep_max_body_bytes_moves_the_cap() {
-    run_driver(Some("1024"), 6);
+    run_driver(Some(("1024", 1024)), 10);
+}
+
+/// Zero padding is not magnitude. Over-18-digit overrides used to
+/// saturate to the same ceiling a huge Content-Length saturates to, so
+/// "…0001024" became a 10^18 cap that a 25-digit length compared equal
+/// to and passed.
+#[test]
+fn a_zero_padded_override_is_its_value() {
+    run_driver(Some(("0000000000000000001024", 1024)), 10);
+}
+
+/// An override too large to represent is not a cap: it leaves the
+/// default, and an over-18-digit Content-Length is still refused.
+#[test]
+fn an_unrepresentable_override_leaves_the_default() {
+    run_driver(Some(("9999999999999999999999999", 100 * 1024 * 1024)), 4);
 }

@@ -216,6 +216,7 @@ fn synthesize_module_lc(
         name: module_id,
         is_module: true,
         parent: None,
+        parent_span: Default::default(),
         includes: Vec::new(),
         methods,
         nullable_columns: Vec::new(),
@@ -498,6 +499,7 @@ fn collect_imports_for_function(
         )),
         is_module: true,
         parent: None,
+        parent_span: Default::default(),
         includes: Vec::new(),
         nullable_columns: Vec::new(),
         methods: vec![crate::dialect::MethodDef {
@@ -1527,6 +1529,8 @@ fn collect_class_refs(e: &Expr, out: &mut BTreeSet<String>) {
         | ExprNode::Retry
         | ExprNode::Redo
         | ExprNode::ForwardArgs
+        | ExprNode::ForwardKeywords
+        | ExprNode::Defined { .. }
         | ExprNode::SelfRef => {}
     }
 }
@@ -1774,6 +1778,8 @@ fn rewrite_free(e: &Expr) -> Expr {
         | ExprNode::Retry
         | ExprNode::Redo
         | ExprNode::ForwardArgs
+        | ExprNode::ForwardKeywords
+        | ExprNode::Defined { .. }
         | ExprNode::SelfRef => (*e.node).clone(),
     };
     Expr {
@@ -2065,6 +2071,8 @@ fn rewrite(e: &Expr, super_method: Option<&str>) -> Expr {
         | ExprNode::Retry
         | ExprNode::Redo
         | ExprNode::ForwardArgs
+        | ExprNode::ForwardKeywords
+        | ExprNode::Defined { .. }
         | ExprNode::SelfRef => (*e.node).clone(),
     };
 

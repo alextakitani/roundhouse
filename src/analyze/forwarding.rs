@@ -115,6 +115,36 @@ fn walk(
     e: &Expr,
     out: &mut Vec<Diagnostic>,
 ) {
+    let forwards_keywords = match &*e.node {
+        ExprNode::Send { args, .. } | ExprNode::Super { args: Some(args) } => args
+            .iter()
+            .any(|a| matches!(&*a.node, ExprNode::ForwardKeywords)),
+        _ => false,
+    };
+    if forwards_keywords {
+        let source_ok = enclosing.params.iter().any(|p| {
+            p.keyword && p.rest && p.name.as_str().is_empty() && !p.forwarding
+        });
+        let resolved = destination(app, contracts, Some((owner, enclosing)), e);
+        let reason = if !source_ok {
+            Some("anonymous keyword forwarding has no enclosing anonymous keyword-rest declaration")
+        } else if enclosing.unsupported_formals.is_some()
+            || contracts.unretained.contains(&enclosing.name_span)
+            || !contracts.verified_hierarchy(owner, &mut HashSet::new())
+        {
+            Some("anonymous keyword forwarding source declaration cannot be verified")
+        } else {
+            keyword_contract_error(Some((owner, enclosing)), e, resolved, contracts)
+        };
+        if let Some(reason) = reason {
+            out.push(Diagnostic::unsupported(
+                e.span,
+                None,
+                "anonymous keyword forwarding",
+                reason,
+            ));
+        }
+    }
     let forwards = match &*e.node {
         ExprNode::Send { args, .. } => has_forwarding(args),
         ExprNode::Super { args } => args
@@ -148,6 +178,44 @@ fn walk(
     }
     e.node
         .for_each_child(&mut |c| walk(app, contracts, owner, enclosing, c, out));
+}
+
+fn accepts_keywords(method: &MethodDef) -> bool {
+    method.params.iter().any(|p| p.forwarding || p.keyword)
+}
+
+fn keyword_contract_error(
+    context: Option<(&ClassId, &MethodDef)>,
+    call: &Expr,
+    resolved: Option<(&MethodDef, bool)>,
+    contracts: &SourceContractIndex<'_>,
+) -> Option<&'static str> {
+    let Some((method, _)) = resolved else {
+        return Some("forwarding destination's declaration cannot be verified");
+    };
+    if method.unsupported_formals.is_some() {
+        return Some("forwarding destination has an unrepresented parameter declaration");
+    }
+    if method.params.iter().any(|p| p.from_keyword || p.from_kwrest) {
+        return Some("forwarding destination has flattened keyword parameters");
+    }
+    if contracts.unretained.contains(&method.name_span) {
+        return Some("model method synthesis does not preserve this source declaration");
+    }
+    let Ok(destinations) = virtual_destinations(contracts, context, call) else {
+        return Some("forwarding destination's declaration cannot be verified");
+    };
+    if !accepts_keywords(method)
+        || destinations.iter().any(|(candidate, _)| {
+            !accepts_keywords(candidate)
+                || candidate.unsupported_formals.is_some()
+                || candidate.params.iter().any(|p| p.from_keyword || p.from_kwrest)
+                || contracts.unretained.contains(&candidate.name_span)
+        })
+    {
+        return Some("forwarding destination has no verified keyword parameter ABI");
+    }
+    None
 }
 
 fn destination<'a>(
@@ -233,7 +301,7 @@ fn association_method(app: &App, owner: &ClassId, method: &MethodDef) -> bool {
     })
 }
 
-fn declaration_error((method, model): (&MethodDef, bool)) -> Option<&'static str> {
+fn declaration_error((method, _model): (&MethodDef, bool)) -> Option<&'static str> {
     if method.unsupported_formals.is_some() {
         Some("forwarding destination has an unrepresented parameter declaration")
     } else if method.has_anonymous_block {
@@ -244,10 +312,6 @@ fn declaration_error((method, model): (&MethodDef, bool)) -> Option<&'static str
         .any(|p| p.from_keyword || p.from_kwrest)
     {
         Some("forwarding destination has flattened keyword parameters")
-    } else if model && !method.params.iter().any(|p| p.forwarding) {
-        Some(
-            "forwarding into a model callee with incomplete rest/block declaration retention is not supported yet",
-        )
     } else {
         None
     }
@@ -260,6 +324,15 @@ fn contract_error(
     contracts: &SourceContractIndex<'_>,
 ) -> Option<&'static str> {
     let Some(resolved) = resolved else {
+        // `super(...)` with no in-app ancestor — Campfire's
+        // `WebPush::Connections::Stages` is `extend`ed onto a
+        // `Net::HTTP` instance, so `super` lands on stdlib. We cannot
+        // verify that ABI from app source; allowing the forward is the
+        // honest alternative to residualizing a pattern RH Ruby/Spinel
+        // already emit and run.
+        if matches!(&*call.node, ExprNode::Super { .. }) {
+            return None;
+        }
         return Some("forwarding destination's declaration cannot be verified");
     };
     if let Some(error) = declaration_error(resolved) {

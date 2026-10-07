@@ -388,3 +388,46 @@ fn the_rbs_contract_declares_the_nullable_seam() {
         missing.join(", ")
     );
 }
+
+/// The request-lifecycle hooks the Ruby-family dispatcher and test
+/// harness call unconditionally (runtime/spinel/scaffold/ruby_overlay/
+/// main.rb, config.ru, test/test_helper.rb, tep/app.rb). The CRuby and
+/// Spinel shims implement them (tests/db_sqlite_concurrency.rs); a shim
+/// that has not yet (JDBC) must still define them as no-ops, or every
+/// request on that lane raises
+/// NoMethodError. Strict targets have no such dispatcher, so only the
+/// Ruby family is held to this.
+const RUBY_FAMILY_LIFECYCLE: &[&str] = &[
+    "read_snapshot_begin",
+    "read_snapshot_end",
+    "checkpoint_in_background!",
+];
+
+#[test]
+fn ruby_family_shims_declare_optional_binds() {
+    let rbs = read_shim("runtime/ruby/db.rbs");
+    for method in ["bind_int_opt", "bind_text_opt", "bind_bool_opt"] {
+        assert!(defines_in_rbs(&rbs, method), "missing RBS: {method}");
+        for path in ["runtime/spinel/db.rb", "runtime/spinel/db_cruby.rb", "runtime/spinel/db_jruby.rb"] {
+            assert!(defines_with(&read_shim(path), method, &["def self."], false, false), "{path}: {method}");
+        }
+    }
+}
+
+#[test]
+fn every_ruby_family_shim_defines_the_request_lifecycle_hooks() {
+    let mut missing: Vec<String> = Vec::new();
+    for shim in SHIMS.iter().filter(|s| s.path.starts_with("runtime/spinel/")) {
+        let src = read_shim(shim.path);
+        for method in RUBY_FAMILY_LIFECYCLE {
+            if !defines_with(&src, method, shim.def_forms, shim.map_entry, shim.type_before_name) {
+                missing.push(format!("{} is missing `{method}`", shim.path));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "Ruby-family Db shims missing request-lifecycle hooks:\n  {}",
+        missing.join("\n  ")
+    );
+}

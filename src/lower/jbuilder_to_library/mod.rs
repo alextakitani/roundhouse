@@ -44,6 +44,15 @@
 //!  12. `x = <expr>`                    → kept as written, in place; a
 //!                                       local the template reads
 //!                                       later
+//!  13. `json.<key> col do |x| … end`   → one pair whose value is an
+//!                                       array, one object per element
+//!                                       built by the block
+//!  14. `json.array! col do |x| … end`  → the same array, as the whole
+//!                                       template
+//!  15. `json.partial! @record`         → (4) with the path Rails takes
+//!                                       from the record's model
+//!                                       (`partial:` and `as:` after
+//!                                       the record do not change it)
 //!
 //! (6)-(9) arrived together with campfire's bot API, which is six
 //! jbuilder templates written in exactly that dialect.
@@ -58,7 +67,7 @@
 //! whole record.
 //!
 //! Still deferred: `json.merge!`, `json.key_format!`, `json.ignore_nil!`,
-//! `json.child!`, and the block form of `array!`.
+//! and `json.child!`.
 
 use crate::App;
 use crate::dialect::{AccessorKind, LibraryClass, MethodDef, MethodReceiver, Param, View};
@@ -151,13 +160,43 @@ pub fn lower_jbuilder_to_library_classes(
             // both arguments reached the helper whole, so every boost's
             // `url` read `/rooms/#<Room:0x…>/messages/#<Message:0x…>`.
             // Same pass the controller and test bodies run, for the
-            // same reason and with the same idempotence.
-            method.body = crate::lower::controller_to_library::rewrites::
-                project_route_helper_ids(&method.body);
-            crate::lower::typing::type_method_body(method, &classes, &empty_ivars);
+            // same reason and with the same idempotence. In-place + skip
+            // the follow-up type when the projection is a no-op — the
+            // cloning entry re-walked every jbuilder body twice.
+            if crate::lower::controller_to_library::rewrites::
+                project_route_helper_ids_in_place(&mut method.body)
+            {
+                crate::lower::typing::type_method_body(method, &classes, &empty_ivars);
+            }
         }
     }
     lcs
+}
+
+/// Untyped jbuilder LibraryClasses — method signatures only. The
+/// controller lowerer registers these so `Views::X.<action>_json`
+/// resolves; body typing is the jbuilder lowerer's job.
+pub fn jbuilder_signature_classes(views: &[View], app: &App) -> Vec<LibraryClass> {
+    views
+        .iter()
+        .filter(|v| v.jbuilder && !v.analysis_only)
+        .map(|v| {
+            let (module_id, method) = jbuilder_signature_method(v, app);
+            LibraryClass {
+                name: module_id,
+                is_module: true,
+                parent: None,
+                parent_span: Default::default(),
+                includes: Vec::new(),
+                methods: vec![method],
+                nullable_columns: Vec::new(),
+                origin: None,
+                constants: Vec::new(),
+                unknown_calls: Vec::new(),
+                class_ivar_initializers: Vec::new(),
+            }
+        })
+        .collect()
 }
 
 /// Single-template entry. Used by tests and the dump_ir binary; the
@@ -170,7 +209,85 @@ fn build_library_class(view: &View, app: &App, type_body: bool) -> LibraryClass 
     let (dir, base) = split_view_name(view.name.as_str());
     let stem = base.trim_start_matches('_');
     let is_partial = base.starts_with('_');
+    let (module_id, mut method, arg_name, _extra_params, known_models) =
+        jbuilder_method_parts(view, app, dir, stem, is_partial);
 
+    // Rewrite `@ivar` → bare `ivar` so the inferred arg / extras
+    // read as plain locals. Mirrors the ERB lowerer.
+    let rewritten = rewrite_ivars_to_locals(&view.body);
+
+    let arg_columns = if arg_name.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        columns_for_arg(&arg_name, dir, is_partial, stem, app)
+    };
+    let ctx = Ctx {
+        resource_dir: dir.to_string(),
+        accumulator: "io".to_string(),
+        arg_name: arg_name.clone(),
+        arg_columns,
+        direct_helpers: app
+            .routes
+            .direct_helpers
+            .iter()
+            .map(|h| h.name.as_str().to_string())
+            .collect(),
+        models: known_models.iter().cloned().collect(),
+        temps: Default::default(),
+    };
+
+    let mut body_stmts: Vec<Expr> = Vec::new();
+    body_stmts.push(assign_accumulator_string_new(&ctx.accumulator));
+    body_stmts.extend(walk_template(&rewritten, &ctx));
+    let mut result = var_ref(Symbol::from(ctx.accumulator.as_str()));
+    result.hint = Some(IrHint::StringBuilderResult);
+    body_stmts.push(result);
+
+    let mut body = seq(body_stmts);
+    // File-grain catch-all: whatever the walk-level stamps didn't reach
+    // (`io = String.new`, the `{`/`}` wrappers, the trailing `io`)
+    // attributes to the template as a whole — same convention as the
+    // ERB lowerer.
+    body.inherit_span(view.body.span);
+    method.body = body;
+
+    if type_body {
+        type_method_body_solo(&mut method);
+    }
+
+    LibraryClass {
+        name: module_id,
+        is_module: true,
+        parent: None,
+        parent_span: Default::default(),
+        includes: Vec::new(),
+        methods: vec![method],
+        nullable_columns: Vec::new(),
+        origin: None,
+        constants: Vec::new(),
+        unknown_calls: Vec::new(),
+        class_ivar_initializers: Vec::new(),
+    }
+}
+
+fn jbuilder_signature_method(view: &View, app: &App) -> (ClassId, MethodDef) {
+    let (dir, base) = split_view_name(view.name.as_str());
+    let stem = base.trim_start_matches('_');
+    let is_partial = base.starts_with('_');
+    let (module_id, method, _, _, _) = jbuilder_method_parts(view, app, dir, stem, is_partial);
+    (module_id, method)
+}
+
+/// Params + signature for a jbuilder template. The controller lowerer
+/// only needs this shape; `build_library_class` then walks the template
+/// into `method.body`.
+fn jbuilder_method_parts(
+    view: &View,
+    app: &App,
+    dir: &str,
+    stem: &str,
+    is_partial: bool,
+) -> (ClassId, MethodDef, String, Vec<String>, Vec<String>) {
     let module_id = view_module_id(dir);
     let method_name = Symbol::from(format!("{stem}_json"));
 
@@ -180,10 +297,6 @@ fn build_library_class(view: &View, app: &App, type_body: bool) -> LibraryClass 
         .map(|m| m.name.0.as_str().to_string())
         .collect();
     let arg_name = infer_view_arg(stem, dir, is_partial, &known_models);
-
-    // Rewrite `@ivar` → bare `ivar` so the inferred arg / extras
-    // read as plain locals. Mirrors the ERB lowerer.
-    let rewritten = rewrite_ivars_to_locals(&view.body);
 
     // The IVARS THIS TEMPLATE READS decide an action view's parameters,
     // and the NAME CONVENTION is only the fallback.
@@ -250,40 +363,7 @@ fn build_library_class(view: &View, app: &App, type_body: bool) -> LibraryClass 
         crate::lower::view_to_library::build_view_signature_from(&typed, &extra_params)
     };
 
-    let arg_columns = if arg_name.is_empty() {
-        std::collections::HashMap::new()
-    } else {
-        columns_for_arg(&arg_name, dir, is_partial, stem, app)
-    };
-    let ctx = Ctx {
-        resource_dir: dir.to_string(),
-        accumulator: "io".to_string(),
-        arg_name: arg_name.clone(),
-        arg_columns,
-        direct_helpers: app
-            .routes
-            .direct_helpers
-            .iter()
-            .map(|h| h.name.as_str().to_string())
-            .collect(),
-        models: known_models.iter().cloned().collect(),
-    };
-
-    let mut body_stmts: Vec<Expr> = Vec::new();
-    body_stmts.push(assign_accumulator_string_new(&ctx.accumulator));
-    body_stmts.extend(walk_template(&rewritten, &ctx));
-    let mut result = var_ref(Symbol::from(ctx.accumulator.as_str()));
-    result.hint = Some(IrHint::StringBuilderResult);
-    body_stmts.push(result);
-
-    let mut body = seq(body_stmts);
-    // File-grain catch-all: whatever the walk-level stamps didn't reach
-    // (`io = String.new`, the `{`/`}` wrappers, the trailing `io`)
-    // attributes to the template as a whole — same convention as the
-    // ERB lowerer.
-    body.inherit_span(view.body.span);
-
-    let mut method = MethodDef {
+    let method = MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
         unsupported_formals: None,
         has_anonymous_block: false,
@@ -291,32 +371,16 @@ fn build_library_class(view: &View, app: &App, type_body: bool) -> LibraryClass 
         name: method_name,
         receiver: MethodReceiver::Class,
         params,
-        body,
+        body: seq(Vec::new()),
         signature,
         effects: EffectSet::default(),
         enclosing_class: Some(module_id.0.clone()),
         kind: AccessorKind::Method,
         is_async: false,
-            mutates_self: false,
-            block_param: None,
+        mutates_self: false,
+        block_param: None,
     };
-
-    if type_body {
-        type_method_body_solo(&mut method);
-    }
-
-    LibraryClass {
-        name: module_id,
-        is_module: true,
-        parent: None,
-        includes: Vec::new(),
-        methods: vec![method],
-        nullable_columns: Vec::new(),
-        origin: None,
-        constants: Vec::new(),
-        unknown_calls: Vec::new(),
-        class_ivar_initializers: Vec::new(),
-    }
+    (module_id, method, arg_name, extra_params, known_models)
 }
 
 fn type_method_body_solo(method: &mut MethodDef) {
@@ -341,6 +405,7 @@ fn type_method_body_solo(method: &mut MethodDef) {
 
 // ── walker ───────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct Ctx {
     /// Source directory of the template — `articles` for
     /// `articles/_article.json.jbuilder`. Used by partial resolution
@@ -375,6 +440,10 @@ struct Ctx {
     /// template SOLO, with only framework stubs registered, so
     /// `boost.message.room` has no type to ask.
     models: std::collections::HashSet<String>,
+    /// Counter for the method's synthesized collection locals
+    /// (`__col0`, `__col1`, …), shared by every clone of the template's
+    /// `Ctx` so two collection blocks never bind the same name.
+    temps: std::rc::Rc<std::cell::Cell<usize>>,
 }
 
 /// Classification of a single top-level statement in a jbuilder
@@ -399,6 +468,10 @@ enum JbStmt<'a> {
         partial_path: String,
         arg: &'a Expr,
     },
+    /// `json.partial! @record` — the same call, with the path Rails
+    /// takes from the record (`to_partial_path`). Resolved at emit time,
+    /// where the app's models are known.
+    PartialRecord { arg: &'a Expr, as_name: Option<Symbol> },
     /// `json.<key> obj, partial: P, as: V` — one pair whose value is a
     /// partial render of a SINGLE object. The `array!`/`partial!`
     /// siblings above render a collection and own the whole template;
@@ -428,6 +501,21 @@ enum JbStmt<'a> {
     /// `x = <expr>` — a template local. Emitted as written; it adds
     /// no pair.
     Local,
+    /// `json.<key> col do |x| … end` — one pair whose value is an array
+    /// with one element per member of `col`, each built by the block.
+    PairBlock {
+        key: Symbol,
+        collection: &'a Expr,
+        item_var: Symbol,
+        body: &'a Expr,
+    },
+    /// `json.array! col do |x| … end` — the same array as the whole
+    /// template.
+    ArrayBlock {
+        collection: &'a Expr,
+        item_var: Symbol,
+        body: &'a Expr,
+    },
     /// Unrecognized DSL or non-Send statement. Surfaces as an empty io
     /// append so the lowered body stays well-formed.
     Unknown,
@@ -498,6 +586,13 @@ fn emit_object(raw_stmts: &[&Expr], ctx: &Ctx) -> Vec<Expr> {
             }
             JbStmt::Partial { partial_path, arg } => {
                 Some(emit_partial_call(partial_path, arg, ctx))
+            }
+            JbStmt::ArrayBlock { collection, item_var, body } => {
+                Some(emit_array_block(collection, item_var, body, ctx))
+            }
+            JbStmt::PartialRecord { arg, as_name } => {
+                record_partial_path(arg, as_name.as_ref(), ctx)
+                    .map(|partial_path| emit_partial_call(&partial_path, arg, ctx))
             }
             _ => None,
         };
@@ -669,7 +764,19 @@ fn emit_pairs(
                 ));
                 sep = Sep::After;
             }
-            JbStmt::ArrayPartial { .. } | JbStmt::Partial { .. } => {
+            JbStmt::PairBlock { key, collection, item_var, body } => {
+                push_separator(out, ctx, sep);
+                out.push(io_append_lit(
+                    &ctx.accumulator,
+                    &format!("\"{}\":", key.as_str()),
+                ));
+                out.extend(emit_array_block(collection, item_var, body, ctx));
+                sep = Sep::After;
+            }
+            JbStmt::ArrayPartial { .. }
+            | JbStmt::Partial { .. }
+            | JbStmt::ArrayBlock { .. }
+            | JbStmt::PartialRecord { .. } => {
                 // These shouldn't appear in an object template, but if
                 // they do (mixed with pair-emitting stmts), drop a
                 // TODO marker rather than emit malformed JSON.
@@ -877,6 +984,17 @@ fn classify<'a>(stmt: &'a Expr) -> JbStmt<'a> {
             let Some(collection) = args.first() else {
                 return JbStmt::Unknown;
             };
+            // `json.array! col do |x| … end` — the block builds each
+            // element. Only with no options: Jbuilder renders a
+            // `partial:` before it looks at a block.
+            if args.len() == 1 {
+                if let Some((item_var, body)) = item_block(block) {
+                    if !element_body_supported(body) {
+                        return JbStmt::Unknown;
+                    }
+                    return JbStmt::ArrayBlock { collection, item_var, body };
+                }
+            }
             let Some(opts) = args.iter().skip(1).find_map(extract_hash) else {
                 return JbStmt::Unknown;
             };
@@ -927,6 +1045,47 @@ fn classify<'a>(stmt: &'a Expr) -> JbStmt<'a> {
             let Some(path_arg) = args.first() else {
                 return JbStmt::Unknown;
             };
+            // `json.partial! @record` — a positional that is a record,
+            // not a path. Jbuilder renders the record's own partial
+            // (`record.to_partial_path`) with the record as its local.
+            // `partial:` and `as:` after it do not change that:
+            // jbuilder's `partial!` sets `options[:partial]` to the
+            // positional, over the option, and `as:` only names the
+            // local (`record_partial_path` checks it is the name the
+            // lowered partial takes the record under). Any other
+            // option is a local for the partial, which the call has no
+            // way to pass, so that form stays Unknown.
+            if block.is_none() && local_name(path_arg).is_some() {
+                let options_ok = match args.len() {
+                    1 => true,
+                    2 => extract_hash(&args[1]).is_some_and(|opts| {
+                        opts.iter().all(|(k, _)| {
+                            matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } }
+                                if matches!(value.as_str(), "partial" | "as"))
+                        })
+                    }),
+                    _ => false,
+                };
+                if !options_ok {
+                    return JbStmt::Unknown;
+                }
+                // `as:` is a Symbol or a String: Action View `to_sym`s
+                // it (`as: "entry"` binds `entry`). Any other value is
+                // a name only known at run time.
+                let as_value =
+                    args.get(1).and_then(extract_hash).and_then(|opts| hash_get_value(opts, "as"));
+                let as_name = match as_value {
+                    None => None,
+                    Some(v) => match &*v.node {
+                        ExprNode::Lit { value: Literal::Sym { value } } => Some(value.clone()),
+                        _ => match string_literal(v) {
+                            Some(s) => Some(Symbol::from(s.as_str())),
+                            None => return JbStmt::Unknown,
+                        },
+                    },
+                };
+                return JbStmt::PartialRecord { arg: path_arg, as_name };
+            }
             let partial_path = match string_literal(path_arg) {
                 Some(s) => s,
                 None => return JbStmt::Unknown,
@@ -956,6 +1115,25 @@ fn classify<'a>(stmt: &'a Expr) -> JbStmt<'a> {
             };
             JbStmt::Nested { key: Symbol::from(key), body }
         }
+        // `json.<key> col do |x| … end` — Jbuilder's `set!` with a value
+        // AND a block is `array!` on the value under that key: an array
+        // of objects, one per element, each built by the block. Checked
+        // before the single-pair shape below, which would otherwise take
+        // the collection as the value and drop the block.
+        key if args.len() == 1 && block.is_some() => {
+            let Some((item_var, body)) = item_block(block) else {
+                return JbStmt::Unknown;
+            };
+            if !element_body_supported(body) {
+                return JbStmt::Unknown;
+            }
+            JbStmt::PairBlock {
+                key: Symbol::from(key),
+                collection: &args[0],
+                item_var,
+                body,
+            }
+        }
         // `json.<key> <expr>` — single-pair shape. The method name IS
         // the JSON key; the single positional arg is the value.
         key if args.len() == 1 => JbStmt::Pair {
@@ -982,6 +1160,58 @@ fn classify<'a>(stmt: &'a Expr) -> JbStmt<'a> {
         }
         _ => JbStmt::Unknown,
     }
+}
+
+/// The element variable and body of a one-parameter block,
+/// `do |x| … end` / `{ |x| … }`. Anything else is not the shape.
+fn item_block(block: &Option<Expr>) -> Option<(Symbol, &Expr)> {
+    let block = block.as_ref()?;
+    let ExprNode::Lambda { params, rest_param: None, body, .. } = &*block.node else {
+        return None;
+    };
+    let [item_var] = params.as_slice() else {
+        return None;
+    };
+    Some((item_var.clone(), body))
+}
+
+/// Whether a collection block's body lowers to the element Jbuilder
+/// builds. A lone `json.partial!` is the element; a partial next to
+/// other statements (or under a branch) renders into the same element
+/// in Jbuilder, which the object walker cannot do yet: it writes a
+/// partial there as an empty append and the element would lose the
+/// partial's fields. Such a body is reported as unsupported and the
+/// statement stays Unknown, rather than lowered without them. The same
+/// holds for a partial inside a nested `json.<key> do … end` object of
+/// the element, which the object walker writes the same way.
+fn element_body_supported(body: &Expr) -> bool {
+    fn has_partial(stmts: &[&Expr]) -> bool {
+        stmts.iter().any(|s| match classify(s) {
+            JbStmt::Partial { .. } => true,
+            JbStmt::Cond { then_branch, else_branch, .. } => {
+                has_partial(&branch_stmts(then_branch)) || has_partial(&branch_stmts(else_branch))
+            }
+            JbStmt::Nested { body, .. } => has_partial(&flatten_cache_blocks(stmts_of(body))),
+            JbStmt::Guarded { body, rescues } => {
+                has_partial(&branch_stmts(body))
+                    || rescues.iter().any(|r| has_partial(&branch_stmts(&r.body)))
+            }
+            _ => false,
+        })
+    }
+    let stmts = flatten_cache_blocks(stmts_of(body));
+    if stmts.len() == 1 && matches!(classify(stmts[0]), JbStmt::Partial { .. }) {
+        return true;
+    }
+    if !has_partial(&stmts) {
+        return true;
+    }
+    crate::ingest::survey::record(&crate::ingest::IngestError::Unsupported {
+        file: String::new(),
+        message: "jbuilder: a collection block that mixes `json.partial!` with other statements is not compiled"
+            .to_string(),
+    });
+    false
 }
 
 /// `json` parsed as a bare method call: `Send { recv: None, method:
@@ -1128,6 +1358,154 @@ fn emit_array_partial(
     out.push(io_append_call(&ctx.accumulator, joined));
     out.push(io_append_lit(&ctx.accumulator, "]"));
     out
+}
+
+/// An array with one element per member of `collection`, each element
+/// the JSON the block's body builds for it:
+///
+///   __col0 = col
+///   io << "["
+///   if !(__col0.nil?)
+///     io << __col0.map do |x|
+///       io_x = String.new
+///       io_x << "{" … io_x << "}"
+///       io_x
+///     end.join(",")
+///   end
+///   io << "]"
+///
+/// Same map+join as `emit_array_partial`; the element is the block's
+/// body walked as a template of its own, into its own accumulator. A
+/// body that is one `json.partial!` call is that call, without the
+/// accumulator around it. The collection is bound once to a `__col<n>`
+/// local, so an expression (`@widget.parts`) is not evaluated twice by
+/// the nil check and the `map`.
+fn emit_array_block(collection: &Expr, item_var: &Symbol, body: &Expr, ctx: &Ctx) -> Vec<Expr> {
+    let stmts = flatten_cache_blocks(stmts_of(body));
+    let single_partial = match stmts.as_slice() {
+        [only] => match classify(only) {
+            JbStmt::Partial { partial_path, arg } => Some((partial_path, arg)),
+            _ => None,
+        },
+        _ => None,
+    };
+    // A one-call element reads as a one-line `{ |x| … }`; a built one
+    // is several statements and takes `do |x| … end`.
+    let block_style = if single_partial.is_some() {
+        crate::expr::BlockStyle::Brace
+    } else {
+        crate::expr::BlockStyle::Do
+    };
+    let element = match single_partial {
+        Some((partial_path, arg)) => {
+            let (mod_path, method) = partial_target(&partial_path, &ctx.resource_dir);
+            // The argument gets the rewrites a `PairPartial` argument
+            // gets (`<x>_url` to `RouteHelpers.<x>_path`, `h`).
+            send(
+                Some(const_path(&mod_path)),
+                &format!("{method}_json"),
+                vec![rewrite_h_escape(&rewrite_route_helpers(arg, ctx))],
+                None,
+                true,
+            )
+        }
+        None => {
+            let mut inner = ctx.clone();
+            inner.accumulator = format!("{}_{}", ctx.accumulator, item_var.as_str());
+            let mut exprs = vec![assign_accumulator_string_new(&inner.accumulator)];
+            exprs.extend(emit_object(&stmts, &inner));
+            let mut result = var_ref(Symbol::from(inner.accumulator.as_str()));
+            result.hint = Some(IrHint::StringBuilderResult);
+            exprs.push(result);
+            seq(exprs)
+        }
+    };
+
+    let block = Expr::new(
+        Span::synthetic(),
+        ExprNode::Lambda {
+            rest_param: None,
+            params: vec![item_var.clone()],
+            block_param: None,
+            body: element,
+            block_style,
+        },
+    );
+    let n = ctx.temps.get();
+    ctx.temps.set(n + 1);
+    let col = Symbol::from(format!("__col{n}"));
+    let bind = Expr::new(
+        Span::synthetic(),
+        ExprNode::Assign {
+            target: LValue::Var { id: VarId(0), name: col.clone() },
+            value: collection.clone(),
+        },
+    );
+    let mapped = send(Some(var_ref(col.clone())), "map", Vec::new(), Some(block), false);
+    let joined = send(Some(mapped), "join", vec![lit_str(",".to_string())], None, true);
+    // Jbuilder's `array!` answers `[]` for a nil collection, and
+    // `json.<key>(nil) { … }` goes through it.
+    let present = send(
+        Some(send(Some(var_ref(col)), "nil?", Vec::new(), None, false)),
+        "!",
+        Vec::new(),
+        None,
+        false,
+    );
+    vec![
+        bind,
+        io_append_lit(&ctx.accumulator, "["),
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::If {
+                cond: present,
+                then_branch: io_append_call(&ctx.accumulator, joined),
+                else_branch: seq(Vec::new()),
+            },
+        ),
+        io_append_lit(&ctx.accumulator, "]"),
+    ]
+}
+
+/// The partial path `json.partial! <local>` renders: Active Model's
+/// `to_partial_path`, `"<plural>/<singular>"` of the record's model
+/// (`widgets/widget` for a `Widget`), under the namespace of the
+/// template's own directory (`admin/widgets/widget` from
+/// `admin/widgets/`), which is Action View's
+/// `prefix_partial_path_with_controller_namespace` default. The model
+/// is the one the local is named after, the same name-to-model reading
+/// the template's parameters get (`ivar_ty`). Unresolved when the
+/// local names no model of the app, or when `as:` names the partial's
+/// local something other than the model's singular: the lowered partial
+/// takes its record under that singular, and a partial reading the
+/// `as:` name would not find it.
+fn record_partial_path(arg: &Expr, as_name: Option<&Symbol>, ctx: &Ctx) -> Option<String> {
+    let name = local_name(arg)?;
+    let model = crate::naming::camelize(name.as_str());
+    if !ctx.models.contains(&model) {
+        return None;
+    }
+    let singular = crate::naming::snake_case(&model);
+    if as_name.is_some_and(|a| a.as_str() != singular) {
+        return None;
+    }
+    let path = format!("{}/{}", crate::naming::pluralize_snake(&model), singular);
+    Some(match ctx.resource_dir.rsplit_once('/') {
+        Some((namespace, _)) => format!("{namespace}/{path}"),
+        None => path,
+    })
+}
+
+/// The name of a bare local: a `Var`, or the receiverless, argless,
+/// blockless `Send` prism gives a partial's locals.
+fn local_name(e: &Expr) -> Option<Symbol> {
+    match &*e.node {
+        ExprNode::Var { name, .. } => Some(name.clone()),
+        ExprNode::Send { recv: None, method, args, block: None, .. } if args.is_empty() => {
+            Some(method.clone())
+        }
+        _ => None,
+    }
 }
 
 fn emit_partial_call(partial_path: &str, arg: &Expr, ctx: &Ctx) -> Vec<Expr> {

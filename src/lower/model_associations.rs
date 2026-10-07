@@ -261,12 +261,15 @@ mod tests {
         Model {
             name: cid(name),
             parent: None,
+            parent_span: Default::default(),
             table: TableRef(sym(&name.to_lowercase())),
             primary_key: None,
             attributes: Row::default(),
             body,
             enums: indexmap::IndexMap::new(),
             enum_defaults: indexmap::IndexMap::new(),
+            class_attr_defaults: indexmap::IndexMap::new(),
+            lexical_json_shadow: false,
             sti_subclass_names: Vec::new(),
             span: crate::span::Span::synthetic(),
         }
@@ -277,6 +280,7 @@ mod tests {
             name: sym(name),
             target: cid(target),
             foreign_key: sym(fk),
+            foreign_key_explicit: false,
             through: None,
             dependent: Dependent::None,
             as_interface: None,
@@ -295,6 +299,8 @@ mod tests {
             polymorphic_targets: vec![],
             default: None,
             touch: None,
+            foreign_type: None,
+            primary_key: None,
         }
     }
 

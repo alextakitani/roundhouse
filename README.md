@@ -60,8 +60,9 @@ oracle: the same URL fetched from Rails and from each target must
 produce the same response — emitted tests, a differential compare
 against live Rails (DOM node for DOM node, JSON value for value), and
 browser end-to-end tests for what a static diff can't reach — and
-the full target matrix runs after merge to `main` and in scheduled
-validation, with a Ruby floor and targeted additions on pull requests. →
+the full target matrix runs in scheduled validation, with a Ruby floor
+and targeted additions on pull requests (canonical `main` keeps Ruby
+plus Spinel). →
 [`--target`](docs/guide/transpile.md) · [targets](docs/guide/targets.md)
 · [what of Rails comes through](docs/guide/rails-coverage.md) ·
 [verifying](docs/guide/verifying.md)
@@ -177,6 +178,12 @@ Include a repro, a regression test, and what you verified. Start with
 [invariants](AGENTS.md). CI selects a Ruby floor plus targeted checks;
 see [CI for contributors](docs/ci/README.md) to request full/fresh validation
 and interpret advisory results. PR validation never deploys Pages.
+
+Contributors also have a chat room. It is Campfire, compiled by
+Roundhouse and running on Spinel, so everyone in it is also testing
+it. The invite link isn't posted publicly; if you have opened an issue
+or pull request and would like to join, say so there and you'll get an
+invite privately.
 
 ## License
 

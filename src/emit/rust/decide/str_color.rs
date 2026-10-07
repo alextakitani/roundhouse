@@ -852,6 +852,8 @@ fn walk_children(e: &mut Expr, tail_expect: ParentExpect, ctx: &mut WalkCtx<'_>)
         | ExprNode::Break { value: None }
         | ExprNode::Retry
         | ExprNode::ForwardArgs
+        | ExprNode::ForwardKeywords
+        | ExprNode::Defined { .. }
         | ExprNode::Redo => {}
     }
     count
@@ -1066,6 +1068,7 @@ mod tests {
             name: ClassId(Symbol::from(name)),
             is_module: false,
             parent: None,
+            parent_span: Default::default(),
             includes: vec![],
             methods,
             nullable_columns: Vec::new(),

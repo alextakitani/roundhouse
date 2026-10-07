@@ -97,6 +97,9 @@ ENV["TZ"] = ActiveSupport::RAILS_TZ_TO_IANA.fetch(
   Rails.application.config_time_zone, Rails.application.config_time_zone
 )
 require_relative "runtime/active_record"
+# Default as_json → _as_json_only. Date-column rewrite is injected only
+# when app_uses_date (see project::spinel_files); Campfire omits Date.
+require_relative "runtime/active_record_serialization"
 # Record equality (same class + same persisted id) — a reopen of
 # ActiveRecord::Base; the CRuby overlay's twin is active_record_bang.rb.
 require_relative "runtime/active_record_equality_spinel"
@@ -115,6 +118,9 @@ require_relative "runtime/action_controller"
 # chain defines. `multipart` first: `Blob.from_attachable` narrows to
 # the `UploadedFile` it defines.
 require_relative "runtime/multipart"
+# MIME registry — `ActiveStorage.content_type_for_filename` looks up
+# extensions through `Mime::Type` when `attach` omits `content_type:`.
+require_relative "runtime/mime"
 require_relative "runtime/active_storage"
 require_relative "runtime/active_storage_disk"
 # The image processor behind variants: a comment-only stub unless the
@@ -145,6 +151,10 @@ require_relative "runtime/active_job"
 # Per-request state per THREAD -- reopens Current, the view slots, the
 # broadcast log, the job queue and the store memo (see the file).
 require_relative "runtime/thread_state"
+# Returning view wrappers call ViewBufferCap.alloc/store (see
+# lower::view_buffer_passing). Spinel's file is a no-op stub; the CRuby
+# overlay replaces it with a thread-variable memo + String.new(capacity:).
+require_relative "runtime/view_buffer_cap"
 require_relative "runtime/tep/tep"
 # Spinel-only CGI reopen: `require "cgi"` reaches spinel's bundled package
 # and this adds `parse`, which upstream moved to `cgi/core`. CRuby/JRuby use

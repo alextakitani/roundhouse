@@ -94,7 +94,9 @@ module Tep
       if cl < 0
         return 400
       end
-      if cl > max
+      # A saturated length is "too large to represent", refused whatever
+      # `max` is — never compared as a size (see Tep.decimal_byte_count).
+      if cl >= Tep::BYTE_COUNT_CEILING || cl > max
         return 413
       end
       0

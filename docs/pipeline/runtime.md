@@ -170,6 +170,25 @@ it. Snapshot tests + toolchain tests catch drift.
 
 ## Emitter ↔ runtime contract
 
+Ruby-family lowered equality reads select SQL from the runtime value: a
+non-nil value uses `col = ?` and a bind; nil uses `col IS NULL` without a slot.
+The same branch selects the fragment and reserves its running bind position,
+so later predicates cannot shift out of alignment. Inline emission uses
+`col = <escaped value>` or `col IS NULL`. `IS ?` is deliberately avoided:
+SQLite excludes `IS` from its [partial-index non-null implication rule](https://www.sqlite.org/partialindex.html#queries_using_partial_indexes).
+
+Each nullable predicate contributes two possible fragments. Code size stays
+linear: no query variants are enumerated in the compiler. A bound query with
+up to seven nullable predicates has at most 128 shapes; queries above that
+budget use `prepare_uncached`, avoiding exponential growth within a long
+lease. Existing per-connection cache limits still apply across query sites.
+Strict-target lowering retains its existing predicates and lifecycle.
+
+Generated Ruby-family reads use `ensure Db.finalize(stmt)` around binding,
+serialization after prepare, stepping and hydration, including reload and
+preloads. Text preprocessing failures also release the binder's checkout.
+Cleanup therefore completes before a caller rescues within an ongoing lease.
+
 For each target:
 
 - **Emitter assumes** specific function names, signatures, and
@@ -206,6 +225,44 @@ instead. **A divergence must be recorded here when it is chosen**: an
 undocumented one reads as intent to the next session precisely because
 it is applied consistently, and the emit gives no signal that anyone
 weighed it.
+
+### Spinel `Date` is a bounded runtime value
+
+The Spinel target defines a small `Date` class in
+`runtime/spinel/date.rb` for Rails date columns. It stores a Gregorian
+year, month, and day; database storage and JSON use `YYYY-MM-DD`, with
+no clock or zone. Its ISO parser accepts only that exact format and
+validates the calendar date.
+
+This is not Ruby's stdlib `date` package. `DateTime`, Julian/Italian
+calendar modes, natural-language and non-ISO parsing, schema date
+defaults, ActiveSupport date extensions beyond `Date.current` and the
+month/day edges `time_calendar` lowers, date picker helpers, and
+`require "date"` are not included. `strftime` implements the date
+directives used by the admitted runtime contract and raises on other
+directives. The compiler continues diagnosing those unsupported paths.
+JRuby and other targets keep their existing Date boundary until they
+have their own runtime.
+
+The Date package — `runtime/spinel/date.rb`, date parse/format
+(`active_support_date_parsing.rb`), the date JSON rewrite
+(`active_record_date_serialization.rb`), matching RBS, and boot
+requires — is injected only when `app_uses_date` is true (schema date
+columns or date values in emitted roots). Default `as_json` stays
+always-on via `active_record_serialization.rb`. Loading
+`Date#strftime` into every Spinel app currently breaks poly
+`Time | Date` receivers for `Time#strftime` (matz/spinel#7334);
+Campfire has no date columns and must not pay that cost. Once upstream
+fixes the poly method table, unconditional load is safe again.
+
+Date-column JSON is rewritten in the omit-gated Spinel reopen (after
+the shared time-aware `_as_json_only`), not in `runtime/ruby/
+active_record/connection.rb` — the CRuby overlay has its own
+reflection-aware Date path, and a shared date branch would tax Bar B /
+AR RBS probes for every app. Raw `where(due_on: some_date)` predicates
+format through `SqliteAdapter.escape_value` →
+`ActiveSupport.format_db_date` so the SQL compares against
+`YYYY-MM-DD` text, not a timestamp.
 
 ### `id` is `0` before save, not `nil` (`""` for a string key)
 
@@ -814,7 +871,14 @@ process keeps one record per digest scheme. Purging a blob purges its
 variant records, their image blobs and their files first. The app's
 libvips loader policy (`Vips.block_untrusted(true)`, `Vips.block(op,
 true)` in an initializer) is lifted at ingest onto the `Rails
-::Application` reopen and applied when the processor loads. `variable?`
+::Application` reopen and applied when the processor loads. The
+processor also wraps `Vips.vips_foreign_find_load` so a blocked
+loader is not selected: libvips 8.15+ skips BLOCKED classes in
+`vips_foreign_map`, but 8.14 still names Magick/Svg after
+`block_untrusted` even though load itself raises. The wrap reaches
+the C finder through `VipsExt` (the spinel package's binding, or an
+FFI stand-in on the gem). Wrapping the Ruby finder in place re-enters
+the wrapper on the spinel package. `variable?`
 is Rails' content-type question, answered from `variable_content_types`
 minus what the app's initializer subtracts (ingest lifts
 `config.active_storage.variable_content_types -= %w[…]` onto the same
@@ -2908,8 +2972,16 @@ header. Grouped by cause, largest first:
   which every Rails response carries. Without `X-Frame-Options` any
   site can frame a signed-in campfire page. The one to close first.
 - **The app's own `config.ru` middleware is not applied.** campfire's
-  `config.ru` says `use Rack::Deflater`; no response of ours is gzipped
-  (65) and none varies on `Accept-Encoding` (71).
+  `config.ru` says `use Rack::Deflater`. The CRuby overlay now wraps
+  `Main.run_rack` in `GzipCache` (Static stays outside so `/cable`
+  hijack is never compressed; CSS/JS stay identity; identical HTML is
+  not deflated on every request). spinel tep gzips inline bodies when
+  `Accept-Encoding` includes gzip, from a cache keyed by SHA-256 of
+  the identity body (CRuby keys by the body itself — MRI's string
+  hash is cheaper than SHA-256 here). Gzip runs outside the lock on
+  both lanes.
+  Re-run `scripts/campfire-http-shape` before treating the 65
+  Content-Encoding misses as current.
 - **Rails' `Rack::ETag` / `Rack::ConditionalGet` are absent**: no weak
   ETag on a 200 (52), no `Cache-Control: max-age=0, private,
   must-revalidate`, so a revisit is 200 where Rails answers 304 (10-14).
