@@ -5336,6 +5336,12 @@ impl Analyzer {
             })
             .filter(|(_, includes)| !includes.is_empty())
             .collect();
+        // `self.classes` is a HashMap: without a fixed order the
+        // includers' observations reach the module's slot in a
+        // different order every run, and a union's variant order (or
+        // any order-sensitive join) leaks into the emitted signature.
+        let mut targets = targets;
+        targets.sort_by(|a, b| a.0.cmp(&b.0));
         let mut adds: Vec<((ClassId, Symbol), Vec<Ty>)> = Vec::new();
         for (id, includes) in targets {
             let mut queue = includes;
@@ -5668,7 +5674,7 @@ impl Analyzer {
                 // chases — the reverse call graph now decides retype,
                 // so Class-only receivers would leave callers of
                 // `records.first.foo` off the frontier.
-                let recv_classes: Vec<ClassId> = match recv {
+                let mut recv_classes: Vec<ClassId> = match recv {
                     Some(r) => r
                         .ty
                         .as_ref()
@@ -5683,6 +5689,25 @@ impl Analyzer {
                         .into_iter()
                         .collect(),
                 };
+                // The params table keys by (class, name) with no side, so
+                // `self.class.get(url, opts)` (HTTParty's class-side `get`)
+                // would feed an instance `def get` — and still would when
+                // the class also defines `def self.get`. Drop an `x.class`
+                // site for any receiver that has that name as an instance
+                // method. Constant receivers stay: `UserMailer.welcome(user)`
+                // and an `extend self` module's `GlobalPath.cdn_path(p)` are
+                // how their instance methods run.
+                let via_dot_class = recv.as_ref().is_some_and(|r| {
+                    matches!(&*r.node, ExprNode::Send { method: m, args, .. }
+                        if m.as_str() == "class" && args.is_empty())
+                });
+                if via_dot_class {
+                    recv_classes.retain(|c| {
+                        !self.classes.get(c).is_some_and(|k| {
+                            k.instance_methods.contains_key(method)
+                        })
+                    });
+                }
                 if !recv_classes.is_empty() {
                     let arg_tys: Vec<Ty> = args
                         .iter()
@@ -6771,7 +6796,8 @@ fn block_filter_gates(call: &Expr) -> (Vec<Symbol>, Vec<Symbol>) {
 /// joinrules at a higher level — we operate on `Ty` directly, so the
 /// rules are:
 /// - same type → keep
-/// - one side is `Ty::Var` (no info yet) → take the other
+/// - one side is `Ty::Var` (no info yet) → take the other, including
+///   when the other is `Untyped` (`Var` is the bottom of the join)
 /// - one side is `Untyped` (an argument nobody could type) → take the
 ///   other: an untyped observation says nothing about the value, and
 ///   letting it into the union turns every concrete observation into
@@ -6786,10 +6812,23 @@ fn unify_param_ty(stored: Ty, observed: Ty) -> Ty {
     if stored == observed {
         return stored;
     }
-    if matches!(stored, Ty::Var { .. } | Ty::Untyped) {
+    // `Var` is checked on both sides before `Untyped` so the join is
+    // commutative: `Var` (no observation) is below `Untyped` (an
+    // observed argument nobody could type), and `Untyped` is below a
+    // concrete type. Testing `Var | Untyped` together on `stored`
+    // first made `unify(Untyped, Var) = Var` but `unify(Var, Untyped)
+    // = Untyped`, so the result depended on the order call sites
+    // arrived in (#209).
+    if matches!(stored, Ty::Var { .. }) {
         return observed;
     }
-    if matches!(observed, Ty::Var { .. } | Ty::Untyped) {
+    if matches!(observed, Ty::Var { .. }) {
+        return stored;
+    }
+    if matches!(stored, Ty::Untyped) {
+        return observed;
+    }
+    if matches!(observed, Ty::Untyped) {
         return stored;
     }
     // T + Nil → Union<T, Nil>; same for the symmetric case. Skip
