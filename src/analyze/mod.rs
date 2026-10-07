@@ -157,6 +157,33 @@ pub struct Analyzer {
     /// `analyze_expr` walks.
     controller_action_meta_cache:
         HashMap<ClassId, (HashMap<Symbol, HashMap<Symbol, Ty>>, HashMap<Symbol, Expr>)>,
+    /// How the last [`Self::analyze`]'s fixpoint loops ended.
+    fixpoint_rounds: FixpointRounds,
+}
+
+/// How each loop of the whole-program fixpoint in [`Analyzer::analyze`]
+/// ended.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FixpointRounds {
+    /// Harvest, unify and retype over production code.
+    pub production: LoopEnd,
+    /// Views once, then test rounds.
+    pub views_and_tests: LoopEnd,
+    /// Production again, only when view or test call sites moved a
+    /// production signature.
+    pub absorb: LoopEnd,
+}
+
+/// How one loop of the whole-program fixpoint ended.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LoopEnd {
+    /// Its signature check passed on this round, counting from 0.
+    Settled(usize),
+    /// It ran every round its cap allows without its check passing.
+    RanToCap,
+    /// It never started.
+    #[default]
+    NotRun,
 }
 
 use dirty_retype::{DirtyHints, InferenceSig, dirty_classes_for_retype};
@@ -1024,6 +1051,7 @@ impl Analyzer {
             view_seeds: None,
             callers_by_target: HashMap::new(),
             controller_action_meta_cache: HashMap::new(),
+            fixpoint_rounds: FixpointRounds::default(),
         }
     }
 
@@ -1055,6 +1083,12 @@ impl Analyzer {
     /// footers' pre-filled RBS).
     pub fn inferred_param_types(&self, class: &ClassId, method: &Symbol) -> Option<&[Ty]> {
         self.inferred_params.get(&(class.clone(), method.clone())).map(|v| v.as_slice())
+    }
+
+    /// How the fixpoint loops of the last [`Self::analyze`] ended; all
+    /// [`LoopEnd::NotRun`] before it.
+    pub fn fixpoint_rounds(&self) -> FixpointRounds {
+        self.fixpoint_rounds
     }
 
     /// Walk the app, annotating every expression's `ty` field, then
@@ -1167,6 +1201,11 @@ impl Analyzer {
         // `with_pagination_info` → `get` → `paginate` → the
         // `get_from_cache` block → its return → the destructuring, which
         // settles on round 9.
+        let mut rounds = FixpointRounds {
+            production: LoopEnd::RanToCap,
+            views_and_tests: LoopEnd::RanToCap,
+            absorb: LoopEnd::NotRun,
+        };
         let mut prev_hints = self.capture_dirty_hints();
         for round in 0..FIXPOINT_CAP {
             crate::timings::phase(format_args!("round {round}: harvest returns"), || {
@@ -1182,6 +1221,7 @@ impl Analyzer {
             if self.inference_matches(&prev_hints.sig)
                 && self.block_value_matches(&prev_hints)
             {
+                rounds.production = LoopEnd::Settled(round);
                 break;
             }
             // Re-type with the refined registry. Idempotent BodyTyper
@@ -1274,11 +1314,13 @@ impl Analyzer {
             if self.inference_matches(&prev_hints.sig)
                 && self.block_value_matches(&prev_hints)
             {
+                rounds.views_and_tests = LoopEnd::Settled(round);
                 break;
             }
             prev_hints = self.capture_dirty_hints();
         }
         if !self.inference_matches(&production_sig) {
+            rounds.absorb = LoopEnd::RanToCap;
             let mut absorb_hints = self.capture_dirty_hints();
             // The view/test rounds above moved signatures that
             // production bodies read, and the last production pass
@@ -1314,6 +1356,7 @@ impl Analyzer {
                 if self.inference_matches(&absorb_hints.sig)
                     && self.block_value_matches(&absorb_hints)
                 {
+                    rounds.absorb = LoopEnd::Settled(round);
                     break;
                 }
                 absorb_dirty = self.dirty_classes_for_retype(app, &absorb_hints);
@@ -1353,6 +1396,7 @@ impl Analyzer {
                 )
             });
         }
+        self.fixpoint_rounds = rounds;
         // Wave 12 types views once against production-only helper
         // returns, then unifies helper params from those sites. Helper
         // returns therefore settle only after the absorb/harvest above.

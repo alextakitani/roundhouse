@@ -10,6 +10,9 @@
 //!
 //! Analysis runs on a worker thread, watched for time and resident memory,
 //! so that a regression fails in seconds instead of exhausting the machine.
+//! The settled sizes hold by construction, since every carried type passes
+//! through the bound; a type that moves round after round within it shows
+//! instead in where the fixpoint loops stop.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -20,7 +23,7 @@ use std::time::{Duration, Instant};
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
-use roundhouse::analyze::{diagnose, Analyzer, Severity};
+use roundhouse::analyze::{diagnose, Analyzer, FixpointRounds, LoopEnd, Severity};
 use roundhouse::ident::{ClassId, Symbol};
 use roundhouse::ingest::ingest_app_from_tree;
 use roundhouse::ty::Ty;
@@ -172,6 +175,7 @@ struct Settled {
     returns: Vec<(String, Ty)>,
     params: Vec<(String, Ty)>,
     errors: Vec<String>,
+    rounds: FixpointRounds,
 }
 
 /// Analyze an app holding `files` (beside an empty schema, an
@@ -214,7 +218,7 @@ fn analyze(files: &[(&str, &str)], methods: &[(&str, &str, bool)]) -> Settled {
             .filter(|d| d.severity == Severity::Error)
             .map(|d| d.message)
             .collect();
-        Settled { returns, params, errors }
+        Settled { returns, params, errors, rounds: analyzer.fixpoint_rounds() }
     })
 }
 
@@ -273,6 +277,34 @@ fn assert_bounded(settled: &Settled) {
     }
 }
 
+/// Where a shape's production rounds stop.
+#[derive(Debug)]
+enum Production {
+    /// On a fixed point, inside their cap.
+    Settles,
+    /// On their cap, with nothing left moving: the check after it, on the
+    /// first view round, passes, so the absorb rounds never run.
+    SettlesAtCap,
+}
+
+/// The fixpoint ends on a fixed point rather than on a round cap.
+fn assert_settles(settled: &Settled, production: Production) {
+    let rounds = settled.rounds;
+    let production_ends_as_expected = match production {
+        Production::Settles => matches!(rounds.production, LoopEnd::Settled(_)),
+        Production::SettlesAtCap => {
+            rounds.production == LoopEnd::RanToCap
+                && rounds.views_and_tests == LoopEnd::Settled(0)
+                && rounds.absorb == LoopEnd::NotRun
+        }
+    };
+    assert!(production_ends_as_expected, "production rounds: expected {production:?}, got {rounds:?}");
+    assert!(
+        matches!(rounds.views_and_tests, LoopEnd::Settled(_)) && rounds.absorb != LoopEnd::RanToCap,
+        "a fixpoint loop stopped on its cap: {rounds:?}"
+    );
+}
+
 #[test]
 fn a_two_method_cycle_settles_bounded() {
     let settled = analyze(
@@ -280,6 +312,7 @@ fn a_two_method_cycle_settles_bounded() {
         &[("TreesController", "walk_0", false), ("TreesController", "walk_1", false)],
     );
     assert_bounded(&settled);
+    assert_settles(&settled, Production::Settles);
 }
 
 #[test]
@@ -289,8 +322,11 @@ fn a_class_method_cycle_settles_bounded() {
         &[("Walker", "walk", true), ("Walker", "step", true)],
     );
     assert_bounded(&settled);
+    assert_settles(&settled, Production::Settles);
 }
 
+/// The return and the parameter are cut at the bound and still move
+/// within it until the last production round.
 #[test]
 fn a_result_merged_back_into_its_own_parameter_settles_bounded() {
     let settled = analyze(
@@ -299,10 +335,11 @@ fn a_result_merged_back_into_its_own_parameter_settles_bounded() {
     );
     assert_bounded(&settled);
     assert!(!settled.params.is_empty(), "canonical's parameter was never unified");
+    assert_settles(&settled, Production::SettlesAtCap);
 }
 
-/// The harvest cuts this method's direct self-nesting, but its return
-/// still gained a level every round and ran both loops to their caps.
+/// The harvest cuts this method's direct self-nesting, so its return
+/// settles inside the production rounds without reaching the bound.
 #[test]
 fn a_self_recursive_walk_settles_bounded() {
     let settled = analyze(
@@ -310,6 +347,7 @@ fn a_self_recursive_walk_settles_bounded() {
         &[("TreesController", "walk", false)],
     );
     assert_bounded(&settled);
+    assert_settles(&settled, Production::Settles);
 }
 
 /// The call sites live in the class, so analysis sees the same feedback
