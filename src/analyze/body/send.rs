@@ -993,6 +993,24 @@ impl<'a> BodyTyper<'a> {
             // of Ruby's own guarantees about the answer.
             Some(Ty::Untyped) => conversion_fallback(method).unwrap_or(Ty::Untyped),
             Some(Ty::Class { id, args }) => {
+                // `GlobalID::Locator.locate(…, only: Model)` /
+                // `locate_signed(…, only: Model, for:)` — the literal
+                // `only:` IS the finder, so the answer is that model
+                // (nilable: a bad/mismatched gid is nil). Refined here
+                // rather than in the registry: the registry cannot see
+                // the call-site kwarg.
+                if id.0.as_str() == "GlobalID::Locator"
+                    && matches!(method.as_str(), "locate" | "locate_signed")
+                {
+                    if let Some(model) = locator_only_class(call_args) {
+                        return Ty::Union {
+                            variants: vec![
+                                Ty::Class { id: model, args: vec![] },
+                                Ty::Nil,
+                            ],
+                        };
+                    }
+                }
                 if id.0.as_str() == "Date" {
                     if let Some(ty) = date_constructor(method, call_args) {
                         return ty;
@@ -2085,6 +2103,29 @@ pub(super) fn time_method(method: &Symbol) -> Option<Ty> {
 
 /// Ruby's native date-only surface. Do not inherit the Time table:
 /// Date has neither epoch seconds nor a zone, and only Date supports >>.
+/// Literal `only: Model` class from a Locator kwargs hash, if present.
+fn locator_only_class(args: &[crate::expr::Expr]) -> Option<ClassId> {
+    for arg in args.iter().rev() {
+        let ExprNode::Hash { entries, .. } = &*arg.node else { continue };
+        for (key, value) in entries {
+            let ExprNode::Lit {
+                value: crate::expr::Literal::Sym { value: k },
+            } = &*key.node
+            else {
+                continue;
+            };
+            if k.as_str() != "only" {
+                continue;
+            }
+            let ExprNode::Const { path } = &*value.node else { return None };
+            return Some(ClassId(Symbol::from(
+                path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::"),
+            )));
+        }
+    }
+    None
+}
+
 fn date_constructor(method: &Symbol, args: &[crate::expr::Expr]) -> Option<Ty> {
     // Every core Date argument is optional. Reject known wrong types
     // and excess arguments rather than declaring a crashing call clean.

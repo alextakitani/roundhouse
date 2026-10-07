@@ -171,6 +171,12 @@ pub struct App {
     /// where the finder is spelled as a literal constant.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub global_id_locate_models: BTreeSet<Symbol>,
+    /// Model class names a `GlobalID::Locator.locate_signed(sgid,
+    /// only: K, for:)` call site names. Same monomorphize reason as
+    /// [`Self::global_id_locate_models`]; the generated entry point is
+    /// `locate_signed_<model>(sgid, purpose)`.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub global_id_locate_signed_models: BTreeSet<Symbol>,
     /// Model names whose attachment sgid the app resolves even when
     /// its SIGNATURE fails — campfire's `%w[ User ]`, read by
     /// [`crate::ingest::on_load_reopen`] from the `from_node` reopen
@@ -706,6 +712,7 @@ impl App {
             view_visible_controller_methods: BTreeSet::new(),
             generated_helper_methods: BTreeMap::new(),
             global_id_locate_models: BTreeSet::new(),
+            global_id_locate_signed_models: BTreeSet::new(),
             attachable_unsigned_models: Vec::new(),
             load_hook_class_macros: Vec::new(),
             partial_local_types: HashMap::new(),

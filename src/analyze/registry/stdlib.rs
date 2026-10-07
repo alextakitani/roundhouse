@@ -32,6 +32,27 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     );
     classes.insert(ClassId(Symbol::from("Rails")), rails_cls);
 
+    // GlobalID mint + Locator — unsigned `param`/`uri`/`signed` and the
+    // locate / locate_signed class methods. Return types for locate*
+    // with a literal `only:` are refined in `body/send.rs` to the named
+    // model (nilable); Untyped here is the gradual fallback for a
+    // computed `only:`.
+    {
+        let mut gid = ClassInfo::default();
+        for m in ["param", "uri", "signed"] {
+            gid.class_methods.insert(Symbol::from(m), Ty::Str);
+        }
+        classes.insert(ClassId(Symbol::from("GlobalID")), gid);
+        let mut locator = ClassInfo::default();
+        locator
+            .class_methods
+            .insert(Symbol::from("locate"), Ty::Untyped);
+        locator
+            .class_methods
+            .insert(Symbol::from("locate_signed"), Ty::Untyped);
+        classes.insert(ClassId(Symbol::from("GlobalID::Locator")), locator);
+    }
+
     // `ActionController::BrowserBlocker.blocked?(user_agent, floors)` —
     // the gate `ingest::allow_browser` synthesizes into a controller
     // body for `allow_browser`, answered by
