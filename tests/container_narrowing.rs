@@ -304,7 +304,6 @@ fn arbitrary_runtime_array_items_remain_gradual_in_source_diagnostics() {
     );
 }
 
-
 #[test]
 fn source_resolved_unqualified_containers_keep_their_shadowing_class() {
     let source = r#"module ContainerNamespace
