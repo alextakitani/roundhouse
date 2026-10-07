@@ -3103,8 +3103,13 @@ jobs:
         run: |
           if [ "$SITE" = true ]; then
             cargo run --release --bin roundhouse -- --site
-          else
+          elif [ -n "$TARGETS" ]; then
             cargo run --release --bin roundhouse -- --archives "$TARGETS"
+          else
+            # Focus/path plans can select build-site with an empty archive
+            # list; never pass '' to --archives (unknown target).
+            echo "No browse archives selected; skipping emit"
+            mkdir -p _site
           fi
 
       # Live SharedWorker blog demo → _site/blog/. Emits real-blog under

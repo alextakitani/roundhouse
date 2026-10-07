@@ -536,6 +536,17 @@ fn pr_archives_remain_tested_without_pages_publication_work() {
             Some(format!("steps.{id}.outputs.{output} == 'present'").as_str())
         );
     }
+    let build_archives = steps
+        .iter()
+        .find(|step| step["name"].as_str() == Some("Build selected archives or the complete site"))
+        .unwrap()["run"]
+        .as_str()
+        .unwrap();
+    assert!(
+        build_archives.contains(r#"[ -n "$TARGETS" ]"#)
+            && build_archives.contains("No browse archives selected"),
+        "empty plan archives must not invoke --archives ''"
+    );
     let archives = steps
         .iter()
         .find(|step| step["name"].as_str() == Some("Upload browse archives"))
