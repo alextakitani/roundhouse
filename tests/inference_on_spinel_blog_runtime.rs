@@ -284,7 +284,10 @@ fn untyped_subexpressions_baseline() {
     // pristine upstream/main after #450+#438. The seven new sites are
     // ActiveRecord::TokenFor helpers under the spinel-blog runtime
     // probe; the Float ceiling was never re-measured against TokenFor.
-    const CEILING: usize = 519;
+    // exists? key dispatch (#549 / #403): 519 -> 523, MEASURED. Four new
+    // Base sites from exists? / _exists_primary_key_input (nil guard +
+    // cast + adapter). Companion RBS probe stays at zero residual.
+    const CEILING: usize = 523;
     assert!(
         all_untyped.len() <= CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ceiling of {CEILING}.\n\

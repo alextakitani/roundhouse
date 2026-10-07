@@ -218,7 +218,7 @@ pub(crate) fn materialize_models(
         )
         .0,
     );
-    let lcs = crate::lower::model_to_library::lower_models_inner(
+    let lcs = crate::lower::model_to_library::lower_models_inner_with_ruby_values(
         &app.models,
         &app.schema,
         Vec::new(),
@@ -226,6 +226,7 @@ pub(crate) fn materialize_models(
         &assoc_scopes,
         materialization,
         crate::lower::model_to_library::FinderInputs::Request,
+        true,
     ).0;
     (lcs, params_specs)
 }
@@ -577,6 +578,7 @@ fn lower_controllers_for_spinel(app: &App, format_breadth: FormatBreadth) -> Vec
         &app.controllers,
         model_extras,
         crate::lower::controller_to_library::LowerControllerOptions {
+            ruby_read_values: true,
             schema: Some(&app.schema),
             views: &app.views,
             library_classes: &app.library_classes,
@@ -653,17 +655,17 @@ fn emit_lowered_controllers_from_lcs(
 /// file put them). No-op when the class line isn't found.
 fn prepend_sibling_classes(
     content: &mut String,
-    siblings: &[(crate::ident::Symbol, crate::ident::Symbol)],
+    siblings: &[crate::dialect::SiblingClass],
     class_name: &str,
 ) {
     let marker = format!("class {class_name}");
     let Some(pos) = content.find(&marker) else { return };
     let mut decls = String::new();
-    for (name, parent) in siblings {
+    for sibling in siblings {
         decls.push_str(&format!(
             "class {} < {}; end\n",
-            name.as_str(),
-            parent.as_str()
+            sibling.name.as_str(),
+            sibling.parent.as_str()
         ));
     }
     decls.push('\n');

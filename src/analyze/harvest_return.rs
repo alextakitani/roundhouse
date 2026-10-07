@@ -28,7 +28,9 @@ fn gradual_nil() -> Ty {
 fn has_informative_core(ty: &Ty) -> bool {
     match ty {
         Ty::Untyped | Ty::Var { .. } => false,
-        Ty::Union { variants } => variants.iter().any(|v| !v.is_unknown()),
+        // Nested unions (a sorbet signature keeps their shape) count only
+        // if some arm somewhere is known.
+        Ty::Union { variants } => variants.iter().any(has_informative_core),
         _ => true,
     }
 }
@@ -129,7 +131,10 @@ fn decide_harvested_return(existing: &Ty, new: Ty) -> HarvestWrite {
         }
         return HarvestWrite::Set(stable);
     }
-    if has_informative_core(existing) && new.is_unknown() {
+    // Bare `Untyped`/`Var`, and unions of only those, must not wipe a
+    // concrete return. `Union[Untyped, Untyped]` is not `is_unknown()`
+    // (that matches only the bare forms) but it has no informative core.
+    if has_informative_core(existing) && (new.is_unknown() || !has_informative_core(&new)) {
         return HarvestWrite::Keep;
     }
     // Distinct cores: last-write wins (residual thrash; not this PR's fix).
@@ -193,6 +198,16 @@ mod tests {
         let stable =
             stabilize_untyped_return_oscillation(&nil, &gradual).expect("nil-only cores match");
         assert_eq!(stable, gradual);
+    }
+
+    #[test]
+    fn a_nested_union_of_unknown_arms_is_not_informative() {
+        let unknown = Ty::Union {
+            variants: vec![Ty::Union { variants: vec![Ty::Untyped, Ty::Var { var: TyVar(0) }] }, Ty::Untyped],
+        };
+        assert!(!has_informative_core(&unknown));
+        let known = Ty::Union { variants: vec![Ty::Union { variants: vec![Ty::Str, Ty::Untyped] }, Ty::Untyped] };
+        assert!(has_informative_core(&known));
     }
 
     #[test]
@@ -266,6 +281,23 @@ mod tests {
         insert_inferred_return(&mut table, &method, cfg());
         insert_inferred_return(&mut table, &method, Ty::Untyped);
         assert_eq!(table.get(&method), Some(&cfg()));
+    }
+
+    #[test]
+    fn insert_keeps_known_return_against_untyped_only_union() {
+        // `Union[Untyped, Untyped]` is not bare `is_unknown()`, but it has
+        // no informative core and must not wipe a concrete harvest —
+        // class_attribute readers thrash on that shape across rounds.
+        let method = Symbol::from("_preload_definitions");
+        let concrete = arr(Ty::Str);
+        let mut table = HashMap::new();
+        insert_inferred_return(&mut table, &method, concrete.clone());
+        insert_inferred_return(
+            &mut table,
+            &method,
+            Ty::Union { variants: vec![Ty::Untyped, Ty::Untyped] },
+        );
+        assert_eq!(table.get(&method), Some(&concrete));
     }
 
     #[test]

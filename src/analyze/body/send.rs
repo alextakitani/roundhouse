@@ -538,6 +538,92 @@ impl<'a> BodyTyper<'a> {
         None
     }
 
+    /// `message.boosts.loaded?` — Rails AssociationProxy spelling.
+    ///
+    /// The has_many reader types as `Array[Boost]`, which has no
+    /// `loaded?`. Emit lowers the two-hop onto the synthesized
+    /// `boosts_loaded?` Bool (`lower::assoc_loaded`), but `check` /
+    /// LSP analyze without that pass and would otherwise residual the
+    /// tip Campfire view. Mirror the rewrite's admission here: only
+    /// when the owner actually has `<assoc>_loaded?` (has_many was
+    /// synthesized) answer Bool — never catalog Relation `#loaded?`
+    /// (invariant 6: no silent runtime gap).
+    ///
+    /// View locals are often `Untyped`; then fall back to the same
+    /// unique-name rule `assoc_loaded` uses for non-model owners.
+    pub(super) fn assoc_loaded_ty(
+        &self,
+        recv: Option<&crate::expr::Expr>,
+        method: &Symbol,
+    ) -> Option<Ty> {
+        if method.as_str() != "loaded?" {
+            return None;
+        }
+        let ExprNode::Send {
+            recv: Some(owner),
+            method: assoc,
+            args,
+            block: None,
+            ..
+        } = &*recv?.node
+        else {
+            return None;
+        };
+        if !args.is_empty() {
+            return None;
+        }
+        let flat = Symbol::from(format!("{}_loaded?", assoc.as_str()));
+        let has_flat = |id: &ClassId| -> bool {
+            let mut current = Some(id);
+            for _ in 0..32 {
+                let Some(cid) = current else { return false };
+                let Some(cls) = self.classes().get(cid) else { return false };
+                if cls.instance_methods.contains_key(&flat) {
+                    return true;
+                }
+                current = cls.parent.as_ref();
+            }
+            false
+        };
+        // Mirror `lower::assoc_loaded::owner_from_typed_recv`: a single
+        // Class admits when it has `<assoc>_loaded?`; a Union admits
+        // only when *every* class alternative does (no first-member
+        // find_map — that would quiet check while emit still refuses).
+        // Typed owners that miss the flat predicate return None — do
+        // not fall through to the unique-name path (that is for
+        // untyped view locals only).
+        match owner.ty.as_ref() {
+            Some(Ty::Class { id, .. }) => {
+                return has_flat(id).then_some(Ty::Bool);
+            }
+            Some(Ty::Union { variants }) => {
+                let ids: Vec<&ClassId> = variants
+                    .iter()
+                    .filter_map(|v| match v {
+                        Ty::Class { id, .. } => Some(id),
+                        _ => None,
+                    })
+                    .collect();
+                return (!ids.is_empty() && ids.iter().all(|id| has_flat(id)))
+                    .then_some(Ty::Bool);
+            }
+            _ => {}
+        }
+        // Untyped / missing owner type (view local): unique `<assoc>_loaded?`
+        // across modeled classes, matching `lower::assoc_loaded`'s
+        // unique-name path for views.
+        let mut found = false;
+        for cls in self.classes().values() {
+            if cls.instance_methods.contains_key(&flat) {
+                if found {
+                    return None;
+                }
+                found = true;
+            }
+        }
+        found.then_some(Ty::Bool)
+    }
+
     pub(super) fn normalize_trailing_kwargs(
         &self,
         recv_ty: Option<&Ty>,
@@ -907,6 +993,24 @@ impl<'a> BodyTyper<'a> {
             // of Ruby's own guarantees about the answer.
             Some(Ty::Untyped) => conversion_fallback(method).unwrap_or(Ty::Untyped),
             Some(Ty::Class { id, args }) => {
+                // `GlobalID::Locator.locate(…, only: Model)` /
+                // `locate_signed(…, only: Model, for:)` — the literal
+                // `only:` IS the finder, so the answer is that model
+                // (nilable: a bad/mismatched gid is nil). Refined here
+                // rather than in the registry: the registry cannot see
+                // the call-site kwarg.
+                if id.0.as_str() == "GlobalID::Locator"
+                    && matches!(method.as_str(), "locate" | "locate_signed")
+                {
+                    if let Some(model) = locator_only_class(call_args) {
+                        return Ty::Union {
+                            variants: vec![
+                                Ty::Class { id: model, args: vec![] },
+                                Ty::Nil,
+                            ],
+                        };
+                    }
+                }
                 if id.0.as_str() == "Date" {
                     if let Some(ty) = date_constructor(method, call_args) {
                         return ty;
@@ -1125,14 +1229,32 @@ impl<'a> BodyTyper<'a> {
                     };
                     // The class object and its instances share this one type, so a
                     // name both sides define is ambiguous. The catalog gives every model
-                    // the relation builders (`order`, `group`, `limit`, ...) class-side;
-                    // `belongs_to :order` gives an instance the reader `order`. A relation
-                    // builder called with no arguments is not a query (`Refund.order` is an
-                    // error), so the zero-argument call is the instance reader.
+                    // the relation builders (`order`, `group`, `limit`, `page`, …)
+                    // class-side; an instance may own the same name as a reader
+                    // (`belongs_to :order`, `delegated_type` singular `page`, …).
+                    // A relation builder called with no arguments is not a useful
+                    // query shape here (`Refund.order` is an error; bare
+                    // `leaf.page` is the delegated_type reader, not
+                    // `Relation[Leaf]`), so the zero-argument call is the
+                    // instance reader. Callers that want the builder pass an
+                    // argument (`Model.page(2)`, `Model.order(:name)`).
                     if call_args.is_empty()
                         && matches!(
                             method.as_str(),
-                            "order" | "group" | "limit" | "offset" | "having" | "joins" | "includes" | "select" | "distinct"
+                            "order"
+                                | "group"
+                                | "limit"
+                                | "offset"
+                                | "having"
+                                | "joins"
+                                | "includes"
+                                | "select"
+                                | "distinct"
+                                | "page"
+                                | "per"
+                                | "paginate"
+                                | "padding"
+                                | "without_count"
                         )
                     {
                         if let (Some(cm), Some(im)) =
@@ -1283,11 +1405,15 @@ impl<'a> BodyTyper<'a> {
                         _ => {}
                     }
                 }
-                // `Process.pid` — the one Process method the corpus
-                // reaches, and it is Ruby's `Logger::Formatter` that
-                // reaches it: every log line carries `#<pid>`. An
+                // `Process.pid` — Ruby's `Logger::Formatter` and
+                // Campfire's web-push pool (`forget_after_fork`). An
                 // Integer on every target that has a process at all.
                 if id.0.as_str() == "Process" && method.as_str() == "pid" {
+                    return Ty::Int;
+                }
+                // `Process.kill(signal, pid)` — TimeLimitedVideoPreviewer
+                // kills a stuck ffmpeg. Answers the signal as Integer.
+                if id.0.as_str() == "Process" && method.as_str() == "kill" {
                     return Ty::Int;
                 }
                 // `Process.clock_gettime(clock, unit = :float_second)`:
@@ -1302,6 +1428,20 @@ impl<'a> BodyTyper<'a> {
                         }
                         Some(_) => Ty::Untyped,
                     };
+                }
+                // `Timeout.timeout(sec) { ... }` — block result, or raises
+                // Timeout::Error. Campfire unfurl + video previewer.
+                if id.0.as_str() == "Timeout" && method.as_str() == "timeout" {
+                    return Ty::Untyped;
+                }
+                // `IO.popen` / `IO.copy_stream` — capture path; popen is
+                // polymorphic (block vs handle), copy_stream answers bytes.
+                if id.0.as_str() == "IO" {
+                    match method.as_str() {
+                        "popen" => return Ty::Untyped,
+                        "copy_stream" => return Ty::Int,
+                        _ => {}
+                    }
                 }
                 // JSON stdlib — `JSON.generate` and `JSON.dump` return
                 // String; `JSON.parse` / `JSON.load` return parsed
@@ -1471,6 +1611,17 @@ impl<'a> BodyTyper<'a> {
                 // An initial value decides the result type (`[1, 2].sum(0.0)` is a Float).
                 if method.as_str() == "sum" && !args.is_empty() {
                     return Ty::Untyped;
+                }
+                // `[] + [h]` is an Array of `h`: when the receiver's
+                // element is empty or not yet known, `+`, `|` and
+                // `concat` take the argument's. A known receiver element
+                // keeps answering for the result, as before.
+                if let ("+" | "|" | "concat", [other]) = (method.as_str(), args) {
+                    if let (Ty::Var { .. } | Ty::Bottom, Some(Ty::Array { elem: other })) =
+                        (elem, &other.ty)
+                    {
+                        return Ty::Array { elem: other.clone() };
+                    }
                 }
                 array_method(method, elem, block_ret)
             }
@@ -1952,6 +2103,29 @@ pub(super) fn time_method(method: &Symbol) -> Option<Ty> {
 
 /// Ruby's native date-only surface. Do not inherit the Time table:
 /// Date has neither epoch seconds nor a zone, and only Date supports >>.
+/// Literal `only: Model` class from a Locator kwargs hash, if present.
+fn locator_only_class(args: &[crate::expr::Expr]) -> Option<ClassId> {
+    for arg in args.iter().rev() {
+        let ExprNode::Hash { entries, .. } = &*arg.node else { continue };
+        for (key, value) in entries {
+            let ExprNode::Lit {
+                value: crate::expr::Literal::Sym { value: k },
+            } = &*key.node
+            else {
+                continue;
+            };
+            if k.as_str() != "only" {
+                continue;
+            }
+            let ExprNode::Const { path } = &*value.node else { return None };
+            return Some(ClassId(Symbol::from(
+                path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::"),
+            )));
+        }
+    }
+    None
+}
+
 fn date_constructor(method: &Symbol, args: &[crate::expr::Expr]) -> Option<Ty> {
     // Every core Date argument is optional. Reject known wrong types
     // and excess arguments rather than declaring a crashing call clean.

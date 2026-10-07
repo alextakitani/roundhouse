@@ -45,6 +45,7 @@ pub fn emit_module(methods: &[MethodDef]) -> Result<String, String> {
         name: crate::ident::ClassId(crate::ident::Symbol::from("__emit_module__")),
         is_module: false,
         parent: None,
+        parent_span: Default::default(),
         includes: Vec::new(),
         methods: std::mem::take(&mut colored),
         nullable_columns: Vec::new(),
@@ -145,7 +146,15 @@ pub fn emit_library_class(class: &LibraryClass) -> Result<String, String> {
                 // lowerings call it through a typed receiver
                 // (`parent.dom_prefix()`), and a static override of an
                 // instance contract strands that call site.
-                && !matches!(m.name.as_str(), "dom_prefix" | "dom_record_key" | "to_param")
+                // Literal controller identity methods still implement an instance API.
+                && !matches!(
+                    m.name.as_str(),
+                    "dom_prefix"
+                        | "dom_record_key"
+                        | "to_param"
+                        | "controller_name"
+                        | "controller_path"
+                )
         })
         .map(|m| m.name.as_str().to_string())
         .collect();

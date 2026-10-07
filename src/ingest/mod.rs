@@ -17,6 +17,7 @@
 
 mod alba;
 mod graphql_ruby;
+pub(crate) mod class_attribute;
 mod class_configuration;
 pub mod allow_browser;
 pub mod app;

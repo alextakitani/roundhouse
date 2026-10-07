@@ -248,6 +248,8 @@ fn returns_relation(ty: &Ty) -> bool {
 /// positional args.
 #[derive(Default)]
 pub struct LowerControllerOptions<'a> {
+    /// Ruby-family nullable read values; strict-target defaults stay unchanged.
+    pub ruby_read_values: bool,
     /// App `Schema` — enables the Arel SQL-chain lowering pass.
     pub schema: Option<&'a crate::schema::Schema>,
     /// App views — scanned for `*.json.jbuilder` format dispatch and the
@@ -292,6 +294,7 @@ pub fn lower_controllers_with_arel_views_assocs_and_routes(
     opts: LowerControllerOptions,
 ) -> Vec<LibraryClass> {
     let LowerControllerOptions {
+        ruby_read_values,
         schema,
         views,
         library_classes,
@@ -533,8 +536,8 @@ pub fn lower_controllers_with_arel_views_assocs_and_routes(
             let refined_across_methods = refined_result_methods.contains(&method.name);
             if let Some(schema) = schema {
                 if !refined_across_methods {
-                    rewritten |= crate::lower::arel::rewrite_arel_in_expr_with_assocs(
-                        &mut method.body, schema, &classes, assocs,
+                    rewritten |= crate::lower::arel::rewrite_arel_in_expr_with_ruby_values(
+                        &mut method.body, schema, &classes, assocs, ruby_read_values,
                     );
                 }
             }
@@ -549,6 +552,7 @@ pub fn lower_controllers_with_arel_views_assocs_and_routes(
             name: controller.name.clone(),
             is_module: false,
             parent: controller.parent.clone(),
+            parent_span: controller.parent_span,
             includes: Vec::new(),
             methods,
             nullable_columns: Vec::new(),
@@ -620,6 +624,7 @@ pub fn lower_controller_to_library_class(controller: &Controller) -> LibraryClas
         name: controller.name.clone(),
         is_module: false,
         parent: controller.parent.clone(),
+        parent_span: controller.parent_span,
         includes: Vec::new(),
         methods,
         nullable_columns: Vec::new(),
@@ -879,15 +884,18 @@ fn subclass_template_hooks(
     view_ivars: &ViewIvarMap,
     partials: &PartialMap,
 ) {
-    // (defining controller, stem) for every hook any body called.
-    let mut hooks: Vec<(ClassId, String)> = Vec::new();
-    fn collect(e: &Expr, definer: &ClassId, hooks: &mut Vec<(ClassId, String)>) {
+    // (defining controller, stem, call-site span) for every hook any
+    // body called. The call site keeps the original `render` span from
+    // rewrite (`rewrites.rs`); the definer's raise reuses it so the
+    // availability gate can ledger MissingTemplate instead of skipping
+    // a synthetic Const while emit still writes the throw.
+    let mut hooks: Vec<(ClassId, String, Span)> = Vec::new();
+    fn collect(e: &Expr, definer: &ClassId, hooks: &mut Vec<(ClassId, String, Span)>) {
         if let ExprNode::Send { recv: None, method, args, .. } = &*e.node {
             if args.is_empty() {
                 if let Some(stem) = method.as_str().strip_prefix("__template_") {
-                    let key = (definer.clone(), stem.to_string());
-                    if !hooks.contains(&key) {
-                        hooks.push(key);
+                    if !hooks.iter().any(|(d, s, _)| d == definer && s == stem) {
+                        hooks.push((definer.clone(), stem.to_string(), e.span));
                     }
                 }
             }
@@ -899,7 +907,7 @@ fn subclass_template_hooks(
             collect(&m.body, &controller.name, &mut hooks);
         }
     }
-    for (definer, stem) in hooks {
+    for (definer, stem, call_span) in hooks {
         let hook = rewrites::subclass_template_hook_name(&stem);
         // `show_json` → (`show`, `format: :json`); `show` → (`show`, none).
         let (template, format) = match stem.rsplit_once('_') {
@@ -918,18 +926,16 @@ fn subclass_template_hooks(
                 if !is_definer {
                     continue;
                 }
-                let span = Span::synthetic();
+                let span = call_span;
                 Expr::new(
                     span,
                     ExprNode::Raise {
                         value: Expr::new(
                             span,
                             ExprNode::Send {
-                                recv: Some(Expr::new(
+                                recv: Some(rewrites::typed_exception_const(
+                                    &["ActionView", "MissingTemplate"],
                                     span,
-                                    ExprNode::Const {
-                                        path: vec![Symbol::from("ActionView"), Symbol::from("MissingTemplate")],
-                                    },
                                 )),
                                 method: Symbol::from("new"),
                                 args: vec![Expr::new(
@@ -1297,7 +1303,107 @@ fn build_methods(
     // Class-side methods are already seeded at the start of build_methods;
     // do not append them again (duplicate defs break several emitters).
 
+    // Specialize `controller_name` / `controller_path` as string
+    // literals so Base does not need `self.class.to_s` reflection or
+    // an ActiveSupport char-walk that several AOT string emits cannot
+    // host yet. Upsert (retain + push) so a source-defined method of
+    // the same name cannot leave a duplicate MethodDef.
+    upsert_controller_string_method(
+        &mut methods,
+        controller,
+        "controller_name",
+        &crate::analyze::controller_name_of(&controller.name),
+    );
+    upsert_controller_string_method(
+        &mut methods,
+        controller,
+        "controller_path",
+        &crate::analyze::controller_view_prefix(&controller.name),
+    );
+
     methods
+}
+
+/// Replace any prior def of `name`, then push the AOT string-literal
+/// override — duplicate MethodDefs break several emitters.
+fn upsert_controller_string_method(
+    methods: &mut Vec<MethodDef>,
+    controller: &Controller,
+    name: &str,
+    value: &str,
+) {
+    methods.retain(|m| m.name.as_str() != name);
+    methods.push(synthesize_controller_string_method(controller, name, value));
+}
+
+/// A real span in this controller's source file — same provenance rule
+/// as `process_action` (first action body), with fallbacks for
+/// action-less bases like `ApplicationController` (superclass path,
+/// then any non-synthetic body item). Whole-cloth AOT literals must
+/// not leave `Span::synthetic` in lowered controller method bodies.
+fn controller_provenance_span(controller: &Controller) -> Option<Span> {
+    for action in controller.actions() {
+        if !action.body.span.is_synthetic() {
+            return Some(action.body.span);
+        }
+    }
+    if !controller.parent_span.is_synthetic() {
+        return Some(controller.parent_span);
+    }
+    for item in &controller.body {
+        let span = match item {
+            ControllerBodyItem::Action { action, .. } => action.body.span,
+            ControllerBodyItem::ClassMethod { method, .. } => method.body.span,
+            ControllerBodyItem::ClassIvarInit { expr, .. }
+            | ControllerBodyItem::Unknown { expr, .. } => expr.span,
+            ControllerBodyItem::Filter { .. } | ControllerBodyItem::PrivateMarker { .. } => {
+                continue;
+            }
+        };
+        if !span.is_synthetic() {
+            return Some(span);
+        }
+    }
+    None
+}
+
+/// Instance method returning a String literal — AOT-safe override of
+/// Base's `controller_name` / `controller_path`.
+fn synthesize_controller_string_method(
+    controller: &Controller,
+    name: &str,
+    value: &str,
+) -> MethodDef {
+    let mut body = Expr::new(
+        Span::synthetic(),
+        ExprNode::Lit {
+            value: Literal::Str {
+                value: value.to_string(),
+            },
+        },
+    );
+    // Attribute the literal to controller source (not synthetic) so
+    // span-preservation gates and LSP provenance stay honest.
+    if let Some(span) = controller_provenance_span(controller) {
+        body.inherit_span(span);
+    }
+    MethodDef {
+        visibility: crate::dialect::MethodVisibility::Public,
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        name_span: Span::synthetic(),
+        name: Symbol::from(name),
+        receiver: MethodReceiver::Instance,
+        params: vec![],
+        body,
+        signature: Some(crate::lower::typing::fn_sig(vec![], Ty::Str)),
+        effects: EffectSet::default(),
+        enclosing_class: Some(controller.name.0.clone()),
+        kind: AccessorKind::Method,
+        is_async: false,
+        mutates_self: false,
+        block_param: None,
+    }
 }
 
 /// Names a controller marks with `helper_method :x` whose public
@@ -1744,11 +1850,15 @@ fn default_forgery_protection() -> Filter {
 /// `post_authenticating_url` (a private method on the Authentication
 /// concern, spliced into ApplicationController) and `logo_path` are the
 /// corpus members that made this visible.
+///
+/// Always includes `controller_path`: ActionController::Base answers it
+/// (and the lowerer synthesizes a literal override) even when no source
+/// `def` appears in the ancestry.
 fn route_helper_shadows(
     controller: &Controller,
     all: &[Controller],
 ) -> std::collections::HashSet<Symbol> {
-    ancestor_chain(controller, all)
+    let mut out: std::collections::HashSet<Symbol> = ancestor_chain(controller, all)
         .into_iter()
         .chain(std::iter::once(controller))
         .flat_map(|c| c.body.iter())
@@ -1758,7 +1868,9 @@ fn route_helper_shadows(
         })
         .filter(|n| n.as_str().ends_with("_path") || n.as_str().ends_with("_url"))
         .cloned()
-        .collect()
+        .collect();
+    out.insert(Symbol::from("controller_path"));
+    out
 }
 
 /// Walk `parent` links root-first (`[ApplicationController]` for a

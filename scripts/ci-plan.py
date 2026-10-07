@@ -41,12 +41,13 @@ BASE = [
 # must not fail the Ruby PR floor.
 PUBLICATION = [*BASE, "compare", "browser-smoke-typescript"]
 CORE = ["build-spinel", "toolchain-spinel", "compare-spinel"]
+PARAM_BIND_TESTS = ["param_binds", "param_binds_values", "param_binds_planner", "param_binds_cleanup"]
 SPINEL_TESTS = [
     "date_columns_spinel",
     "framework_tests_spinel",
     "spinel_web_push_crypto",
     "spinel_db_lease",
-    "param_binds",
+    *PARAM_BIND_TESTS,
     "spinel_stmt_cache_lru",
     "db_sqlite_concurrency",
     "spinel_param_builder",
@@ -70,6 +71,12 @@ SPINEL11 = [
 # build-site; archive-results closes packaging evidence.
 SPINEL_LANE = [*BASE, *SPINEL11, "build-site", "archive-results"]
 ADVISORY = set(SPINEL11) - {"build-campfire-archive"}
+# Packaging evidence report only. Selected for completeness and required by
+# assemble-site when publishing; never a hard CI-summary / compact failure.
+# GitHub can mark the job `abandoned` (queued, never assigned) on large
+# ci:full PR graphs even when every producer succeeded — that must not red
+# an otherwise green PR summary.
+REPORTING = {"archive-results"}
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 PROJECT_BUILDERS = {
     "ruby_runtime_files": "interpreted",
@@ -106,17 +113,24 @@ def native_coverage(path):
         suites.add(focused[1])
     if path == "tests/support/db_concurrency_spinel.rb":
         suites.add("db_sqlite_concurrency")
+    # Gate drivers stay flat beside their Rust harness. Match the most
+    # specific suite first (e.g. param_binds_values before param_binds).
+    if path == "tests/param_binds_text_cleanup.rb":
+        suites.add("param_binds_cleanup")
+    elif path.startswith("tests/") and path.endswith(".rb"):
+        stem = path[len("tests/"):-len(".rb")]
+        for suite in reversed(PARAM_BIND_TESTS):
+            if stem == suite or stem.startswith(suite + "_"):
+                suites.add(suite)
+                break
+    if path == "runtime/spinel/test/statement_cache_cases.rb":
+        suites.add("param_binds")
     if path in {
-        "tests/param_binds_emit.rb",
-        "tests/param_binds_raw_where.rb",
-        "tests/param_binds_runtime.rb",
-        "tests/param_binds_cruby_cache.rb",
-        "tests/param_binds_spinel_cache.rb",
-        "runtime/spinel/test/statement_cache_cases.rb",
         "tests/support/emit_and_run.rs",
         "src/lower/model_to_library/adapter_emit.rs",
-    } or path.startswith("src/lower/arel/"):
-        suites.add("param_binds")
+        "src/emit/ruby/library.rs",
+    } or path.startswith(("src/lower/arel/", "src/lower/model_to_library/adapter_emit/")):
+        suites.update(PARAM_BIND_TESTS)
     if path.startswith(("runtime/spinel/", "runtime/ruby/")) and not interpreter_only:
         name = path.rsplit("/", 1)[-1]
         owned_tests = set()
@@ -143,7 +157,7 @@ def native_coverage(path):
             owned_tests.update(
                 (
                     "spinel_db_lease",
-                    "param_binds",
+                    *PARAM_BIND_TESTS,
                     "spinel_stmt_cache_lru",
                     "db_sqlite_concurrency",
                 )
@@ -405,7 +419,7 @@ def finish(
     )
     return {
         "jobs": jobs,
-        "required": [j for j in jobs if j not in ADVISORY],
+        "required": [j for j in jobs if j not in ADVISORY and j not in REPORTING],
         "extra_compare": extra,
         "smoke": smoke,
         "archives": archives,

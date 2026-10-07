@@ -150,6 +150,9 @@ require_relative "runtime/rails_executor"
 # chain defines. `multipart` first: `Blob.from_attachable` narrows to
 # the `UploadedFile` it defines.
 require_relative "runtime/multipart"
+# MIME registry — `ActiveStorage.content_type_for_filename` looks up
+# extensions through `Mime::Type` when `attach` omits `content_type:`.
+require_relative "runtime/mime"
 require_relative "runtime/active_storage"
 # Column list and metadata reads without per-load String building.
 require_relative "runtime/active_storage_cruby"
@@ -210,6 +213,10 @@ require_relative "runtime/thread_state"
 # A drain thread per serving process, registered by config.ru. After
 # thread_state: it wraps that file's locked queue methods.
 require_relative "runtime/active_job_cruby"
+# Returning view wrappers call ViewBufferCap.alloc/store (see
+# lower::view_buffer_passing). Overlay: thread-variable memo +
+# String.new(capacity:) from the last render of that page/action.
+require_relative "runtime/view_buffer_cap"
 # `Turbo::StreamsChannel` — the channel a `<turbo-cable-stream-source>`
 # names, AND the `broadcast_*_to` class methods a model's after_commit
 # reaches (and an app's own tests mock). One constant, both halves, the

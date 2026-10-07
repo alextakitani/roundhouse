@@ -110,7 +110,8 @@ class Routing(unittest.TestCase):
                 self.assertTrue(plan["wasm"])
                 self.assertTrue(set(ci.SPINEL11).issubset(plan["jobs"]))
                 self.assertIn("writebook-inventory", plan["required"])
-                self.assertIn("archive-results", plan["required"])
+                self.assertIn("archive-results", plan["jobs"])
+                self.assertNotIn("archive-results", plan["required"])
 
     def test_native_only_test_selects_core_without_archives_or_campfire(self):
         plan = ci.select(["tests/spinel_toolchain.rs"])
@@ -205,7 +206,8 @@ class Routing(unittest.TestCase):
         self.assertTrue(plan["wasm"])
         self.assertTrue(set(ci.SPINEL11).issubset(plan["jobs"]))
         self.assertIn("build-roundhouse", plan["required"])
-        self.assertIn("archive-results", plan["required"])
+        self.assertIn("archive-results", plan["jobs"])
+        self.assertNotIn("archive-results", plan["required"])
         self.assertNotIn("assemble-site", plan["jobs"])
 
     def test_canonical_main_push_selects_spinel_lane_without_extra_sdks(self):
@@ -402,19 +404,31 @@ class Routing(unittest.TestCase):
             "tests/param_binds_runtime.rb",
             "tests/param_binds_cruby_cache.rb",
             "tests/param_binds_spinel_cache.rb",
+            "tests/param_binds_associations.rb",
+            "tests/param_binds_nil.rb",
             "tests/support/emit_and_run.rs",
         ]:
             with self.subTest(path=path):
                 plan = ci.select([path])
-                self.assertEqual(plan["spinel_tests"], ["param_binds"])
+                self.assertEqual(
+                    plan["spinel_tests"],
+                    ci.PARAM_BIND_TESTS if path.startswith("src/") or path == "tests/support/emit_and_run.rs" else ["param_binds"],
+                )
                 self.assertEqual(
                     self.extras(plan), set(ci.CORE) | {"framework-tests-spinel"}
                 )
+        # Generated-read ensure/finalize lives in the Ruby emitter.
+        # Native core already runs for this path; the bind cleanup suite
+        # must too when that file is the only change.
+        self.assertEqual(
+            ci.select(["src/emit/ruby/library.rs"])["spinel_tests"],
+            ci.PARAM_BIND_TESTS,
+        )
         self.assertEqual(
             ci.select(["runtime/spinel/db.rb"])["spinel_tests"],
             [
                 "spinel_db_lease",
-                "param_binds",
+                *ci.PARAM_BIND_TESTS,
                 "spinel_stmt_cache_lru",
                 "db_sqlite_concurrency",
             ],
@@ -424,7 +438,7 @@ class Routing(unittest.TestCase):
             [
                 "date_columns_spinel",
                 "spinel_db_lease",
-                "param_binds",
+                *ci.PARAM_BIND_TESTS,
                 "spinel_stmt_cache_lru",
                 "db_sqlite_concurrency",
             ],
@@ -454,6 +468,14 @@ class Routing(unittest.TestCase):
                 self.assertEqual(plan["spinel_tests"], suites)
                 self.assertEqual(plan["smoke"], [])
                 self.assertEqual(plan["archives"], [])
+
+    def test_param_bind_suite_drivers_select_their_native_harness(self):
+        for suite in ci.PARAM_BIND_TESTS:
+            for suffix in (".rs", ".rb", "_runtime.rb"):
+                with self.subTest(suite=suite, suffix=suffix):
+                    plan = ci.select(["tests/" + suite + suffix])
+                    self.assertEqual(plan["spinel_tests"], [suite])
+                    self.assertIn("framework-tests-spinel", plan["jobs"])
 
     def test_runtime_owners_choose_asymmetric_focused_binaries(self):
         cases = {
@@ -502,18 +524,18 @@ class Routing(unittest.TestCase):
             "tests/spinel_stmt_cache_lru.rb": ["spinel_stmt_cache_lru"],
             "tests/support/db_concurrency_spinel.rb": ["db_sqlite_concurrency"],
             "runtime/spinel/db.rb": [
-                "spinel_db_lease", "param_binds", "spinel_stmt_cache_lru",
+                "spinel_db_lease", *ci.PARAM_BIND_TESTS, "spinel_stmt_cache_lru",
                 "db_sqlite_concurrency",
             ],
             "runtime/spinel/sqlite_adapter.rb": [
                 "date_columns_spinel",
                 "spinel_db_lease",
-                "param_binds",
+                *ci.PARAM_BIND_TESTS,
                 "spinel_stmt_cache_lru",
                 "db_sqlite_concurrency",
             ],
             "runtime/spinel/active_support_time_parsing.rb": [
-                "spinel_db_lease", "param_binds", "spinel_stmt_cache_lru",
+                "spinel_db_lease", *ci.PARAM_BIND_TESTS, "spinel_stmt_cache_lru",
                 "db_sqlite_concurrency",
             ],
             "runtime/spinel/date.rb": ["date_columns_spinel"],
@@ -560,7 +582,7 @@ class Routing(unittest.TestCase):
                 "date_columns_spinel",
                 "spinel_web_push_crypto",
                 "spinel_db_lease",
-                "param_binds",
+                *ci.PARAM_BIND_TESTS,
                 "spinel_stmt_cache_lru",
                 "db_sqlite_concurrency",
             ],
@@ -598,7 +620,8 @@ class Routing(unittest.TestCase):
                 self.assertEqual(plan["extra_compare"], [])
                 self.assertIn("compare-jruby", plan["required"])
                 self.assertIn("writebook-inventory", plan["required"])
-                self.assertIn("archive-results", plan["required"])
+                self.assertIn("archive-results", plan["jobs"])
+                self.assertNotIn("archive-results", plan["required"])
                 self.assertFalse(plan["wasm"])
                 self.assertFalse(plan["site"])
                 if scope == "ruby-family":
@@ -639,12 +662,13 @@ class Routing(unittest.TestCase):
         plan = ci.select([], full=True)
         self.assertEqual(plan["spinel_tests"], ci.SPINEL_TESTS)
         self.assertTrue(set(ci.SPINEL11).issubset(plan["jobs"]))
-        self.assertIn("archive-results", plan["required"])
+        self.assertIn("archive-results", plan["jobs"])
+        self.assertNotIn("archive-results", plan["required"])
         self.assertIn("writebook-inventory", plan["required"])
         self.assertNotIn("deploy", plan["jobs"])
-        self.assertIn(
-            "assemble-site", ci.select([], full=True, publish=True)["required"]
-        )
+        published = ci.select([], full=True, publish=True)
+        self.assertIn("assemble-site", published["required"])
+        self.assertNotIn("archive-results", published["required"])
         with self.assertRaises(ValueError):
             ci.select([], publish=True)
 
@@ -760,6 +784,28 @@ class Results(unittest.TestCase):
         self.assertFalse(complete)
         needs["smoke-spinel"]["result"] = "skipped"
         self.assertFalse(ci.check_results(plan, needs)[1])
+
+    def test_archive_results_report_never_fails_summary_gate(self):
+        # Repro: PR ci:full run 37652830796 — every producer succeeded, but
+        # GitHub left archive-results `abandoned` and CI summary exited 1.
+        plan = ci.select([], full=True)
+        self.assertIn("archive-results", plan["jobs"])
+        self.assertNotIn("archive-results", plan["required"])
+        self.assertEqual(ci.REPORTING, {"archive-results"})
+        for outcome in ["abandoned", "skipped", "failure", "cancelled", None]:
+            with self.subTest(outcome=outcome):
+                needs = self.needs(plan)
+                needs["archive-results"] = {"result": outcome}
+                failures, complete = ci.check_results(plan, needs)
+                self.assertEqual(failures, [])
+                self.assertFalse(complete)
+        # Publication still selects assemble-site as required; the report job
+        # stays evidence-only at the summary gate.
+        published = ci.select([], full=True, publish=True)
+        needs = self.needs(published)
+        needs["archive-results"] = {"result": "abandoned"}
+        self.assertEqual(ci.check_results(published, needs)[0], [])
+        self.assertFalse(ci.check_results(published, needs)[1])
 
     def test_assembly_failure_cannot_issue_checkpoint(self):
         plan = ci.select([], full=True, publish=True)
