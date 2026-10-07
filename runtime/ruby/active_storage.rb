@@ -1383,6 +1383,68 @@ module ActiveStorage
       purge
     end
   end
+
+  # What a `has_many_attached :uploads` reader hands back. Always
+  # constructed — never nil — so `uploads.attach` / `uploads.attachments`
+  # need no nil guard. Unlike `Attached` (One), `attach_blob` APPENDS:
+  # prior rows under the same name stay. `attachments` answers the
+  # Attachment MODEL rows (synthesized under `app/models/`), which is
+  # what lets `uploads.attachments.last` resolve.
+  class AttachedMany
+    def initialize(record_type, record_id, name)
+      @record_type = record_type
+      @record_id = record_id
+      @name = name
+    end
+
+    def attached?
+      attachments.length > 0
+    end
+
+    # Every Attachment row for this name on this record — Rails'
+    # `Attached::Many#attachments` (a collection proxy over the join
+    # model). Uses the synthesized `ActiveStorage::Attachment` finder
+    # so `.last` / `.first` / indexing are ordinary Array ops.
+    def attachments
+      ActiveRecord::Relation.new(ActiveStorage::Attachment).where(
+        record_type: @record_type,
+        record_id: @record_id,
+        name: @name
+      ).to_a
+    end
+
+    # APPEND — prior attachments under `@name` stay. One's `attach_blob`
+    # purges first; Many must not.
+    def attach_blob(blob)
+      ActiveRecord.adapter.insert("active_storage_attachments", {
+        "name" => @name,
+        "record_type" => @record_type,
+        "record_id" => @record_id,
+        "blob_id" => blob.id,
+        "created_at" => ActiveSupport.db_now,
+      })
+      nil
+    end
+
+    # DATA, NOT AN IO: `lower::attached::apply_attach_lowering` grounds
+    # `attach(io: …)` / `attach([…])` at the call site.
+    def attach(data, filename, content_type)
+      attach_blob(Blob.create_and_upload!(data, filename, content_type))
+    end
+
+    def purge
+      attachments.each do |att|
+        blob = att.blob
+        ActiveRecord.adapter.delete("active_storage_attachments", att.id)
+        blob.purge unless blob.nil?
+      end
+      nil
+    end
+
+    def destroy
+      purge
+    end
+  end
 end
 
 # Active Storage's ROUTE helpers, reopened onto the app's generated

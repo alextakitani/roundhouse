@@ -598,6 +598,12 @@ impl Analyzer {
                     args: vec![],
                 });
             }
+            for (_span, attr) in crate::lower::attached::many_attached_attrs(model) {
+                cls.instance_methods.entry(attr).or_insert(Ty::Class {
+                    id: ClassId(Symbol::from("ActiveStorage::AttachedMany")),
+                    args: vec![],
+                });
+            }
             // `attr_accessor :x` — and `attr_accessor *CONST`, which is
             // how campfire's `Opengraph::Metadata` names its four. The
             // reader/writer pair is synthesized by
@@ -4043,6 +4049,7 @@ impl Analyzer {
                 method.name.as_str(),
                 "generates_token_for"
                     | "has_one_attached"
+                    | "has_many_attached"
                     | "has_rich_text"
                     | "has_markdown"
                     | "has_secure_token"

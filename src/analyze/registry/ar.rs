@@ -286,6 +286,31 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         );
         classes.insert(attached_id.clone(), attached);
 
+        // `has_many_attached` proxy — same surface the runtime RBS
+        // declares. `attachments` is gradual (`Array[untyped]`) because
+        // the Attachment MODEL is synthesized into `app.models` and
+        // typed there; the registry cannot name it as a ClassId without
+        // racing the model loop.
+        {
+            let many_id = ClassId(Symbol::from("ActiveStorage::AttachedMany"));
+            let mut many = ClassInfo::default();
+            many.instance_methods.insert(Symbol::from("attached?"), Ty::Bool);
+            many.instance_methods.insert(
+                Symbol::from("attachments"),
+                Ty::Array {
+                    elem: Box::new(Ty::Class {
+                        id: ClassId(Symbol::from("ActiveStorage::Attachment")),
+                        args: vec![],
+                    }),
+                },
+            );
+            many.instance_methods.insert(Symbol::from("attach_blob"), Ty::Nil);
+            many.instance_methods.insert(Symbol::from("attach"), Ty::Nil);
+            many.instance_methods.insert(Symbol::from("purge"), Ty::Nil);
+            many.instance_methods.insert(Symbol::from("destroy"), Ty::Nil);
+            classes.insert(many_id, many);
+        }
+
         let mut blob = ClassInfo::default();
         for (m, ty) in [
             ("id", Ty::Int),

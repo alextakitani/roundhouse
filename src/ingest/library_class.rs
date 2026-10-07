@@ -3069,6 +3069,7 @@ fn unknown_is_block_callback(item: &crate::dialect::ModelBodyItem) -> bool {
 const CONCERN_MODEL_MACROS: &[&str] = &[
     "generates_token_for",
     "has_one_attached",
+    "has_many_attached",
     "has_rich_text",
     "has_markdown",
     "has_secure_token",

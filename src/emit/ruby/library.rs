@@ -7668,6 +7668,11 @@ enum PreloadKind {
     /// (`lower::attached::variations_ruby_source`), the proxy's fourth
     /// constructor argument.
     Attached { attr: String, owner: String, variations: String },
+    /// `has_many_attached :<attr>`: install an `AttachedMany` proxy per
+    /// record. Rows are still loaded on ask (`AttachedMany#attachments`);
+    /// the batch here is the memoized proxy, matching One's "one proxy
+    /// per record" contract.
+    AttachedMany { attr: String, owner: String },
     /// `has_rich_text :<attr>`: one `IN` over `action_text_rich_texts`,
     /// installed through the owner's load-once setter.
     RichText { attr: String, owner: String },
@@ -7797,6 +7802,17 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
                 attr: attr.as_str().to_string(),
                 owner: model.name.0.as_str().to_string(),
                 variations: crate::lower::attached::variations_ruby_source(model, &attr),
+            },
+        ));
+    }
+    for (_span, attr) in crate::lower::attached::many_attached_attrs(model) {
+        out.push((
+            crate::lower::attached::many_attachments_assoc_name(&attr)
+                .as_str()
+                .to_string(),
+            PreloadKind::AttachedMany {
+                attr: attr.as_str().to_string(),
+                owner: model.name.0.as_str().to_string(),
             },
         ));
     }
@@ -8010,6 +8026,19 @@ end
 "#
                 );
             }
+            PreloadKind::AttachedMany { attr, owner } => {
+                let _ = write!(
+                    src,
+                    r#"
+def self._preload_batch_{name}(records)
+  records.each do |r|
+    r._preload_{name}(ActiveStorage::AttachedMany.new("{owner}", r.id, "{attr}"))
+  end
+  []
+end
+"#
+                );
+            }
             // One IN over the rich-text table; a record with no row is
             // told so, which is the state the load-once reader must not
             // re-query.
@@ -8084,8 +8113,8 @@ end
                 PreloadKind::PlainText { .. } => Some("ActionText::Markdown"),
                 // `includes(logo_attachment: :blob)`: the blob is already
                 // in the row the loader fetched; there is no model to
-                // recurse into.
-                PreloadKind::Attached { .. } => None,
+                // recurse into. Many installs the proxy only.
+                PreloadKind::Attached { .. } | PreloadKind::AttachedMany { .. } => None,
             };
             match target {
                 Some(target) => {
