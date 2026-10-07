@@ -426,6 +426,27 @@ fn compact_and_extra_compare_share_commands_but_not_results() {
         serde_yaml_ng::from_str::<serde_yaml_ng::Value>("[rust, typescript]").unwrap()
     );
     assert_eq!(jobs["compare"]["steps"], jobs["compare-extra"]["steps"]);
+    let compare_steps = jobs["compare"]["steps"].as_sequence().unwrap();
+    let controller_identity = compare_steps
+        .iter()
+        .find(|step| {
+            step["name"].as_str()
+                == Some("cargo test --test rust_toolchain controller identity values")
+        })
+        .expect("the selected Rust compare lane executes controller identity values");
+    assert_eq!(
+        controller_identity["if"].as_str(),
+        Some("${{ !cancelled() && matrix.target == 'rust' }}")
+    );
+    assert_eq!(
+        controller_identity["run"].as_str(),
+        Some("cargo test --locked --test rust_toolchain real_blog_controller_identity_values_match_rails -- --ignored --nocapture --exact")
+    );
+    assert!(
+        controller_identity["continue-on-error"].is_null()
+            || controller_identity["continue-on-error"].as_bool() == Some(false),
+        "the Rust controller identity regression must be required"
+    );
     assert_eq!(
         jobs["compare-extra"]["strategy"]["max-parallel"].as_u64(),
         Some(7)

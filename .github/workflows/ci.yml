@@ -2109,6 +2109,9 @@ jobs:
           bundler-cache: true
           working-directory: ./fixtures/real-blog
       # Not separate jobs: each target's framework-tests and toolchain suites ride the compare job that already installs its toolchain (#273).
+      - name: cargo test --test rust_toolchain controller identity values
+        if: ${{ !cancelled() && matrix.target == 'rust' }}
+        run: cargo test --locked --test rust_toolchain real_blog_controller_identity_values_match_rails -- --ignored --nocapture --exact
       - name: cargo test --test framework_tests_rust (green subset)
         id: inflector
         if: ${{ !cancelled() && matrix.target == 'rust' }}
