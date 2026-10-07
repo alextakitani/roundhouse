@@ -1069,7 +1069,8 @@ jobs:
     # upload cannot skip into a green compact gate (#317).
     if: ${{ contains(fromJSON(needs.plan.outputs.jobs), 'campfire-compare') && needs.build-roundhouse.outputs.roundhouse-bin-artifact-id != '' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    # 55m: leave room after a slow 20m libvips42 apt for oracle/emit.
+    timeout-minutes: 55
 
     services:
       redis:
