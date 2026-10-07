@@ -124,20 +124,19 @@ module Params
   end
 
   # `params.require(key).permit(...)`'s refusal. Laxer than `expect`, as
-  # in Rails: missing, nil, "" and {} raise `ParameterMissing`; a hash of
-  # only unpermitted keys passes (the permit then yields nothing); a
-  # scalar or an array reaches `permit` in Rails, which has no such
-  # method on it, so the request is a 500 there and here.
+  # in Rails, whose `require` passes on a value that is `present?` or
+  # `false`: a blank one (missing, nil, a whitespace-only string, an empty
+  # array or hash) raises `ParameterMissing`; a hash of only unpermitted
+  # keys passes (the permit then yields nothing); any other value reaches
+  # `permit`, which only a hash has, so the request is a 500 there and here.
   def self.require_present(params, key)
     value = params.fetch(key, "")
-    # A JSON `null` is blank, like a missing key.
-    raise(ActionController::ParameterMissing.new(key)) if value.nil?
     if value.is_a?(Hash)
       raise(ActionController::ParameterMissing.new(key)) if value.empty?
       return params
     end
-    if value.is_a?(String)
-      raise(ActionController::ParameterMissing.new(key)) if value.empty?
+    if value != false && ActiveSupport.blank?(value)
+      raise(ActionController::ParameterMissing.new(key))
     end
     raise(NoMethodError.new("undefined method 'permit' for #{key}: not a Hash"))
   end

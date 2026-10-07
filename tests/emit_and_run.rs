@@ -7896,10 +7896,10 @@ require "stringio"
 # CSRF off, as Rails' test environment has it (the Rails measurements
 # above were taken that way); this is about the action, not the token.
 ActionController::Base.allow_forgery_protection = false
-def post_form(path, body)
+def post(path, type, body)
   env = {
     "REQUEST_METHOD" => "POST", "PATH_INFO" => path, "QUERY_STRING" => "",
-    "CONTENT_TYPE" => "application/x-www-form-urlencoded",
+    "CONTENT_TYPE" => type,
     "CONTENT_LENGTH" => body.bytesize.to_s, "HTTP_ACCEPT" => "application/json"
   }
   status, _body = Main.dispatch_core(env, StringIO.new(body))
@@ -7907,14 +7907,24 @@ def post_form(path, body)
 rescue NoMethodError
   500
 end
+FORM = "application/x-www-form-urlencoded"
+JSON_TYPE = "application/json"
+# Rails refuses a blank resource (`blank?`: whitespace, an empty array)
+# with ParameterMissing; anything else that is not a hash reaches
+# `permit` and is a NoMethodError.
 expected = [
-  ["no article key", "title=Flat&body=A+body+long+enough", 400],
-  ["article is a scalar", "article=oops", 500],
-  ["only unpermitted keys", "article%5Bother%5D=1", 422],
-  ["article nested", "article%5Btitle%5D=Nested&article%5Bbody%5D=A+body+long+enough", 201],
+  ["no article key", FORM, "title=Flat&body=A+body+long+enough", 400],
+  ["article is whitespace", FORM, "article=%20%20", 400],
+  ["article is a tab", FORM, "article=%09", 400],
+  ["article is an empty array", JSON_TYPE, %({"article":[]}), 400],
+  ["article is a scalar", FORM, "article=oops", 500],
+  ["article is an array of a blank", JSON_TYPE, %({"article":[""]}), 500],
+  ["article is false", JSON_TYPE, %({"article":false}), 500],
+  ["only unpermitted keys", FORM, "article%5Bother%5D=1", 422],
+  ["article nested", FORM, "article%5Btitle%5D=Nested&article%5Bbody%5D=A+body+long+enough", 201],
 ]
-expected.each do |label, body, want|
-  status = post_form("/articles.json", body)
+expected.each do |label, type, body, want|
+  status = post("/articles.json", type, body)
   raise "#{label}: expected #{want} as Rails answers, got #{status.inspect}" unless status == want
 end
 puts "require.permit refuses like Rails"
