@@ -388,6 +388,14 @@ class DbConn
   def initialize(dbh)
     @dbh = dbh
     @entries = []
+    # The same cached statements keyed by SQL, so a miss is a Hash probe
+    # instead of a scan of @entries. SQL that inlines its values misses
+    # almost every time: campfire's sidebar for a user with 10,000 direct
+    # rooms prepares 30,011 distinct strings in one lease, and a scan per
+    # miss made that request quadratic in its own statements. Each SQL is
+    # in @entries at most once (a busy hit is a transient), so one key
+    # per entry; every place that drops an entry drops its key.
+    @entry_by_sql = {}
     # Every checkout, including busy-hit transients and replay promotions.
     # Entry flags protect ownership before step and after SQLITE_DONE;
     # the usually short list avoids hash mutations on the query hot path.
@@ -474,8 +482,11 @@ class DbConn
   # paused outer cursor must keep both its position and its bindings.
   # Search from the most-recent end of the concretely typed Stmt array.
   # Hits move to that end so repeated hot lookups stop at the first entry.
+  # A miss skips the search: @entry_by_sql says the SQL is not cached.
   # New SQL is cached without a cap check; trim! bounds it at lease end.
   def prepare_cached(sql)
+    return prepare_owned(sql, true) if @entry_by_sql[sql].nil?
+
     cached = true
     last = @entries.length - 1
     i = last
@@ -513,6 +524,20 @@ class DbConn
     prepare_owned(sql, false)
   end
 
+  # Keep @entries and @entry_by_sql in lockstep: every cached insert and
+  # drop goes through these two so a later eviction path cannot update
+  # one structure without the other.
+  def index_cached(entry)
+    @entries.push(entry)
+    @entry_by_sql[entry.sql] = entry
+    nil
+  end
+
+  def unindex_cached(entry)
+    @entry_by_sql.delete(entry.sql)
+    nil
+  end
+
   def prepare_owned(sql, cached)
     # `SQL.stmt_out` is ONE 8-byte out-buffer for the whole process (an
     # `ffi_buffer`, static C storage). Under parallel OS workers two
@@ -536,7 +561,7 @@ class DbConn
       raise "Db.prepare failed (" + rc.to_s + "): " + SQL.sqlite3_errmsg(@dbh) + " — sql: " + sql
     end
     entry = Stmt.new(sql, st, cached)
-    @entries.push(entry) if cached
+    index_cached(entry) if cached
     @open.push(entry)
     st
   end
@@ -584,7 +609,10 @@ class DbConn
   def discard_closed
     i = @entries.length - 1
     while i >= 0
-      @entries.delete_at(i) if @entries[i].closed
+      if @entries[i].closed
+        unindex_cached(@entries[i])
+        @entries.delete_at(i)
+      end
       i -= 1
     end
     nil
@@ -606,6 +634,7 @@ class DbConn
     i = 0
     while i < @entries.length
       if i < drop_before && !@entries[i].in_use
+        unindex_cached(@entries[i])
         SQL.sqlite3_finalize(@entries[i].ptr)
       else
         keep.push(@entries[i])
@@ -852,6 +881,8 @@ class DbConn
         i += 1
       end
       @entries.clear
+      # Bulk wipe: no per-entry unindex; the map goes with the array.
+      @entry_by_sql = {}
     end
     nil
   end
@@ -1397,9 +1428,12 @@ module Db
   # (scaffold/main.rb): starts one thread with its own connection that
   # runs PASSIVE every CHECKPOINT_INTERVAL and RESTART (under the permit)
   # past CHECKPOINT_RESTART_FRAMES; each pooled connection turns its own
-  # automatic checkpoint off at its next lease. No fork on this lane, so
-  # unlike the CRuby shim it can start at boot. Only a database file has
-  # a WAL to checkpoint.
+  # automatic checkpoint off at its next lease. The measured Spinel lane
+  # is one process (WORKERS=1); with `--workers N` the parent starts this
+  # thread before prefork and children inherit `@checkpoint_wanted`
+  # without their own loop — do not paper over that with a flock (second
+  # home); default does not hit it. Only a database file has a WAL to
+  # checkpoint.
   def self.checkpoint_in_background!
     return nil if @checkpoint_wanted
     path = @db_path

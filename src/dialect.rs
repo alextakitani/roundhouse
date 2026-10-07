@@ -13,7 +13,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use crate::effect::EffectSet;
-use crate::expr::{Expr, Literal};
+use crate::expr::{Expr, ExprNode, LValue, Literal};
 use crate::ident::{ClassId, Symbol, TableRef};
 use crate::span::Span;
 use crate::ty::{Row, Ty};
@@ -905,6 +905,28 @@ pub struct LibraryClass {
     /// visibility deny-list at the ingest site.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unknown_calls: Vec<Expr>,
+}
+
+impl LibraryClass {
+    /// Direct source `@ivar` / compound `@ivar` writes — the shapes that
+    /// need source-ordered emission. Synthetic `mattr_*` / `cattr_*` `@@`
+    /// seeds and other framework initialization stay on the partitioned
+    /// path.
+    pub fn has_source_ivar_initializers(&self) -> bool {
+        self.class_ivar_initializers.iter().any(|expr| {
+            !expr.span.is_synthetic()
+                && matches!(
+                    &*expr.node,
+                    ExprNode::Assign {
+                        target: LValue::Ivar { .. },
+                        ..
+                    } | ExprNode::OpAssign {
+                        target: LValue::Ivar { .. },
+                        ..
+                    }
+                )
+        })
+    }
 }
 
 /// What synthesized a `LibraryClass`. Used by per-target collapsers to

@@ -47,6 +47,7 @@ pub(crate) mod forwarding;
 mod filter_targets;
 pub mod graphql;
 mod harvest_return;
+mod fixpoint_bound;
 mod dirty_retype;
 mod typing_mode;
 mod inferred_types;
@@ -5170,7 +5171,7 @@ impl Analyzer {
                 entry.resize(arity, Ty::Var { var: crate::ident::TyVar(0) });
             }
             for (slot, observed) in entry.iter_mut().zip(arg_tys.into_iter()) {
-                *slot = unify_param_ty(slot.clone(), observed);
+                *slot = fixpoint_bound::bound(unify_param_ty(slot.clone(), observed));
             }
         }
     }
@@ -5384,7 +5385,7 @@ impl Analyzer {
                 entry.resize(tys.len(), Ty::Var { var: crate::ident::TyVar(0) });
             }
             for (slot, observed) in entry.iter_mut().zip(tys.into_iter()) {
-                *slot = unify_param_ty(slot.clone(), observed);
+                *slot = fixpoint_bound::bound(unify_param_ty(slot.clone(), observed));
             }
         }
     }
