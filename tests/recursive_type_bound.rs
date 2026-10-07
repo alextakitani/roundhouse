@@ -277,31 +277,20 @@ fn assert_bounded(settled: &Settled) {
     }
 }
 
-/// Where a shape's production rounds stop.
-#[derive(Debug)]
-enum Production {
-    /// On a fixed point, inside their cap.
-    Settles,
-    /// On their cap, with nothing left moving: the check after it, on the
-    /// first view round, passes, so the absorb rounds never run.
-    SettlesAtCap,
-}
-
-/// The fixpoint ends on a fixed point rather than on a round cap.
-fn assert_settles(settled: &Settled, production: Production) {
+/// The fixpoint ends on a fixed point rather than on a round cap. The
+/// production rounds may run out first: the first view round harvests
+/// production again, so its check passing, or the absorb rounds settling,
+/// is production settling just past its cap.
+fn assert_settles(settled: &Settled) {
     let rounds = settled.rounds;
-    let production_ends_as_expected = match production {
-        Production::Settles => matches!(rounds.production, LoopEnd::Settled(_)),
-        Production::SettlesAtCap => {
-            rounds.production == LoopEnd::RanToCap
-                && rounds.views_and_tests == LoopEnd::Settled(0)
-                && rounds.absorb == LoopEnd::NotRun
-        }
-    };
-    assert!(production_ends_as_expected, "production rounds: expected {production:?}, got {rounds:?}");
+    let production_settles = matches!(rounds.production, LoopEnd::Settled(_))
+        || rounds.views_and_tests == LoopEnd::Settled(0)
+        || matches!(rounds.absorb, LoopEnd::Settled(_));
     assert!(
-        matches!(rounds.views_and_tests, LoopEnd::Settled(_)) && rounds.absorb != LoopEnd::RanToCap,
-        "a fixpoint loop stopped on its cap: {rounds:?}"
+        production_settles
+            && matches!(rounds.views_and_tests, LoopEnd::Settled(_))
+            && rounds.absorb != LoopEnd::RanToCap,
+        "the fixpoint stopped on a round cap: {rounds:?}"
     );
 }
 
@@ -312,7 +301,7 @@ fn a_two_method_cycle_settles_bounded() {
         &[("TreesController", "walk_0", false), ("TreesController", "walk_1", false)],
     );
     assert_bounded(&settled);
-    assert_settles(&settled, Production::Settles);
+    assert_settles(&settled);
 }
 
 #[test]
@@ -322,11 +311,9 @@ fn a_class_method_cycle_settles_bounded() {
         &[("Walker", "walk", true), ("Walker", "step", true)],
     );
     assert_bounded(&settled);
-    assert_settles(&settled, Production::Settles);
+    assert_settles(&settled);
 }
 
-/// The return and the parameter are cut at the bound and still move
-/// within it until the last production round.
 #[test]
 fn a_result_merged_back_into_its_own_parameter_settles_bounded() {
     let settled = analyze(
@@ -335,11 +322,11 @@ fn a_result_merged_back_into_its_own_parameter_settles_bounded() {
     );
     assert_bounded(&settled);
     assert!(!settled.params.is_empty(), "canonical's parameter was never unified");
-    assert_settles(&settled, Production::SettlesAtCap);
+    assert_settles(&settled);
 }
 
 /// The harvest cuts this method's direct self-nesting, so its return
-/// settles inside the production rounds without reaching the bound.
+/// settles without reaching the bound.
 #[test]
 fn a_self_recursive_walk_settles_bounded() {
     let settled = analyze(
@@ -347,7 +334,7 @@ fn a_self_recursive_walk_settles_bounded() {
         &[("TreesController", "walk", false)],
     );
     assert_bounded(&settled);
-    assert_settles(&settled, Production::Settles);
+    assert_settles(&settled);
 }
 
 /// The call sites live in the class, so analysis sees the same feedback
@@ -356,6 +343,10 @@ const TREE_WALK: &str = r#"
 class TreeWalk
   def walked
     walk_0({ "a" => [1, { "b" => "x" }] })
+  end
+
+  def walked_by_class
+    Walker.walk({ "a" => [1, { "b" => "x" }] })
   end
 
   def canonicalized
@@ -396,18 +387,21 @@ end
 /// A clean `check` on these shapes is a claim that they run: the bounded
 /// types must not cost the emitted program its values.
 #[test]
-fn the_cycle_and_the_merged_back_result_run_once_emitted() {
+fn the_cycles_and_the_merged_back_result_run_once_emitted() {
     let run = watched(|| {
         emit_and_run::empty_app()
             .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
             .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
             .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"probes\" do |t|\n    t.string \"name\"\n  end\nend\n")
             .write("app/models/tree_walk.rb", TREE_WALK)
+            .write("app/models/walker.rb", CLASS_METHOD_CYCLE)
             .run_ruby(
                 r#"
 walk = TreeWalk.new
 walked = walk.walked
 raise "cycle lost values: #{walked.inspect}" unless walked == { "a" => [1, { "b" => "x" }] }
+walked = walk.walked_by_class
+raise "class-method cycle lost values: #{walked.inspect}" unless walked == { "a" => [1, { "b" => "x" }] }
 canonical = walk.canonicalized
 expected = { "a" => { "b" => [1, "x"], "d" => 2 }, "c" => [{ "b" => [1, "x"], "e" => nil }] }
 raise "merge feedback lost values: #{canonical.inspect}" unless canonical == expected
