@@ -1175,7 +1175,8 @@ jobs:
     needs: [spinel-build, plan]
     if: ${{ !cancelled() && contains(fromJSON(needs.plan.outputs.jobs), 'campfire-spinel-build') && needs.spinel-build.outputs.artifact-id != '' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    # 60m: apt alone can take 20m; fetch 5m + emit/build 25m still need room.
+    timeout-minutes: 60
     continue-on-error: true
     outputs:
       artifact-id: ${{ steps.binary.outputs.artifact-id }}
@@ -1195,7 +1196,9 @@ jobs:
           chmod +x spinel-dist/spinel spinel-dist/spin spinel-dist/spinel_rbs_extract
           echo "$PWD/spinel-dist" >> $GITHUB_PATH
       - name: System libvips + libsqlite3-dev + libjemalloc-dev
-        timeout-minutes: 8
+        # libvips-dev pulls ~150 packages; slow Azure apt has burned 8m
+        # mid-download (Full validation 37683643149 campfire-smoke).
+        timeout-minutes: 20
         run: |
           "$GITHUB_WORKSPACE/scripts/ci-apt-install" libvips-dev libsqlite3-dev libjemalloc-dev
       - name: Fetch pinned once-campfire
@@ -1348,9 +1351,10 @@ jobs:
           test -x build/campfire-compare-spinel/build/blog
       - name: System libvips + libsqlite3-dev + libjemalloc-dev
         # Runtime deps for the served binary + oracle. DEV packages match
-        # the producer link set; step timeout fails fast on mirror hangs
-        # (apt Acquire timeouts alone have left jobs stuck for tens of minutes).
-        timeout-minutes: 8
+        # the producer link set. libvips-dev is ~150 packages — keep the
+        # step bound high enough for slow Azure apt (8m was exhausted on
+        # Full validation 37683643149 campfire-smoke mid-download).
+        timeout-minutes: 20
         run: |
           "$GITHUB_WORKSPACE/scripts/ci-apt-install" libvips-dev libsqlite3-dev libjemalloc-dev sqlite3
       - name: Fetch pinned once-campfire
@@ -1420,7 +1424,8 @@ jobs:
     if: ${{ !cancelled() && contains(fromJSON(needs.plan.outputs.jobs), 'campfire-spinel-db') && needs.spinel-build.outputs.artifact-id != '' }}
     outputs: *advisory-outputs
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    # 60m: leave headroom after a slow 20m libvips-dev apt for oracle/emit.
+    timeout-minutes: 60
 
     continue-on-error: true
     services:
@@ -1446,7 +1451,7 @@ jobs:
           chmod +x spinel-dist/spinel spinel-dist/spin spinel-dist/spinel_rbs_extract
           echo "$PWD/spinel-dist" >> $GITHUB_PATH
       - name: System libvips + libsqlite3-dev + libjemalloc-dev
-        timeout-minutes: 8
+        timeout-minutes: 20
         run: |
           "$GITHUB_WORKSPACE/scripts/ci-apt-install" libvips-dev libsqlite3-dev libjemalloc-dev sqlite3
       - name: Fetch pinned once-campfire
@@ -2925,7 +2930,9 @@ jobs:
     if: ${{ !cancelled() && contains(fromJSON(needs.plan.outputs.jobs), 'campfire-smoke') && needs.campfire-archive-build.result == 'success' && needs.spinel-build.outputs.artifact-id != '' }}
     outputs: *advisory-outputs
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # 35m: libvips-dev apt alone can take ~20m on a slow Azure day, then
+    # Playwright + README smoke still need room (job was 25m / step 8m).
+    timeout-minutes: 35
 
     continue-on-error: true
     env:
@@ -2945,9 +2952,11 @@ jobs:
           chmod +x spinel-dist/spinel spinel-dist/spin spinel-dist/spinel_rbs_extract
           echo "$PWD/spinel-dist" >> $GITHUB_PATH
       - name: Install libsqlite3-dev + libjemalloc-dev + libvips-dev
-        timeout-minutes: 8
+        timeout-minutes: 20
         # libvips-dev: the emitted spin.toml names ruby-vips (campfire
         # declares image variants), and the package links -lvips.
+        # ~150 packages / ~47MB — 8m step timeout failed mid-download on
+        # Full validation 37683643149 (slow Azure apt Ign:/Get cycles).
         run: |
           "$GITHUB_WORKSPACE/scripts/ci-apt-install" libsqlite3-dev libjemalloc-dev libvips-dev
       - uses: actions/setup-node@v7
