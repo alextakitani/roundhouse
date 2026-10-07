@@ -155,6 +155,14 @@ fn a_view_render_with_locals_passes_the_same_arguments() {
         ),
     ]);
     assert_one_param_and_matching_calls(&files, "note", "error", "app/views/posts/index.rb");
+    // From a view the closure param takes the caller's `error` (its
+    // `@error`), not the render-local "x": `note_into(io, post, error, …)`.
+    let source = file(&files, "app/views/posts/index.rb");
+    let args = source
+        .lines()
+        .find_map(|l| arg_list(l, "Views::Posts.note_into("))
+        .unwrap_or_else(|| panic!("no note_into call:\n{source}"));
+    assert_eq!(args[2], "error", "args {args:?}\n{source}");
 }
 
 const CARD: (&str, &str) = (
