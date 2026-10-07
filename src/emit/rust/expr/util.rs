@@ -183,11 +183,24 @@ pub(crate) fn ty_contains_untyped(ty: &crate::ty::Ty) -> bool {
     }
 }
 
+/// Whether [`emit_case_pattern`] has a faithful Rust pattern for `p`.
+pub(crate) fn case_pattern_supported(p: &crate::expr::Pattern) -> bool {
+    use crate::expr::Pattern;
+    match p {
+        Pattern::Wildcard | Pattern::Bind { .. } => true,
+        Pattern::Lit { value } => matches!(
+            value,
+            Literal::Str { .. } | Literal::Sym { .. } | Literal::Int { .. } | Literal::Bool { .. }
+        ),
+        _ => false,
+    }
+}
+
 /// Emit a Case `Pattern` as a Rust `match` arm pattern. The
 /// lowerer-synthesized `synth_index_read`/`synth_index_write` use
 /// `Pattern::Lit { value: Symbol }` against an `&str`-typed
-/// scrutinee — emit as a string-literal pattern. Other shapes fall
-/// through to `_` until they're needed.
+/// scrutinee — emit as a string-literal pattern. Shapes outside
+/// [`case_pattern_supported`] are reported by `emit_case` first.
 pub(crate) fn emit_case_pattern(p: &crate::expr::Pattern) -> String {
     use crate::expr::Pattern;
     match p {

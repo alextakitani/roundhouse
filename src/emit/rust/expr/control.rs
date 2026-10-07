@@ -7,7 +7,7 @@
 
 use crate::expr::{Expr, ExprNode, LValue, Literal};
 
-use super::util::{arm_body_already_value, emit_case_pattern, indent, peel_nil};
+use super::util::{arm_body_already_value, case_pattern_supported, emit_case_pattern, indent, peel_nil};
 use super::{
     current_return_is_option, current_return_is_unit, current_return_ty,
     emit_expr, emit_expr_tail, in_constructor, in_return_tail, mark_rebound_var,
@@ -426,6 +426,14 @@ pub(super) fn emit_case(scrutinee: &Expr, arms: &[crate::expr::Arm]) -> String {
     // An IR-carried guard-free Wildcard (a source `else`, or the shared
     // send grounding's raise arm) already IS the default — appending a
     // second `_` would be unreachable.
+    //
+    // Only literal, binding and wildcard patterns have a Rust `match`
+    // form. A range, class or other `===` pattern, a nil/float literal,
+    // or a guarded arm has none, and rendering it as `_` makes the first
+    // such arm swallow every input, so report it instead.
+    if arms.iter().any(|arm| arm.guard.is_some() || !case_pattern_supported(&arm.pattern)) {
+        return crate::emit::diagnostics::report_unsupported(scrutinee.span, "rust", "Case", "");
+    }
     let scrutinee_s = emit_expr(scrutinee);
     let return_ty = current_return_ty();
     let return_is_value = matches!(return_ty.as_ref(), Some(crate::ty::Ty::Untyped));
