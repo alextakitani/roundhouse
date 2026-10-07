@@ -1271,8 +1271,17 @@ impl<'a> BodyTyper<'a> {
                         }
                     }
                 }
+                let class_object_receiver =
+                    recv.as_ref().map_or(ctx.class_side, |r| self.is_class_object(r, ctx));
                 let block_ret = if let Some(b) = block {
-                    let mut block_ctx = self.block_ctx_for(ctx, recv_ty.as_ref(), method, args, b);
+                    let mut block_ctx = self.block_ctx_for(
+                        ctx,
+                        recv_ty.as_ref(),
+                        method,
+                        args,
+                        class_object_receiver,
+                        b,
+                    );
                     if matches!(method.as_str(), "instance_eval" | "instance_exec" | "class_eval" | "class_exec" | "module_eval" | "module_exec") {
                         if let Some(receiver) = recv.as_ref() {
                             block_ctx.self_ty = recv_ty.clone();
@@ -1478,7 +1487,8 @@ impl<'a> BodyTyper<'a> {
                 }
                 // What every object and every module answers, when the
                 // receiver's own table did not. App analyzer only.
-                let class_object_receiver = recv.as_ref().map_or(ctx.class_side, |r| self.is_class_object(r, ctx));
+                // `class_object_receiver` was resolved above for block binding
+                // so it matches the same class/instance table preference.
                 if matches!(dispatched, Ty::Var { .. } | Ty::Untyped) && self.inquirers.is_some()
                     && (recv.is_some() || (ctx.self_ty.is_some() && send::is_module_protocol(method)))
                     && !self.owns_operator(recv_ty.as_ref(), method, class_object_receiver) {
