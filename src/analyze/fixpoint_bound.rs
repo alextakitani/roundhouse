@@ -23,10 +23,18 @@
 //! than [`MAX_DEPTH`] containers; a cut position reads `untyped`. A
 //! recursive value has no finite type in this lattice, so the cut gives
 //! up only precision that was never reachable, and it surfaces as gradual
-//! `untyped` (which strict targets reject at emit) instead of a deeper copy
-//! each round. Both bounds sit above every type the public corpora carry
-//! (depth 10 and about 320 nodes at most), so a program without such a
-//! cycle is unchanged.
+//! `untyped` instead of a deeper copy each round. Both bounds sit above
+//! every type the public corpora carry (depth 10 and about 320 nodes at
+//! most), so a program without such a cycle is unchanged.
+//!
+//! Gradual is a warning, not an error, and every emitter accepts it. These
+//! walks are an open gap on Rust whether or not the bound cuts them: a
+//! value that may be a Hash, an Array or a scalar renders as
+//! `serde_json::Value`, which has none of the Hash and Array methods
+//! called on it (`transform_values`, `sort`, `merge`, iteration), and a
+//! `case … when Hash` renders every arm as `_`. The crate fails
+//! `cargo check` while `check` reports no error. The emitted Ruby runs
+//! (`tests/recursive_type_bound.rs`).
 
 use crate::ty::{Param, Row, Ty};
 

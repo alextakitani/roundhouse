@@ -48,6 +48,8 @@ mod filter_targets;
 pub mod graphql;
 mod harvest_return;
 mod fixpoint_bound;
+mod fixpoint_rounds;
+pub use fixpoint_rounds::{FixpointRounds, LoopEnd};
 mod dirty_retype;
 mod typing_mode;
 mod inferred_types;
@@ -157,6 +159,8 @@ pub struct Analyzer {
     /// `analyze_expr` walks.
     controller_action_meta_cache:
         HashMap<ClassId, (HashMap<Symbol, HashMap<Symbol, Ty>>, HashMap<Symbol, Expr>)>,
+    /// How the last [`Self::analyze`]'s fixpoint loops ended.
+    fixpoint_rounds: FixpointRounds,
 }
 
 use dirty_retype::{DirtyHints, InferenceSig, dirty_classes_for_retype};
@@ -1024,6 +1028,7 @@ impl Analyzer {
             view_seeds: None,
             callers_by_target: HashMap::new(),
             controller_action_meta_cache: HashMap::new(),
+            fixpoint_rounds: FixpointRounds::default(),
         }
     }
 
@@ -1055,6 +1060,12 @@ impl Analyzer {
     /// footers' pre-filled RBS).
     pub fn inferred_param_types(&self, class: &ClassId, method: &Symbol) -> Option<&[Ty]> {
         self.inferred_params.get(&(class.clone(), method.clone())).map(|v| v.as_slice())
+    }
+
+    /// How the fixpoint loops of the last [`Self::analyze`] ended; all
+    /// [`LoopEnd::NotRun`] before it.
+    pub fn fixpoint_rounds(&self) -> FixpointRounds {
+        self.fixpoint_rounds
     }
 
     /// Walk the app, annotating every expression's `ty` field, then
@@ -1155,6 +1166,11 @@ impl Analyzer {
             )
         });
 
+        let mut rounds = FixpointRounds {
+            production: LoopEnd::RanToCap,
+            views_and_tests: LoopEnd::RanToCap,
+            absorb: LoopEnd::NotRun,
+        };
         // Whole-program fixpoint: harvest returns + unify params, re-type,
         // repeat until the registry signature stabilizes. Each round
         // carries a fact one link further, so the cap bounds the longest
@@ -1182,6 +1198,7 @@ impl Analyzer {
             if self.inference_matches(&prev_hints.sig)
                 && self.block_value_matches(&prev_hints)
             {
+                rounds.production = LoopEnd::Settled(round);
                 break;
             }
             // Re-type with the refined registry. Idempotent BodyTyper
@@ -1274,11 +1291,13 @@ impl Analyzer {
             if self.inference_matches(&prev_hints.sig)
                 && self.block_value_matches(&prev_hints)
             {
+                rounds.views_and_tests = LoopEnd::Settled(round);
                 break;
             }
             prev_hints = self.capture_dirty_hints();
         }
         if !self.inference_matches(&production_sig) {
+            rounds.absorb = LoopEnd::RanToCap;
             let mut absorb_hints = self.capture_dirty_hints();
             // The view/test rounds above moved signatures that
             // production bodies read, and the last production pass
@@ -1314,6 +1333,7 @@ impl Analyzer {
                 if self.inference_matches(&absorb_hints.sig)
                     && self.block_value_matches(&absorb_hints)
                 {
+                    rounds.absorb = LoopEnd::Settled(round);
                     break;
                 }
                 absorb_dirty = self.dirty_classes_for_retype(app, &absorb_hints);
@@ -1353,6 +1373,7 @@ impl Analyzer {
                 )
             });
         }
+        self.fixpoint_rounds = rounds;
         // Wave 12 types views once against production-only helper
         // returns, then unifies helper params from those sites. Helper
         // returns therefore settle only after the absorb/harvest above.
