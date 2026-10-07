@@ -2023,23 +2023,17 @@ fn build_from_raw_merge(class_id: &ClassId, entries: &[(Expr, Expr)], span: Span
 
 /// The factory's argument for the permit chain `chain`: `@params`, or,
 /// under `guard`, `@params` behind the refusal its source form makes in
-/// Rails - `Params.expect_present(@params, "<r>", [scalar keys],
-/// [array keys])` for `params.expect(r: [...])`, `Params.require_present(
-/// @params, "<r>")` for `params.require(:r).permit(...)`. A `.merge(...)`
-/// on top refuses as the chain it extends.
+/// Rails - `Params.expect_present(@params, "<r>", ...)` with the filter's
+/// keys by kind ([`ExpectKeys`]) for `params.expect(r: [...])`,
+/// `Params.require_present(@params, "<r>")` for
+/// `params.require(:r).permit(...)`. A `.merge(...)` on top refuses as
+/// the chain it extends.
 fn factory_arg(chain: &Expr, guard: bool, span: Span) -> Expr {
     let params_ivar = Expr::new(span, ExprNode::Ivar { name: Symbol::from("params") });
     if !guard {
         return params_ivar;
     }
     let str_lit = |v: &str| Expr::new(span, ExprNode::Lit { value: Literal::Str { value: v.to_string() } });
-    let str_array = |items: &[Symbol]| Expr::new(
-        span,
-        ExprNode::Array {
-            elements: items.iter().map(|s| str_lit(s.as_str())).collect(),
-            style: crate::expr::ArrayStyle::default(),
-        },
-    );
     let params_call = |method: &str, args: Vec<Expr>| Expr::new(
         span,
         ExprNode::Send {
@@ -2060,29 +2054,98 @@ fn factory_arg(chain: &Expr, guard: bool, span: Span) -> Expr {
             "expect" if is_bare_params(recv) && args.len() == 1 => {
                 let ExprNode::Hash { entries, .. } = &*args[0].node else { return params_ivar };
                 let [(k, v)] = entries.as_slice() else { return params_ivar };
-                let (Some(resource), Some((scalars, arrays))) = (sym_of(k), sym_array(v)) else {
+                let ExprNode::Array { elements, .. } = &*v.node else { return params_ivar };
+                let (Some(resource), Some(keys)) = (sym_of(k), expect_keys(elements)) else {
                     return params_ivar;
                 };
-                return params_call(
-                    "expect_present",
-                    vec![params_ivar, str_lit(resource.as_str()), str_array(&scalars), str_array(&arrays)],
-                );
+                return params_call("expect_present", expect_present_args(params_ivar, str_lit(resource.as_str()), &keys));
             }
             "permit" => {
                 let Some((resource, ())) = match_require_chain(recv) else { return params_ivar };
                 // `params.expect(r: [...])`, respelled by `rewrite_params`.
                 if node.decisions & crate::expr::FROM_PARAMS_EXPECT != 0 {
-                    let Some((scalars, arrays)) = collect_permit_args(args) else { return params_ivar };
-                    return params_call(
-                        "expect_present",
-                        vec![params_ivar, str_lit(resource.as_str()), str_array(&scalars), str_array(&arrays)],
-                    );
+                    let elements = match args.as_slice() {
+                        [single] => match &*single.node {
+                            ExprNode::Array { elements, .. } => elements.as_slice(),
+                            _ => args.as_slice(),
+                        },
+                        _ => args.as_slice(),
+                    };
+                    let Some(keys) = expect_keys(elements) else { return params_ivar };
+                    return params_call("expect_present", expect_present_args(params_ivar, str_lit(resource.as_str()), &keys));
                 }
                 return params_call("require_present", vec![params_ivar, str_lit(resource.as_str())]);
             }
             _ => return params_ivar,
         }
     }
+}
+
+/// An `expect` filter's keys by the value each accepts, as Rails'
+/// `expect` decides whether the resource holds anything permitted:
+/// `title` a scalar, `tags: []` an array of scalars, `settings: [:theme]`
+/// or `settings: {}` a hash, `items: [[:name]]` an array (of hashes).
+/// Separate from the record-field split ([`collect_permit_args`]), which
+/// only needs to know which keys are not scalars.
+#[derive(Default)]
+struct ExpectKeys {
+    scalars: Vec<Symbol>,
+    scalar_arrays: Vec<Symbol>,
+    hashes: Vec<Symbol>,
+    arrays: Vec<Symbol>,
+}
+
+fn expect_keys(elements: &[Expr]) -> Option<ExpectKeys> {
+    let mut keys = ExpectKeys::default();
+    for (i, el) in elements.iter().enumerate() {
+        if let Some(s) = sym_of(el) {
+            keys.scalars.push(s);
+            continue;
+        }
+        // Only the last element may be the keyword hash, as in
+        // [`sym_list`].
+        let ExprNode::Hash { entries, .. } = &*el.node else { return None };
+        if i + 1 != elements.len() || entries.is_empty() {
+            return None;
+        }
+        for (k, v) in entries {
+            let key = sym_of(k)?;
+            match &*v.node {
+                ExprNode::Hash { .. } => keys.hashes.push(key),
+                ExprNode::Array { elements, .. } => match elements.first().map(|e| &*e.node) {
+                    None => keys.scalar_arrays.push(key),
+                    Some(ExprNode::Array { .. }) => keys.arrays.push(key),
+                    Some(_) => keys.hashes.push(key),
+                },
+                _ => return None,
+            }
+        }
+    }
+    Some(keys)
+}
+
+/// `Params.expect_present(@params, "<r>", scalars, scalar_arrays, hashes,
+/// arrays)`'s arguments.
+fn expect_present_args(params_ivar: Expr, resource: Expr, keys: &ExpectKeys) -> Vec<Expr> {
+    let span = params_ivar.span;
+    let str_array = |items: &[Symbol]| Expr::new(
+        span,
+        ExprNode::Array {
+            elements: items
+                .iter()
+                .map(|s| Expr::new(span, ExprNode::Lit { value: Literal::Str { value: s.as_str().to_string() } }))
+                .collect(),
+            style: crate::expr::ArrayStyle::default(),
+        },
+    );
+    vec![
+        params_ivar,
+        resource,
+        str_array(&keys.scalars),
+        str_array(&keys.scalar_arrays),
+        str_array(&keys.hashes),
+        str_array(&keys.arrays),
+    ]
 }
 
 fn build_from_raw_call(class_id: &ClassId, span: Span, arg: Expr) -> Expr {

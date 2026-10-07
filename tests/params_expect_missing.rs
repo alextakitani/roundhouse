@@ -43,7 +43,7 @@ fn expect_is_guarded_by_its_own_refusal_on_the_ruby_family() {
     for target in [BuildTarget::Ruby, BuildTarget::Spinel] {
         let src = controller_for(target, "params.expect(article: [ :title, :body ])");
         assert!(
-            src.contains(r#"ArticleParams.from_raw(Params.expect_present(@params, "article", ["title", "body"], []))"#),
+            src.contains(r#"ArticleParams.from_raw(Params.expect_present(@params, "article", ["title", "body"], [], [], []))"#),
             "{target:?}:\n{src}"
         );
     }
@@ -65,4 +65,20 @@ fn strict_targets_keep_the_unguarded_factory() {
     assert!(!src.contains("expect_present"), "{src}");
     assert!(!src.contains("require_present"), "{src}");
     assert!(src.contains("from_raw"), "{src}");
+}
+
+/// Each nested key of an `expect` filter is passed by the kind of value
+/// its filter takes, as Rails' `expect` checks it: `tags: []` an array of
+/// scalars, `settings: [:theme]` and `prefs: {}` a hash, `items: [[:name]]`
+/// an array of hashes.
+#[test]
+fn expect_passes_nested_keys_by_the_value_their_filter_takes() {
+    let src = controller_for(
+        BuildTarget::Ruby,
+        "params.expect(article: [ :title, settings: [ :theme ], tags: [], items: [ [ :name ] ], prefs: {} ])",
+    );
+    assert!(
+        src.contains(r#"Params.expect_present(@params, "article", ["title"], ["tags"], ["settings", "prefs"], ["items"])"#),
+        "{src}"
+    );
 }

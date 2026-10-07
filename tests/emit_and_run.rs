@@ -7932,3 +7932,44 @@ puts "require.permit refuses like Rails"
         )
         .assert_passes();
 }
+
+/// `Params.expect_present` accepts a nested key only with the kind of
+/// value its filter takes. Every row is Rails 8.1.4's
+/// `ActionController::Parameters#expect` on `{"article" => {key => value}}`.
+#[test]
+fn expect_nested_filters_accept_what_rails_accepts() {
+    emit_and_run::real_blog()
+        .run_ruby(
+            r##"
+# filter kind => [scalars, scalar arrays, hashes, arrays] for key "k"
+KINDS = {
+  "settings: [:theme]" => [[], [], ["k"], []],
+  "tags: []" => [[], ["k"], [], []],
+  "items: [[:name]]" => [[], [], [], ["k"]],
+}
+VALUES = {
+  "hash with key" => {"theme" => "dark"}, "hash other key" => {"x" => "1"}, "empty hash" => {},
+  "array of str" => ["a"], "array of hash" => [{"name" => "n"}], "empty array" => [], "scalar" => "s",
+}
+RAILS_ACCEPTS = {
+  "settings: [:theme]" => ["hash with key", "hash other key", "empty hash"],
+  "tags: []" => ["array of str", "empty array"],
+  "items: [[:name]]" => ["array of str", "array of hash", "empty array"],
+}
+KINDS.each do |kind, (scalars, scalar_arrays, hashes, arrays)|
+  VALUES.each do |name, value|
+    accepted = begin
+      Params.expect_present({"article" => {"k" => value}}, "article", scalars, scalar_arrays, hashes, arrays)
+      true
+    rescue ActionController::ParameterMissing
+      false
+    end
+    want = RAILS_ACCEPTS[kind].include?(name)
+    raise "#{kind} with #{name}: Rails #{want ? "accepts" : "refuses"}, got #{accepted ? "accepted" : "refused"}" unless accepted == want
+  end
+end
+puts "nested expect filters match Rails"
+"##,
+        )
+        .assert_passes();
+}

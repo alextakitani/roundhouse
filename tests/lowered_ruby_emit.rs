@@ -842,7 +842,7 @@ fn controllers_article_params_lowers_to_typed_factory() {
     assert!(
         // The ruby family hands the factory `@params` behind
         // `expect`'s refusal (ParameterMissing → 400, as Rails).
-        src.contains(r#"ArticleParams.from_raw(Params.expect_present(@params, "article", ["title", "body"], []))"#),
+        src.contains(r#"ArticleParams.from_raw(Params.expect_present(@params, "article", ["title", "body"], [], [], []))"#),
         "expected typed-factory lowering; got:\n{src}",
     );
     assert!(
@@ -1167,7 +1167,7 @@ fn controllers_params_helper_body_is_from_raw_call() {
         .split("def article_params").nth(1).unwrap()
         .split("end").next().unwrap();
     assert!(
-        body.contains(r#"ArticleParams.from_raw(Params.expect_present(@params, "article", ["title", "body"], []))"#),
+        body.contains(r#"ArticleParams.from_raw(Params.expect_present(@params, "article", ["title", "body"], [], [], []))"#),
         "expected typed-factory body; got:\n{body}",
     );
     assert!(

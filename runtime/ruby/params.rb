@@ -98,10 +98,12 @@ module Params
   # typed factory reads the resource: `params` back unchanged, or
   # `ParameterMissing` (400 when the app does not rescue it). Rails
   # refuses unless the value is a Hash holding at least one permitted
-  # key: a scalar under a scalar key (`expect(r: [:title])`) or an Array
-  # under an array key (`expect(r: [tags: []])`). A missing key, nil, "",
-  # {}, a scalar, an array, and a hash of only unpermitted keys all raise.
-  def self.expect_present(params, key, fields, array_fields)
+  # key with the kind of value its filter takes: a scalar under a scalar
+  # key (`:title`), an array of scalars under `tags: []`, a hash under
+  # `settings: [:theme]` or `settings: {}`, an array under
+  # `items: [[:name]]`. A missing key, nil, "", {}, a scalar, an array,
+  # and a hash of only unpermitted or mistyped keys all raise.
+  def self.expect_present(params, key, fields, scalar_array_fields, hash_fields, array_fields)
     value = params.fetch(key, "")
     if value.is_a?(Hash)
       i = 0
@@ -114,6 +116,21 @@ module Params
         i = i + 1
       end
       i = 0
+      while i < scalar_array_fields.length
+        field = scalar_array_fields[i]
+        if value.key?(field)
+          inner = value.fetch(field, "")
+          return params if inner.is_a?(Array) && Params.scalars_only(inner)
+        end
+        i = i + 1
+      end
+      i = 0
+      while i < hash_fields.length
+        field = hash_fields[i]
+        return params if value.key?(field) && value.fetch(field, "").is_a?(Hash)
+        i = i + 1
+      end
+      i = 0
       while i < array_fields.length
         field = array_fields[i]
         return params if value.key?(field) && value.fetch(field, "").is_a?(Array)
@@ -121,6 +138,17 @@ module Params
       end
     end
     raise(ActionController::ParameterMissing.new(key))
+  end
+
+  # Does `items` hold only scalars - what `tags: []` permits?
+  def self.scalars_only(items)
+    i = 0
+    while i < items.length
+      item = items[i]
+      return false if item.is_a?(Hash) || item.is_a?(Array)
+      i = i + 1
+    end
+    true
   end
 
   # `params.require(key).permit(...)`'s refusal. Laxer than `expect`, as
