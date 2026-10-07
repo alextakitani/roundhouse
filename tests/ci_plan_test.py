@@ -574,6 +574,8 @@ class Routing(unittest.TestCase):
             # database suites its `db` name would otherwise select.
             "runtime/spinel/db_pg.rb": ["spinel_pg_db"],
             "runtime/spinel/db_pg.rbs": ["spinel_pg_db"],
+            "runtime/spinel/pg_errors.rb": ["spinel_pg_db"],
+            "runtime/spinel/pg_errors.rbs": ["spinel_pg_db"],
             "tests/spinel_pg_db_cases.rb": ["spinel_pg_db"],
             "runtime/ruby/db.rbs": [
                 "framework_tests_spinel",

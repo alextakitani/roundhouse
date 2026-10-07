@@ -32,11 +32,20 @@
 #   Db.finalize(h)       — releases the handle.
 #   Db.exec(sql)         — simple query; `changes` comes from its tag.
 #
-# Not here yet: RETURNING, transaction pinning and the SQLSTATE mapping
-# to ActiveRecord exceptions (driver errors surface as PG::Error), and a
-# sharded pool with named statements cached per connection and a request
-# query cache. The SQLite-only entry points the server boot calls are
-# no-ops, except `seed_from_file`, which raises (see below).
+# Writes: `exec`, and `exec_returning` for a write with a RETURNING
+# clause, which answers a handle over the returned rows. Server errors
+# with a SQLSTATE that ActiveRecord names are raised as that class
+# (pg_errors.rb); others surface as the driver's PG::Error. A
+# transaction keeps its connection: inside a lease that is the leased
+# one, and a BEGIN outside a lease pins the connection to the thread
+# until COMMIT or ROLLBACK. A lease that ends with a transaction still
+# open (or failed) rolls it back before the connection is reused, and a
+# connection whose session ended is reopened on next use.
+#
+# Not here yet: a sharded pool with named statements cached per
+# connection, and a request query cache. The SQLite-only entry points
+# the server boot calls are no-ops, except `seed_from_file`, which
+# raises (see below).
 #
 # The SQL-functions hook: project.rs installs an app's SQLite functions
 # by patching a connection-open anchor in runtime/db.rb. This file does
@@ -48,6 +57,7 @@
 # Integer handles, assign-then-return, and `rescue PG::Error => e`
 # (typed) before reading anything from a driver error.
 require "pg"
+require_relative "pg_errors"
 
 # Connection settings from a URL, then the libpq PG* environment
 # variables, then libpq's defaults (localhost:5432, database named after
@@ -380,16 +390,79 @@ class PgConn
   end
 
   def run(st)
-    r = client.exec_params(st.sql, st.params)
-    st.finish(r)
+    begin
+      r = client.exec_params(st.sql, st.params)
+      st.finish(r)
+    rescue PG::Error => e
+      PgErrors.raise_mapped(e.result.error_field(PG::PG_DIAG_SQLSTATE).to_s, e.message)
+      raise e
+    end
     nil
   end
 
   def exec(sql)
-    r = client.exec(sql)
-    @last_tag = r.cmd_tag
-    @changes = Db.tag_count(@last_tag)
-    @last_insert_table = @last_tag.start_with?("INSERT ") ? Db.insert_target(sql) : ""
+    simple(sql)
+    nil
+  end
+
+  # A simple query: the result, with its row count and INSERT target
+  # recorded for `changes` and `last_insert_rowid`.
+  def simple(sql)
+    begin
+      r = client.exec(sql)
+      @last_tag = r.cmd_tag
+      @changes = Db.tag_count(@last_tag)
+      @last_insert_table = @last_tag.start_with?("INSERT ") ? Db.insert_target(sql) : ""
+      return r
+    rescue PG::Error => e
+      PgErrors.raise_mapped(e.result.error_field(PG::PG_DIAG_SQLSTATE).to_s, e.message)
+      raise e
+    end
+  end
+
+  # A handle over a write's returned rows, already in hand.
+  def returning(sql)
+    r = simple(sql)
+    h = open_stmt(sql)
+    stmt(h).finish(r)
+    h
+  end
+
+  # From the last ReadyForQuery; UNKNOWN before the first connect and
+  # after the session ended.
+  def status
+    c = @client
+    return PG::PQTRANS_IDLE if c.nil?
+    c.transaction_status
+  end
+
+  # Lease-end hygiene: roll back a transaction the holder left open or
+  # failed, and drop a session that ended (FATAL, lost transport) so the
+  # next use reconnects. Never raises; a failed ROLLBACK drops the session.
+  def reset_for_reuse
+    st = status
+    if st == PG::PQTRANS_INTRANS || st == PG::PQTRANS_INERROR
+      begin
+        client.exec("ROLLBACK")
+      rescue StandardError
+        drop
+      end
+    elsif st == PG::PQTRANS_UNKNOWN
+      drop
+    end
+    nil
+  end
+
+  # Forget the session without the Terminate handshake.
+  def drop
+    c = @client
+    @client = nil
+    release_all
+    begin
+      c.close if !c.nil?
+    rescue StandardError
+      nil
+    end
     nil
   end
 
@@ -534,6 +607,9 @@ module Db
   # Request-scoped lease. Handles left open by the block are released
   # with the lease, and the release runs even when the block raises.
   def self.with_connection
+    # Re-entrant: a nested lease, or one inside a transaction a BEGIN
+    # outside any lease pinned, keeps the thread's connection.
+    return yield if !Thread.current[:db_conn].nil?
     pool = Db.pool
     idx = pool.lease
     conn = pool.conn(idx)
@@ -550,6 +626,7 @@ module Db
       rescue StandardError => e
         cleanup_error = e
       ensure
+        conn.reset_for_reuse
         Thread.current[:db_conn] = nil
         pool.release(idx)
       end
@@ -610,10 +687,38 @@ module Db
 
   def self.exec(sql)
     record_query(sql)
-    current_conn.exec(sql)
+    conn = current_conn
+    conn.exec(sql)
+    Db.pin_transaction(conn)
     # A value, not nil, for the same reason as db.rb: `result = yield`
     # in with_connection cannot hold a void.
     true
+  end
+
+  # A BEGIN outside a lease binds its connection to this thread until
+  # the transaction ends, so a lease taken inside it (with_connection)
+  # writes through the same session instead of committing on another.
+  def self.pin_transaction(conn)
+    if conn.status == PG::PQTRANS_IDLE
+      Thread.current[:db_conn] = nil if Thread.current[:db_txn_pin] == true
+      Thread.current[:db_txn_pin] = false
+    elsif !Db.in_lease?
+      Thread.current[:db_conn] = conn
+      Thread.current[:db_txn_pin] = true
+    end
+    nil
+  end
+
+  # A write with a RETURNING clause (roundhouse#91): runs once, inline,
+  # like `exec`, and answers a handle over the returned rows
+  # (step?/column_*/finalize, as for a read). `changes` is its row count.
+  # There is no query cache to invalidate yet.
+  def self.exec_returning(sql)
+    record_query(sql)
+    conn = current_conn
+    h = conn.returning(sql)
+    Db.pin_transaction(conn)
+    h
   end
 
   def self.prepare(sql)

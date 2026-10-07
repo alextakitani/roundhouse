@@ -71,6 +71,8 @@ SPINEL_TESTS = [
 PG_DB_INPUTS = {
     "runtime/spinel/db_pg.rb",
     "runtime/spinel/db_pg.rbs",
+    "runtime/spinel/pg_errors.rb",
+    "runtime/spinel/pg_errors.rbs",
     "runtime/ruby/db.rbs",
     "runtime/spinel/active_support_time_parsing.rb",
     "runtime/spinel/active_support_time_parsing.rbs",
@@ -260,7 +262,7 @@ def native_coverage(path):
             )
         ) or path.startswith("runtime/spinel/tep/url."):
             owned_tests.add("rails_compat_vectors_spinel")
-        if name in {"db_pg.rb", "db_pg.rbs"}:
+        if name in {"db_pg.rb", "db_pg.rbs", "pg_errors.rb", "pg_errors.rbs"}:
             # PostgreSQL, not SQLite: the SQLite database suites below
             # never load it.
             owned_tests.add("spinel_pg_db")

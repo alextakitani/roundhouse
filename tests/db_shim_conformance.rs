@@ -431,13 +431,15 @@ fn ruby_family_shims_declare_optional_binds() {
 
 /// `exec_returning` (roundhouse#91): a write with a RETURNING clause
 /// that answers a handle over the returned rows. Declared once in the
-/// ruby-family contract, so every Ruby-family shim implements it; a
+/// ruby-family contract, so every Ruby-family shim implements it (the
+/// PostgreSQL one natively); a
 /// SQLite without RETURNING (before 3.35) raises rather than being
 /// exempted.
 const RUBY_FAMILY_RETURNING_SHIMS: &[&str] = &[
     "runtime/spinel/db.rb",
     "runtime/spinel/db_cruby.rb",
     "runtime/spinel/db_jruby.rb",
+    "runtime/spinel/db_pg.rb",
 ];
 
 #[test]

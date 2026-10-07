@@ -70,6 +70,11 @@ class PgConn
   def open_count: () -> Integer
   def run: (PgStmt st) -> nil
   def exec: (String sql) -> nil
+  def simple: (String sql) -> PgResult
+  def returning: (String sql) -> Integer
+  def status: () -> Integer
+  def reset_for_reuse: () -> nil
+  def drop: () -> nil
   def last_insert_table: () -> String
   def inserted_key: (String table) -> Integer
   def close: () -> nil
@@ -90,6 +95,7 @@ module Db
   def self.pool: () -> PgPool
   def self.current_conn: () -> PgConn
   def self.in_lease?: () -> bool
+  def self.pin_transaction: (PgConn conn) -> nil
   def self.with_connection: [T] () { () -> T } -> T
   def self.read_snapshot_begin: () -> bool
   def self.read_snapshot_end: () -> bool

@@ -12,6 +12,26 @@ module ActiveSupport
   end
 end
 
+# The app runtime defines these (runtime/ruby/active_record/errors.rb);
+# pg_errors.rb raises them.
+module ActiveRecord
+  class RecordNotUnique < StandardError
+  end
+
+  class ValueTooLong < StandardError
+  end
+end
+
+def sqlstate_of
+  code = ""
+  begin
+    yield
+  rescue PG::Error => e
+    code = e.result.error_field(PG::PG_DIAG_SQLSTATE).to_s
+  end
+  code
+end
+
 $checks = 0
 
 def check(label, ok)
@@ -69,13 +89,19 @@ s = schema + "."
 Db.exec("DROP SCHEMA IF EXISTS " + schema + " CASCADE")
 Db.exec("CREATE SCHEMA " + schema)
 
-begin
+# Each case is its own method: one top-level function holding every
+# case makes the C compiler crawl.
+
+def case_01(s, schema)
   Db.exec("CREATE TABLE " + s + "widgets (id bigserial PRIMARY KEY, name text NOT NULL, " +
           "active boolean, weight float8, made_at timestamp(6), gadget_id integer)")
   Db.exec("CREATE TABLE " + s + "gadgets (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), label text)")
   check_int("DDL changes", 0, Db.changes)
   check_raises("last_insert_rowid needs an INSERT", "was not an INSERT") { Db.last_insert_rowid }
+  nil
+end
 
+def case_02(s, schema)
   # ── Inline writes through the escape helpers ──
 
   Db.exec("INSERT INTO " + s + "widgets (name, active, weight, made_at, gadget_id) VALUES (" +
@@ -115,7 +141,10 @@ begin
   check_str("escape_int_list", "1, 2, 3", Db.escape_int_list([1, 2, 3]))
   check_str("escape_int_list empty", "NULL", Db.escape_int_list([]))
   check_str("escape_string_opt nil", "NULL", Db.escape_string_opt(nil))
+  nil
+end
 
+def case_03(s, schema)
   # ── Bound reads ──
 
   # Column metadata before the first step runs the statement (PostgreSQL
@@ -167,7 +196,10 @@ begin
   check("third row", Db.step?(h))
   check("NULL bool reads nil", Db.column_bool_opt(h, 0).nil?)
   Db.finalize(h)
+  nil
+end
 
+def case_04(s, schema)
   # Text and bool binds together.
   h = Db.prepare("SELECT id FROM " + s + "widgets WHERE name = $1 AND active = $2")
   Db.bind_text(h, 1, "gädget ✓ \\ back")
@@ -175,7 +207,10 @@ begin
   check("text + bool binds", Db.step?(h))
   check_int("text + bool row", 2, Db.column_int(h, 0))
   Db.finalize(h)
+  nil
+end
 
+def case_05(s, schema)
   # A nullable predicate renders IS NULL with no slot; the next value
   # keeps position $1.
   h = Db.prepare("SELECT id FROM " + s + "widgets WHERE gadget_id IS NULL AND name = $1")
@@ -198,7 +233,10 @@ begin
   check("bind_int nil is NULL", Db.column_bool(h, 3))
   check("bind_bool true is true", Db.column_bool(h, 4))
   Db.finalize(h)
+  nil
+end
 
+def case_06(s, schema)
   # Several rows, in order, then done.
   h = Db.prepare_uncached("SELECT id FROM " + s + "widgets WHERE id >= $1 ORDER BY id")
   Db.bind_int(h, 1, 1)
@@ -208,7 +246,10 @@ begin
   end
   Db.finalize(h)
   check_str("multi-row stepping", "[1, 2, 3]", ids.inspect)
+  nil
+end
 
+def case_07(s, schema)
   # Zero rows.
   h = Db.prepare("SELECT id, name FROM " + s + "widgets WHERE id = $1")
   Db.bind_int(h, 1, 999)
@@ -227,7 +268,10 @@ begin
   check_str("column_value false", "0", Db.column_value(h, 4).inspect)
   check("column_value NULL", Db.column_value(h, 5).nil?)
   Db.finalize(h)
+  nil
+end
 
+def case_08(s, schema)
   # ── Writes and their row counts ──
 
   Db.exec("UPDATE " + s + "widgets SET weight = 9.5 WHERE gadget_id = " + Db.escape_int(7))
@@ -241,7 +285,10 @@ begin
   Db.finalize(h)
   Db.exec("DELETE FROM " + s + "widgets WHERE id = 3")
   check_int("delete changes", 1, Db.changes)
+  nil
+end
 
+def case_09(s, schema)
   # ── Handle lifecycle ──
 
   conn = Db.current_conn
@@ -257,7 +304,10 @@ begin
   check_raises("old handle still refused", "unknown or finalized") { Db.column_int(h, 0) }
   Db.finalize(h2)
   Db.finalize(h2)
+  nil
+end
 
+def case_10(s, schema)
   # ── Leases ──
 
   check("no lease outside", !Db.in_lease?)
@@ -286,7 +336,176 @@ begin
   end
   check_int("released after the error", 0, leased.open_count)
   check("no lease after the error", !Db.in_lease?)
+  nil
+end
 
+def case_11(s, schema)
+  # ── Writes that return rows ──
+
+  h = Db.exec_returning("INSERT INTO " + s + "widgets (name) VALUES ('ret-a'), ('ret-b') RETURNING id, name")
+  check_int("returning changes", 2, Db.changes)
+  check_int("returning column count", 2, Db.column_count(h))
+  check("first returned row", Db.step?(h))
+  first_id = Db.column_int(h, 0)
+  check_str("first returned name", "ret-a", Db.column_text(h, 1))
+  check("second returned row", Db.step?(h))
+  check_int("returned ids ascend", first_id + 1, Db.column_int(h, 0))
+  check("returned rows end", !Db.step?(h))
+  Db.finalize(h)
+  h = Db.exec_returning("INSERT INTO " + s + "gadgets (label) VALUES ('ret-uuid') RETURNING id")
+  check("uuid key returned", Db.step?(h))
+  check_int("uuid key as text", 36, Db.column_text(h, 0).length)
+  Db.finalize(h)
+  h = Db.exec_returning("UPDATE " + s + "widgets SET weight = 0 WHERE name LIKE 'ret-%' RETURNING id")
+  check_int("update returning changes", 2, Db.changes)
+  Db.finalize(h)
+  h = Db.exec_returning("DELETE FROM " + s + "widgets WHERE id = -1 RETURNING id")
+  check_int("no-match returning changes", 0, Db.changes)
+  check("no-match returns no rows", !Db.step?(h))
+  Db.finalize(h)
+  Db.exec("DELETE FROM " + s + "widgets WHERE name LIKE 'ret-%'")
+  nil
+end
+
+def case_12(s, schema)
+  # ── SQLSTATE mapping ──
+
+  Db.exec("CREATE TABLE " + s + "tags (id serial PRIMARY KEY, name varchar(3) NOT NULL UNIQUE)")
+  Db.exec("INSERT INTO " + s + "tags (name) VALUES ('red')")
+  dup = ""
+  begin
+    Db.exec("INSERT INTO " + s + "tags (name) VALUES ('red')")
+  rescue ActiveRecord::RecordNotUnique => e
+    dup = e.message
+  end
+  check("23505 is RecordNotUnique", dup.include?("duplicate key"))
+  dup = ""
+  begin
+    h = Db.exec_returning("INSERT INTO " + s + "tags (name) VALUES ('red') RETURNING id")
+  rescue ActiveRecord::RecordNotUnique => e
+    dup = e.message
+  end
+  check("23505 from exec_returning", dup.include?("duplicate key"))
+  long = ""
+  begin
+    Db.exec("INSERT INTO " + s + "tags (name) VALUES ('purple')")
+  rescue ActiveRecord::ValueTooLong => e
+    long = e.message
+  end
+  check("22001 is ValueTooLong", long.include?("too long"))
+  h = Db.prepare("INSERT INTO " + s + "tags (name) VALUES ($1) RETURNING id")
+  Db.bind_text(h, 1, "red")
+  dup = ""
+  begin
+    Db.step?(h)
+  rescue ActiveRecord::RecordNotUnique => e
+    dup = e.message
+  end
+  Db.finalize(h)
+  check("23505 from a bound statement", dup.include?("duplicate key"))
+  check_str("unmapped codes stay PG::Error", "23502",
+            sqlstate_of { Db.exec("INSERT INTO " + s + "tags (name) VALUES (NULL)") })
+  nil
+end
+
+def case_13(s, schema)
+  # ── Transactions ──
+
+  Db.with_connection do
+    Db.exec("BEGIN")
+    Db.exec("INSERT INTO " + s + "tags (name) VALUES ('tmp')")
+    Db.exec("ROLLBACK")
+  end
+  h = Db.prepare("SELECT count(*) FROM " + s + "tags WHERE name = 'tmp'")
+  check("count row", Db.step?(h))
+  check_int("a rolled-back transaction leaves no row", 0, Db.column_int(h, 0))
+  Db.finalize(h)
+
+  Db.with_connection do
+    conn = Db.current_conn
+    Db.exec("BEGIN")
+    dup = ""
+    begin
+      Db.exec("INSERT INTO " + s + "tags (name) VALUES ('red')")
+    rescue ActiveRecord::RecordNotUnique => e
+      dup = e.message
+    end
+    check("duplicate inside a transaction", dup != "")
+    check_int("failed transaction status", PG::PQTRANS_INERROR, conn.status)
+    check_str("the next statement is refused", "25P02", sqlstate_of { Db.exec("SELECT 1") })
+    Db.exec("ROLLBACK")
+    check_int("idle after ROLLBACK", PG::PQTRANS_IDLE, conn.status)
+    Db.exec("INSERT INTO " + s + "tags (name) VALUES ('blu')")
+    check_int("usable after ROLLBACK", 1, Db.changes)
+  end
+  nil
+end
+
+def case_14(s, schema)
+  # A lease that ends inside a transaction, or after a failure in one,
+  # rolls back before the connection is reused.
+  leased = Db.current_conn
+  check_raises("abandoned transaction", "tag failure") do
+    Db.with_connection do
+      leased = Db.current_conn
+      Db.exec("BEGIN")
+      Db.exec("INSERT INTO " + s + "tags (name) VALUES ('grn')")
+      raise "tag failure"
+    end
+  end
+  check_int("abandoned lease returns idle", PG::PQTRANS_IDLE, leased.status)
+  h = Db.prepare("SELECT count(*) FROM " + s + "tags WHERE name = 'grn'")
+  check("abandoned count row", Db.step?(h))
+  check_int("abandoned transaction rolled back", 0, Db.column_int(h, 0))
+  Db.finalize(h)
+  Db.with_connection do
+    leased = Db.current_conn
+    Db.exec("BEGIN")
+    sqlstate_of { Db.exec("SELECT 1/0") }
+  end
+  check_int("failed transaction returns idle", PG::PQTRANS_IDLE, leased.status)
+  nil
+end
+
+def case_15(s, schema)
+  # A BEGIN outside a lease keeps its connection for a lease taken inside it.
+  Db.exec("BEGIN")
+  Db.with_connection do
+    Db.exec("INSERT INTO " + s + "tags (name) VALUES ('yel')")
+  end
+  Db.exec("ROLLBACK")
+  check("unpinned after ROLLBACK", !Db.in_lease?)
+  h = Db.prepare("SELECT count(*) FROM " + s + "tags WHERE name = 'yel'")
+  check("pinned count row", Db.step?(h))
+  check_int("a lease inside a transaction joins it", 0, Db.column_int(h, 0))
+  Db.finalize(h)
+  nil
+end
+
+def case_16(s, schema)
+  # A session the server ended is reopened on the next lease.
+  pid = 0
+  leased = Db.current_conn
+  Db.with_connection do
+    leased = Db.current_conn
+    h = Db.prepare("SELECT pg_backend_pid()")
+    Db.step?(h)
+    pid = Db.column_int(h, 0)
+    Db.finalize(h)
+    Db.pool.first.exec("SELECT pg_terminate_backend(" + pid.to_s + ")")
+    check_raises("terminated session", "connection") { Db.exec("SELECT 1") }
+  end
+  Db.with_connection do
+    check("same connection slot", Db.current_conn == leased)
+    h = Db.prepare("SELECT pg_backend_pid()")
+    check("reopened session answers", Db.step?(h))
+    check("a new backend", Db.column_int(h, 0) != pid)
+    Db.finalize(h)
+  end
+  nil
+end
+
+def case_17(s, schema)
   # ── Server errors leave the connection usable ──
 
   failed = false
@@ -301,7 +520,10 @@ begin
   check("usable after an error", Db.step?(h))
   check_int("usable after an error value", 42, Db.column_int(h, 0))
   Db.finalize(h)
+  nil
+end
 
+def case_18(s, schema)
   # ── SQLite-only entry points ──
 
   check("read_snapshot_begin no-op", Db.read_snapshot_begin)
@@ -310,7 +532,10 @@ begin
   check("query_cache_begin no-op", Db.query_cache_begin.nil?)
   check("query_cache_end no-op", Db.query_cache_end.nil?)
   check_raises("seed_from_file refused", "pg_restore") { Db.seed_from_file("widgets.sqlite3") }
+  nil
+end
 
+def case_19(s, schema)
   # ── Query capture ──
 
   log = Db.capture_sql do
@@ -320,7 +545,34 @@ begin
   end
   check_str("capture_sql", "[\"SELECT 1\", \"SELECT 2\"]", log.inspect)
   check("sql_trace off", !Db.sql_trace?)
+  nil
+end
+
+begin
+  case_01(s, schema)
+  case_02(s, schema)
+  case_03(s, schema)
+  case_04(s, schema)
+  case_05(s, schema)
+  case_06(s, schema)
+  case_07(s, schema)
+  case_08(s, schema)
+  case_09(s, schema)
+  case_10(s, schema)
+  case_11(s, schema)
+  case_12(s, schema)
+  case_13(s, schema)
+  case_14(s, schema)
+  case_15(s, schema)
+  case_16(s, schema)
+  case_17(s, schema)
+  case_18(s, schema)
+  case_19(s, schema)
 ensure
+  # Close every session first: a failed case can leave one holding locks
+  # the DROP would otherwise wait on forever.
+  Db.close
+  Db.configure(url, pool_size: 1)
   Db.exec("DROP SCHEMA IF EXISTS " + schema + " CASCADE")
 end
 

@@ -66,13 +66,14 @@ fn spinel_gate_pg_db_bound_reads_and_writes() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("sig")).unwrap();
     let _cleanup = ScratchDir(dir.clone());
-    for name in ["db_pg.rb", "active_support_time_parsing.rb"] {
+    for name in ["db_pg.rb", "pg_errors.rb", "active_support_time_parsing.rb"] {
         let src = root.join("runtime/spinel").join(name);
         std::fs::copy(&src, dir.join(name))
             .unwrap_or_else(|e| panic!("copy {}: {e}", src.display()));
     }
     for rbs in [
         "runtime/spinel/db_pg.rbs",
+        "runtime/spinel/pg_errors.rbs",
         "runtime/ruby/db.rbs",
         "runtime/spinel/active_support_time_parsing.rbs",
     ] {
@@ -99,7 +100,11 @@ fn spinel_gate_pg_db_bound_reads_and_writes() {
             "pg_db_gate",
         ])
         .current_dir(&dir));
-    let stdout = run(Command::new(dir.join("pg_db_gate"))
+    // Bounded: a lock left behind by a broken case must fail the gate,
+    // not hang the CI job.
+    let stdout = run(Command::new("timeout")
+        .arg("300")
+        .arg(dir.join("pg_db_gate"))
         .env("DATABASE_URL", &url)
         .env(
             "SPINEL_PG_SCHEMA",
@@ -144,21 +149,27 @@ fn definitions(src: &str, rbs: bool) -> BTreeSet<(String, String)> {
     out
 }
 
-/// Every method the shim defines carries a signature: the contract in
-/// runtime/ruby/db.rbs, or the shim's own runtime/spinel/db_pg.rbs. Both
-/// files parse as RBS.
+/// Every method the shim (db_pg.rb, pg_errors.rb) defines carries a
+/// signature: the contract in runtime/ruby/db.rbs, or the shim's own
+/// db_pg.rbs / pg_errors.rbs. All of them parse as RBS.
 #[test]
 fn db_pg_rbs_declares_every_method() {
-    let ruby = std::fs::read_to_string("runtime/spinel/db_pg.rb").unwrap();
-    let own = std::fs::read_to_string("runtime/spinel/db_pg.rbs").unwrap();
-    let contract = std::fs::read_to_string("runtime/ruby/db.rbs").unwrap();
-    for (path, src) in [
-        ("runtime/spinel/db_pg.rbs", &own),
-        ("runtime/ruby/db.rbs", &contract),
-    ] {
-        roundhouse::rbs::parse_app_signatures(src)
-            .unwrap_or_else(|e| panic!("{path} does not parse: {e}"));
+    let read =
+        |path: &str| std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let contract = read("runtime/ruby/db.rbs");
+    let mut ruby = String::new();
+    let mut own = String::new();
+    for stem in ["runtime/spinel/db_pg", "runtime/spinel/pg_errors"] {
+        ruby.push_str(&read(&format!("{stem}.rb")));
+        ruby.push('\n');
+        let rbs = read(&format!("{stem}.rbs"));
+        roundhouse::rbs::parse_app_signatures(&rbs)
+            .unwrap_or_else(|e| panic!("{stem}.rbs does not parse: {e}"));
+        own.push_str(&rbs);
+        own.push('\n');
     }
+    roundhouse::rbs::parse_app_signatures(&contract)
+        .unwrap_or_else(|e| panic!("runtime/ruby/db.rbs does not parse: {e}"));
     let mut declared = definitions(&own, true);
     declared.extend(definitions(&contract, true));
     let defined = definitions(&ruby, false);
@@ -173,7 +184,7 @@ fn db_pg_rbs_declares_every_method() {
         .collect();
     assert!(
         missing.is_empty(),
-        "runtime/spinel/db_pg.rb defines methods with no RBS signature:\n  {}",
+        "the PostgreSQL shim defines methods with no RBS signature:\n  {}",
         missing.join("\n  ")
     );
     let stale: Vec<String> = definitions(&own, true)
@@ -182,7 +193,7 @@ fn db_pg_rbs_declares_every_method() {
         .collect();
     assert!(
         stale.is_empty(),
-        "runtime/spinel/db_pg.rbs declares methods db_pg.rb does not define:\n  {}",
+        "the PostgreSQL shim RBS declares methods the shim does not define:\n  {}",
         stale.join("\n  ")
     );
 }
