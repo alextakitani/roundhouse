@@ -31,6 +31,12 @@ unified parameter over 512 type nodes is cut to the deepest container
 nesting that fits, and none nests more than 16 containers; a cut
 position reads `untyped`. This lattice has no recursive types, so past
 the bound the position is gradual rather than a deeper copy each round.
+Gradual is a warning, and no target rejects it at emit. The walks the
+bound exists for are an open gap on Rust whether or not it cuts them: a
+value that may be a Hash, an Array or a scalar renders as
+`serde_json::Value`, the `transform_values` / `map` after each `is_a?`
+check do not compile against it, and `check` reports no error. The
+emitted Ruby runs.
 A companion fixpoint (`Analyzer::build_constant_registry`) types
 app-level constants — see below. After convergence,
 `stamp_inferred_library_signatures` writes what inference discovered
