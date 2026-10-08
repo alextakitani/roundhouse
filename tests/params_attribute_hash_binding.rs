@@ -278,3 +278,63 @@ fn to_attrs_follows_attribute_hash_demand() {
         "NoteParams grows to_attrs once file! binds Attrs:\n{params}"
     );
 }
+
+/// Body-wins is not census-wins-always: an opaque local still collapses
+/// the binding when the body does not need a Hash.
+#[test]
+fn opaque_local_still_poisons_when_body_does_not_need_hash() {
+    let mut app = ingest_app_from_tree(tree(&[
+        ("db/schema.rb", SCHEMA),
+        (
+            "app/models/note.rb",
+            r#"class Note < ApplicationRecord
+  def self.echo!(attributes)
+    attributes
+  end
+end
+"#,
+        ),
+        (
+            "app/models/webhook.rb",
+            r#"class Webhook
+  def self.deliver(note)
+    bag = { text: "x" }
+    note.class.echo!(bag)
+  end
+end
+"#,
+        ),
+        (
+            "app/controllers/messages_controller.rb",
+            r#"class MessagesController < ApplicationController
+  def create
+    @room = Room.find(params[:room_id])
+    Note.echo!(note_params)
+  end
+
+  private
+    def note_params
+      params.require(:note).permit(:text)
+    end
+end
+"#,
+        ),
+        (
+            "app/models/room.rb",
+            r#"class Room < ApplicationRecord
+  has_many :notes
+end
+"#,
+        ),
+    ]))
+    .expect("ingest");
+    roundhouse::session::analyze_and_lower(&mut app);
+    let ctrl = emitted(
+        &ruby::emit_lowered_controllers(&app),
+        "app/controllers/messages_controller.rb",
+    );
+    assert!(
+        !ctrl.contains("note_params.to_attrs"),
+        "opaque local without hash-only body must not force Attrs:\n{ctrl}"
+    );
+}

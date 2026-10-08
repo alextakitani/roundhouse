@@ -410,9 +410,12 @@ fn scan_bindings(app: &App, specs: &ParamsSpecs) -> HashMap<BindKey, Binding> {
 /// The body was the evidence in both cases; one just had a second
 /// witness.
 ///
-/// `delete` and `[]=` only. `merge` is deliberately absent:
-/// `convert_attributes_in` already rewrites a params receiver's `merge`
-/// to `to_attrs.merge` at the site, so a body calling it proves nothing.
+/// Hash-only body uses: receiver `delete`/`[]=`/`[]=`-assign, or the
+/// parameter passed to AR ctors/mutators (`create!`, `new`, `update!`,
+/// `assign_attributes`, … — see [`HASH_CTOR_METHODS`]). `merge` is
+/// deliberately absent: `convert_attributes_in` already rewrites a
+/// params receiver's `merge` to `to_attrs.merge` at the site, so a body
+/// calling it proves nothing.
 fn hash_only_params(app: &App) -> std::collections::HashSet<BindKey> {
     let mut out = std::collections::HashSet::new();
     let unqualified = |id: &ClassId| Symbol::from(id.0.as_str().rsplit("::").next().unwrap_or(id.0.as_str()));
@@ -442,6 +445,17 @@ fn hash_only_params(app: &App) -> std::collections::HashSet<BindKey> {
     out
 }
 
+/// Runtime methods whose sole positional argument is an attribute hash.
+const HASH_CTOR_METHODS: &[&str] = &[
+    "create!",
+    "create",
+    "new",
+    "update!",
+    "update",
+    "assign_attributes",
+    "attributes=",
+];
+
 /// Is `name` used in a way only a Hash answers anywhere in `body`?
 fn uses_as_hash(body: &Expr, name: &Symbol) -> bool {
     let mut found = false;
@@ -461,16 +475,7 @@ fn uses_as_hash(body: &Expr, name: &Symbol) -> bool {
             ExprNode::Send { method, args, .. }
                 if args.len() == 1
                     && reads_name(&args[0])
-                    && matches!(
-                        method.as_str(),
-                        "create!"
-                            | "create"
-                            | "new"
-                            | "update!"
-                            | "update"
-                            | "assign_attributes"
-                            | "attributes="
-                    ) =>
+                    && HASH_CTOR_METHODS.contains(&method.as_str()) =>
             {
                 found = true;
             }
