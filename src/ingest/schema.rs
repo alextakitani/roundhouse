@@ -1392,7 +1392,8 @@ fn generated_column_from_options(
 
 /// A column-type name (`t.<type>` / `add_column …, :<type>`) to its
 /// `ColumnType`. The Postgres-only types map to their SQLite storage:
-/// `uuid` is its own variant (TEXT, typed String); `jsonb` is `json`;
+/// `uuid`, `json`, and `jsonb` retain distinct schema variants even when
+/// their shared SQLite/runtime representation uses text;
 /// `citext` is text; `timestamptz` is a datetime; the network types
 /// and a PG `enum` are strings. `timestamp` is Rails' own alias for
 /// `datetime` (`TableDefinition#timestamp`), which a MySQL-backed
@@ -1425,7 +1426,8 @@ fn column_with_type(
         "datetime" | "timestamp" | "timestamptz" => ColumnType::DateTime,
         "time" => ColumnType::Time,
         "binary" => ColumnType::Binary,
-        "json" | "jsonb" => ColumnType::Json,
+        "json" => ColumnType::Json,
+        "jsonb" => ColumnType::Jsonb,
         "uuid" => ColumnType::Uuid,
         "references" | "belongs_to" => {
             ColumnType::Reference { table: TableRef(Symbol::from(col_name.as_str())) }

@@ -89,8 +89,13 @@ qualifiers. The key forms the
 PostgreSQL dumper writes are read as the keys they name: `id: :serial`
 is an `integer` key, and a hash-valued `id: { type: :string, limit:
 32 }` keeps its type and limit. And the folds below
-apply (`jsonb` and `json` both render `jsonb`, `timestamptz` renders
-`timestamp`). A partial index's predicate (`t.index … where:`,
+apply (`timestamptz` renders `timestamp`). The IR preserves `json` and
+`jsonb` separately so PostgreSQL DDL keeps the source type. SQLite stores both
+as text, and both use the same Ruby `JsonColumn` encoding/decoding path; this
+does not add PostgreSQL runtime support or generated JSON-expression support.
+Roda's current Sequel schema mapping remains text-backed and records the
+original type in a comment rather than claiming native JSONB support.
+A partial index's predicate (`t.index … where:`,
 `add_index … where:` in the migration fold, or `WHERE` in
 `structure.sql`) is kept as the source database wrote it. Postgres
 renders it on every index. SQLite renders it on a unique index, where
@@ -115,10 +120,10 @@ performance can differ while row semantics stay the same. Custom PostgreSQL
 methods are preserved as identifiers, but their extension must already be
 installed by a PostgreSQL deployment.
 Postgres column types map to their SQLite storage at
-ingest (`uuid` → TEXT via `ColumnType::Uuid`, `jsonb` → json,
-`citext` → text, `timestamptz` → datetime, `inet`/`cidr`/`macaddr`/
-`enum` → string); a type with no mapping is an ingest error (a ledger
-line under `--survey`), never a silent drop — its index would still be
+ingest (`uuid` → TEXT via `ColumnType::Uuid`, `json`/`jsonb` → the same
+text-backed JSON representation, `citext` → text, `timestamptz` → datetime,
+`inet`/`cidr`/`macaddr`/`enum` → string); a type with no mapping is an
+ingest error (a ledger line under `--survey`), never a silent drop — its index would still be
 emitted and the DDL would not apply. A non-integer primary key
 (`create_table …, id: :uuid` / `primary_key: "identifier", id:
 :string`) renders as `TEXT PRIMARY KEY` in SQLite and is carried end
