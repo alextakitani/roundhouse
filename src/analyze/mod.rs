@@ -7608,7 +7608,7 @@ pub(crate) fn extract_ivar_assignments_in(
                     Some(prev) => crate::analyze::body::union_of(prev, ty),
                     None => ty,
                 };
-                out.insert(name.clone(), merged);
+                out.insert(name.clone(), fixpoint_bound::bound(merged));
             }
         }
         // Short-circuit compound assignment to an ivar (`@x ||= y`,
@@ -7621,7 +7621,7 @@ pub(crate) fn extract_ivar_assignments_in(
                     Some(prev) => crate::analyze::body::union_of(prev, ty),
                     None => ty,
                 };
-                out.insert(name.clone(), merged);
+                out.insert(name.clone(), fixpoint_bound::bound(merged));
             }
         }
         // `@a, @b = expr` — destructuring assignment. Each ivar target
@@ -7640,7 +7640,7 @@ pub(crate) fn extract_ivar_assignments_in(
                             Some(prev) => crate::analyze::body::union_of(prev, ty),
                             None => ty,
                         };
-                        out.insert(name.clone(), merged);
+                        out.insert(name.clone(), fixpoint_bound::bound(merged));
                     }
                 }
             }
@@ -7799,7 +7799,7 @@ fn widen_hash_ivar_value(out: &mut HashMap<Symbol, Ty>, name: &Symbol, incoming:
         // the Crystal collector's "fresh entry" branch.
         out.insert(
             name.clone(),
-            Ty::Hash { key: Box::new(Ty::Str), value: Box::new(incoming.clone()) },
+            fixpoint_bound::bound(Ty::Hash { key: Box::new(Ty::Str), value: Box::new(incoming.clone()) }),
         );
         return;
     };
@@ -7817,7 +7817,7 @@ fn widen_hash_ivar_value(out: &mut HashMap<Symbol, Ty>, name: &Symbol, incoming:
         // The general widening is exactly the canonical type join.
         Box::new(crate::analyze::body::union_of((**value).clone(), incoming.clone()))
     };
-    out.insert(name.clone(), Ty::Hash { key, value });
+    out.insert(name.clone(), fixpoint_bound::bound(Ty::Hash { key, value }));
 }
 
 // Diagnostic emission -----------------------------------------------------

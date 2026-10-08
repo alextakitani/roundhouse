@@ -8275,3 +8275,23 @@ fn an_rbs_array_block_runs_after_app_emission() {
         .run_ruby("raise 'wrong sum' unless Batch.new.consume == 3")
         .assert_passes();
 }
+
+/// `pairs.to_h` with no block reads each element as a [key, value] pair; the
+/// ivar rewritten through it keeps its String keys and Integer values.
+#[test]
+fn an_ivar_rewritten_through_sort_by_to_h_runs() {
+    emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            "class Article < ApplicationRecord\n  def word_counts\n    @word_counts = {}\n    body.split.each do |w|\n      @word_counts[w] = 0 if @word_counts[w].nil?\n      @word_counts[w] += 1\n    end\n    @word_counts = @word_counts.sort_by { |k, v| [-v, k] }.to_h\n  end\n\n  def top_word\n    word_counts.keys.first\n  end\n",
+        )
+        .run_ruby(
+            r#"article = Article.create!(title: "Counts", body: "b a b c b a")
+counts = article.word_counts
+raise counts.inspect unless counts == { "b" => 3, "a" => 2, "c" => 1 }
+raise article.top_word.inspect unless article.top_word == "b"
+"#,
+        )
+        .assert_passes();
+}

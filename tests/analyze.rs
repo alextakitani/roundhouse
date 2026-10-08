@@ -5215,3 +5215,46 @@ end
         "irregular singularize must stay fail-closed until runtime matches naming; unresolved = {unresolved:?}"
     );
 }
+
+#[test]
+fn array_to_h_without_a_block_reads_each_element_as_a_pair() {
+    // `pairs.to_h` keyed the Hash by the whole [key, value] pair, so an ivar
+    // rewritten as `@counts = @counts.sort_by { … }.to_h` nested the pair one
+    // level deeper every fixpoint round and the analysis never finished.
+    let app = app_from_files(&[
+        (
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\nend\n",
+        ),
+        (
+            "app/models/report.rb",
+            r#"class Report < ApplicationRecord
+  def counts
+    @counts = {}
+    ["a", "b", "a"].each do |name|
+      @counts[name] = 0 if @counts[name].nil?
+      @counts[name] += 1
+    end
+    @counts = @counts.sort_by { |k, v| [-v, k] }.to_h
+    @counts.probe_counts
+  end
+
+  def literal_pairs
+    [["a", 1], ["b", 2]].to_h.probe_literal_pairs
+  end
+end
+"#,
+        ),
+    ]);
+    let receiver = |probe: &str| {
+        diagnose(&app)
+            .into_iter()
+            .find(|d| d.message.contains(probe))
+            .map(|d| d.message.split(" on ").last().unwrap_or("").to_string())
+            .unwrap_or_else(|| panic!("no `{probe}` diagnostic"))
+    };
+    // The empty literal's key stays `untyped`; what matters is that no pair nests in.
+    let counts = receiver("probe_counts");
+    assert!(counts.starts_with("Hash[String") && counts.matches('[').count() == 1, "{counts}");
+    assert_eq!(receiver("probe_literal_pairs"), "Hash[Integer | String, Integer | String]");
+}
