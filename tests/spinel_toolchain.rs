@@ -60,6 +60,15 @@ fn anonymous_keyword_forwarding_runs_natively() {
     assert!(emitted.contains("request(kind: :get, path: path, **)"), "{emitted}");
 }
 
+#[path = "support/engine_mount.rs"]
+mod engine_mount;
+
+#[test]
+#[ignore = "requires the Spinel toolchain, run in its CI lane"]
+fn literal_isolated_engine_mount_dispatches_on_native_http() {
+    engine_mount::spinel_http_witness();
+}
+
 #[test]
 #[ignore = "requires the Spinel toolchain, run in its CI lane"]
 fn finite_concern_class_configuration_runs_natively() {
