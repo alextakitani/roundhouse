@@ -1334,6 +1334,43 @@ fn reject_unsupported_pattern_matches(app: &App, target: BuildTarget) -> Result<
     Ok(())
 }
 
+/// Generated fixture attributes cannot be reproduced by the current
+/// model-based fixture loaders: their in-memory setter would expose the
+/// supplied YAML value even though persistence correctly omits that
+/// database-owned column. Fail at the source fixture and record instead
+/// of silently loading a different value. The Blog target ships the
+/// Rails fixture source verbatim and does not use these loaders.
+fn reject_generated_fixture_assignments(app: &App) -> Result<(), String> {
+    let lowered = crate::lower::lower_fixtures(app);
+    for fixture in &lowered.fixtures {
+        let Some(source_fixture) = app.fixtures.iter().find(|source| source.name == fixture.name) else {
+            continue;
+        };
+        let Some(model) = app.models.iter().find(|model| model.name == fixture.class) else {
+            continue;
+        };
+        let Some(table) = app.schema.tables.get(&model.table.0) else {
+            continue;
+        };
+        for record in &fixture.records {
+            for field in &record.fields {
+                if table.columns.iter().any(|column| {
+                    column.name == field.column && column.generated.is_some()
+                }) {
+                    return Err(format!(
+                        "fixture `test/fixtures/{}.yml` record `{}` assigns generated column `{}.{}`; generated fixture values are not supported",
+                        source_fixture.path.as_str(),
+                        record.label.as_str(),
+                        table.name.as_str(),
+                        field.column.as_str(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn target_files(
     app: &App,
     fixture: &Path,
@@ -1347,6 +1384,25 @@ pub fn target_files(
         }
         None => app,
     };
+    if target == BuildTarget::Roda {
+        if let Some((table, column)) = app.schema.tables.values().find_map(|table| {
+            table
+                .columns
+                .iter()
+                .find(|column| column.generated.is_some())
+                .map(|column| (table.name.as_str(), column.name.as_str()))
+        }) {
+            return Err(format!(
+                "Roda target does not support generated column `{table}.{column}`"
+            ));
+        }
+    } else if target != BuildTarget::Blog {
+        crate::emit::shared::schema_sql::validate_schema_for_dialect(
+            &app.schema,
+            crate::emit::shared::schema_sql::Dialect::Sqlite,
+        )?;
+        reject_generated_fixture_assignments(app)?;
+    }
     // Before the refusals below: a refusal returns early, and a
     // reference that it hides would leave the transpile with fewer
     // errors than the app has.

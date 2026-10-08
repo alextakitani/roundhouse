@@ -8,6 +8,8 @@
 //! `nullable` flag decide the `Ty` (and the `T | Nil` unions) every
 //! target ultimately emits.
 
+pub mod generated;
+
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +53,35 @@ pub struct Column {
     pub nullable: bool,
     pub default: Option<String>,
     pub primary_key: bool,
+    /// The SQL expression and storage mode of a generated column. The
+    /// declared `col_type` remains the column's result type; generated
+    /// columns are not writable by application inserts or updates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated: Option<GeneratedColumn>,
+    /// Ingest-only evidence for generated-expression validation. Some
+    /// database types (for example `inet`, PostgreSQL enums, and fixed
+    /// `character`) normalize to `String { limit: None }` or `Text` for
+    /// Roundhouse's ordinary-column typing. `Some(false)` records that
+    /// the original type does not have the portable text semantics
+    /// required by the supported generated-expression grammar. `None`
+    /// means the normalized `col_type` is sufficient evidence. This is
+    /// sparse so well-represented ordinary types retain their serialized form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_text_compatible: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GeneratedColumn {
+    /// Source SQL retained from `as:` or `GENERATED ALWAYS AS (...)`.
+    pub expression: String,
+    pub storage: GeneratedColumnStorage,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GeneratedColumnStorage {
+    Stored,
+    Virtual,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

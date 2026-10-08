@@ -23,6 +23,61 @@ mod rails_root_join;
 #[path = "support/anonymous_keywords.rs"]
 mod anonymous_keywords;
 
+/// A generated text column on the real-blog Article model exercises the
+/// schema-to-runtime path together with Rails-style symbol callbacks. The
+/// create callbacks must see the value returned by the database, while an
+/// update remains stale until the model is explicitly reloaded.
+#[test]
+fn generated_article_text_runs_through_callbacks_and_reload() {
+    emit_and_run::real_blog()
+        .edit(
+            "db/schema.rb",
+            "    t.string \"title\"\n    t.text \"body\"\n    t.datetime \"created_at\", null: false\n",
+            "    t.string \"title\"\n    t.text \"body\"\n    t.virtual \"display_text\", type: :string, as: \"coalesce(title, '') || ' / ' || coalesce(body, '')\", stored: true\n    t.datetime \"created_at\", null: false\n",
+        )
+        .edit(
+            "app/models/article.rb",
+            "  validates :body, presence: true, length: { minimum: 10 }\nend\n",
+            concat!(
+                "  validates :body, presence: true, length: { minimum: 10 }\n\n",
+                "  after_create :capture_generated_create\n",
+                "  after_update :capture_generated_update\n",
+                "  after_save :capture_generated_save\n\n",
+                "  def capture_generated_create\n    @generated_after_create = display_text\n  end\n\n",
+                "  def capture_generated_update\n    @generated_after_update = display_text\n  end\n\n",
+                "  def capture_generated_save\n    @generated_after_save = display_text\n  end\n\n",
+                "  def generated_after_create\n    @generated_after_create\n  end\n\n",
+                "  def generated_after_update\n    @generated_after_update\n  end\n\n",
+                "  def generated_after_save\n    @generated_after_save\n  end\n",
+                "end\n",
+            ),
+        )
+        .write(
+            "test/models/generated_column_article_test.rb",
+            r#"require "test_helper"
+
+class GeneratedColumnArticleTest < ActiveSupport::TestCase
+  test "generated text hydrates before create callbacks and reload refreshes updates" do
+    article = Article.create!(title: "Generated title", body: "A sufficiently long article body.")
+    original = "Generated title / A sufficiently long article body."
+
+    assert_equal original, article.display_text
+    assert_equal original, article.generated_after_create
+    assert_equal original, article.generated_after_save
+
+    article.update!(title: "Updated title")
+    assert_equal original, article.display_text
+    assert_equal original, article.generated_after_update
+    assert_equal original, article.generated_after_save
+    assert_equal "Updated title / A sufficiently long article body.", article.reload.display_text
+  end
+end
+"#,
+        )
+        .run_test("test/models/generated_column_article_test.rb")
+        .assert_passes();
+}
+
 /// The same anonymous keyword packet survives defaulting, local-name
 /// collisions, and a virtual override in emitted CRuby. Effectful input
 /// values also stay left-to-right and run once.

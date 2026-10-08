@@ -143,6 +143,59 @@ an ingest gap that would be false of the ruby family (#90;
 `fixtures/tiny-blog-uuid` + `tests/uuid_key_ruby.rs` run the shape
 on CRuby, and the same fixture compiles and serves under Spinel).
 
+### Generated columns
+
+`Column.generated` retains a generated expression and its `stored` or
+`virtual` mode separately from its declared result type. For example:
+
+```ruby
+t.string "first_name"
+t.string "last_name"
+t.virtual "display_name", type: :string,
+  as: "first_name || ' ' || coalesce(last_name, '')", stored: true
+```
+
+The initial expression subset is deliberately bounded: unbounded string/text
+columns, SQL string literals, parentheses, `||`, and `coalesce` with at least
+two arguments. Expressions are validated against the complete table and kept
+verbatim. PostgreSQL casts, JSON operators, other functions, generated-column
+references, defaults, generated keys/timestamps, and length-limited result or
+operand types remain explicit errors. A table must contain an ordinary column.
+Source types normalized to text for ordinary model typing (such as network
+types, enums, `citext`, and fixed-width characters) remain unsupported here.
+Column names that are SQL keywords must be double-quoted in the expression.
+Unresolved keyword splats in column options are rejected because they can hide
+generated-column metadata.
+The same metadata is read from a complete `GENERATED ALWAYS AS (...) STORED`
+or `VIRTUAL` clause in `structure.sql`; unsupported clauses cannot silently
+become writable columns. Roda emission rejects generated columns. SQLite DDL
+supports both modes; the separate PostgreSQL DDL renderer currently accepts
+stored columns only, even though PostgreSQL 18 also supports virtual columns.
+This does not enable a PostgreSQL runtime backend.
+
+Normal model inserts and updates omit generated columns, while SELECT and
+reload retain them. Generated attributes start nil, including a database
+`NOT NULL` attribute. After insert, the shared adapter reads generated values
+by the inserted key and fills nil attributes before create callbacks; an
+assigned nonnil value remains in memory until reload. Updates leave the
+previous generated value in memory until explicit reload, as observed with
+Rails 8.1.4 and SQLite. The extra post-insert SELECT is a difference from
+Rails' `INSERT ... RETURNING`. Existing full-column update behavior also
+remains: saving only a generated-field assignment on a mixed table may still
+write unchanged ordinary fields. A table with no writable non-key fields
+uses `DEFAULT VALUES` on insert and issues no UPDATE.
+
+Direct writes that the current lowering would silently discard remain
+unsupported: generated-model `insert_all`/`insert_all!`, and `update_column`
+or named `touch` calls that can address a generated field, including
+`belongs_to ..., touch: :generated_column` callbacks. Ordinary literal
+column names retain their existing behavior; dynamic names on generated
+models fail closed. Static seed SQL follows ordinary `create!` filtering.
+Explicit generated values in YAML fixtures are rejected with fixture, record,
+and column context. The regression suites are `tests/generated_columns*.rs`;
+`generated_columns_spinel` executes the SQLite contract natively in the
+selected Spinel CI suite.
+
 ## `config/routes.rb` → `RouteTable` → `RouteHelpers.<x>_path`
 
 **Source IR:** `src/dialect.rs::RouteTable` — a list of `RouteSpec`

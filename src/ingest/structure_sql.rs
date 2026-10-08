@@ -32,7 +32,10 @@
 
 use std::collections::HashSet;
 
-use crate::schema::{Column, ColumnType, ForeignKey, Index, ReferentialAction, Schema, Table};
+use crate::schema::{
+    Column, ColumnType, ForeignKey, GeneratedColumn, GeneratedColumnStorage, Index,
+    ReferentialAction, Schema, Table,
+};
 use crate::{Symbol, TableRef};
 
 use super::{IngestError, IngestResult};
@@ -255,16 +258,26 @@ fn handle_create_table(
     // (…)`, `WITH (…)` storage params) is intentionally never
     // inspected — none of it changes the column list, and schema.rb
     // has no equivalent to round-trip it into anyway.
-    schema.tables.insert(
-        Symbol::from(table_name.clone()),
-        Table {
-            name: Symbol::from(table_name),
-            columns,
-            indexes: Vec::new(),
-            foreign_keys: Vec::new(),
-            virtual_module: None,
-        },
-    );
+    let mut table = Table {
+        name: Symbol::from(table_name.as_str()),
+        columns,
+        indexes: Vec::new(),
+        foreign_keys: Vec::new(),
+        virtual_module: None,
+    };
+    let invalid_generated = crate::schema::generated::validate_table(&table);
+    for (column, reason) in &invalid_generated {
+        gaps.push(IngestError::Unsupported {
+            file: file.into(),
+            message: format!("generated column dropped: {table_name}.{column}: {reason}"),
+        });
+    }
+    if !invalid_generated.is_empty() {
+        table.columns.retain(|col| {
+            !invalid_generated.iter().any(|(name, _)| name == col.name.as_str())
+        });
+    }
+    schema.tables.insert(Symbol::from(table_name), table);
 }
 
 /// A comma-separated entry inside `CREATE TABLE (...)` that is a
@@ -335,11 +348,50 @@ fn parse_column_def(
         return Ok(None);
     }
 
+    let generated = parse_generated_modifier(modifiers).map_err(|message| IngestError::Unsupported {
+        file: file.into(),
+        message: format!("generated column dropped: {table}.{col_name}: {message}"),
+    })?;
     let (nullable, default) = parse_modifiers(modifiers);
+    if generated.is_some() && default.is_some() {
+        return Err(unsupported_col(file, table, &col_name, "generated column also has DEFAULT"));
+    }
     let col_type = resolve_column_type(type_phrase, enum_types)
         .ok_or_else(|| unsupported_col(file, table, &col_name, type_phrase))?;
+    let generated_text_compatible = has_nonportable_text_source_type(type_phrase, enum_types)
+        .then_some(false);
 
-    Ok(Some(Column { name: Symbol::from(col_name), col_type, nullable, default, primary_key: false }))
+    Ok(Some(Column {
+        name: Symbol::from(col_name),
+        col_type,
+        nullable,
+        default,
+        primary_key: false,
+        generated,
+        generated_text_compatible,
+    }))
+}
+
+/// Keep only the negative type provenance that `ColumnType` cannot
+/// express. `inet`, `interval`, enums, `citext`, and fixed `character`
+/// spellings normalize to text-like Rust types for ordinary app typing,
+/// but are not admitted as portable operands/results in our generated
+/// text-expression subset. Unbounded `character varying`/`varchar` and
+/// `text` already normalize faithfully and need no marker; a text typmod
+/// is marked because this IR does not retain it.
+fn has_nonportable_text_source_type(
+    type_phrase: &str,
+    enum_types: &HashSet<String>,
+) -> bool {
+    let (mut base, first_type_modifier, _) = strip_parens_capture_nums(type_phrase);
+    if let Some(dot) = base.rfind('.') {
+        base = base[dot + 1..].to_string();
+    }
+    matches!(
+        base.as_str(),
+        "inet" | "cidr" | "macaddr" | "macaddr8" | "interval" | "character" | "char" | "bpchar" | "citext"
+    ) || enum_types.contains(&base)
+        || (base == "text" && first_type_modifier.is_some())
 }
 
 fn unsupported_col(file: &str, table: &str, col: &str, type_name: &str) -> IngestError {
@@ -1147,9 +1199,10 @@ fn consume_sql_keyword_ci(s: &str, start: usize, keyword: &str) -> Option<usize>
     if !s.get(start..end)?.eq_ignore_ascii_case(keyword) {
         return None;
     }
-    let next = *s.as_bytes().get(end)?;
-    if next.is_ascii_alphanumeric() || next == b'_' || next == b'$' || next >= 0x80 {
-        return None;
+    if let Some(next) = s.as_bytes().get(end) {
+        if next.is_ascii_alphanumeric() || *next == b'_' || *next == b'$' || *next >= 0x80 {
+            return None;
+        }
     }
     Some(end)
 }
@@ -1250,6 +1303,81 @@ fn find_modifier_start(rest: &str) -> usize {
         }
     }
     rest.len()
+}
+
+/// Parse the supported PostgreSQL generated-column modifier. Any other
+/// form containing `GENERATED` fails explicitly so it cannot become an
+/// ordinary writable column after its expression is discarded.
+fn parse_generated_modifier(modifiers: &str) -> Result<Option<GeneratedColumn>, String> {
+    let words = top_level_words(modifiers);
+    let generated_positions: Vec<usize> =
+        words.iter().filter(|(_, word)| word == "GENERATED").map(|(pos, _)| *pos).collect();
+    let Some(&generated_pos) = generated_positions.first() else { return Ok(None) };
+    if generated_positions.len() != 1 {
+        return Err("multiple GENERATED clauses are unsupported".into());
+    }
+
+    if !only_optional_nullability(&modifiers[..generated_pos]) {
+        return Err("only NULL or NOT NULL may precede GENERATED ALWAYS".into());
+    }
+
+    let after_generated = consume_sql_keyword_ci(modifiers, generated_pos, "GENERATED")
+        .ok_or_else(|| "expected GENERATED ALWAYS AS".to_string())?;
+    let after_always = consume_sql_keyword_ci(
+        modifiers,
+        skip_sql_trivia(modifiers, after_generated),
+        "ALWAYS",
+    )
+    .ok_or_else(|| "expected GENERATED ALWAYS AS".to_string())?;
+    let after_as = consume_sql_keyword_ci(
+        modifiers,
+        skip_sql_trivia(modifiers, after_always),
+        "AS",
+    )
+    .ok_or_else(|| "expected GENERATED ALWAYS AS".to_string())?;
+    let open = skip_sql_trivia(modifiers, after_as);
+    if modifiers.as_bytes().get(open) != Some(&b'(') {
+        return Err("generated expression must be parenthesized".into());
+    }
+    let close = matching_close_paren(modifiers, open)
+        .ok_or_else(|| "generated expression has an unclosed parenthesis".to_string())?;
+    let expression = modifiers[open + 1..close].to_string();
+    if expression.trim().is_empty() {
+        return Err("generated expression is empty".into());
+    }
+
+    let storage_start = skip_sql_trivia(modifiers, close + 1);
+    let (storage, storage_end) = if let Some(end) = consume_sql_keyword_ci(modifiers, storage_start, "STORED") {
+        (GeneratedColumnStorage::Stored, end)
+    } else if let Some(end) = consume_sql_keyword_ci(modifiers, storage_start, "VIRTUAL") {
+        (GeneratedColumnStorage::Virtual, end)
+    } else {
+        return Err("generated expression must end in STORED or VIRTUAL".into());
+    };
+
+    if !only_optional_nullability(&modifiers[storage_end..]) {
+        return Err("only NULL or NOT NULL may follow the generated storage mode".into());
+    }
+
+    Ok(Some(GeneratedColumn { expression, storage }))
+}
+
+/// Consume only an optional `NULL` or `NOT NULL` clause plus SQL trivia.
+/// Checking the full suffix prevents punctuation, string literals, or
+/// other modifiers from being silently ignored.
+fn only_optional_nullability(s: &str) -> bool {
+    let start = skip_sql_trivia(s, 0);
+    if start == s.len() {
+        return true;
+    }
+    if let Some(end) = consume_sql_keyword_ci(s, start, "NULL") {
+        return skip_sql_trivia(s, end) == s.len();
+    }
+    let Some(after_not) = consume_sql_keyword_ci(s, start, "NOT") else { return false };
+    let Some(after_null) = consume_sql_keyword_ci(s, skip_sql_trivia(s, after_not), "NULL") else {
+        return false;
+    };
+    skip_sql_trivia(s, after_null) == s.len()
 }
 
 /// From a column definition's modifier tail: whether the column is

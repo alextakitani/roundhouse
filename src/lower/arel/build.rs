@@ -657,6 +657,8 @@ mod tests {
                         nullable: false,
                         default: None,
                         primary_key: true,
+                        generated: None,
+                        generated_text_compatible: None,
                     },
                     Column {
                         name: Symbol::from("article_id"),
@@ -664,6 +666,8 @@ mod tests {
                         nullable: false,
                         default: None,
                         primary_key: false,
+                        generated: None,
+                        generated_text_compatible: None,
                     },
                     Column {
                         name: Symbol::from("body"),
@@ -671,6 +675,8 @@ mod tests {
                         nullable: false,
                         default: None,
                         primary_key: false,
+                        generated: None,
+                        generated_text_compatible: None,
                     },
                 ],
                 indexes: vec![],

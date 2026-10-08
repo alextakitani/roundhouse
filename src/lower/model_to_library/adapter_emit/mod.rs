@@ -320,7 +320,7 @@ fn synth_adapter_insert(owner: &ClassId, table: &Table, schema: &Schema) -> Meth
     let assignments: Vec<Assignment> = table
         .columns
         .iter()
-        .filter(|c| !c.primary_key || supplied_key.is_some())
+        .filter(|c| c.generated.is_none() && (!c.primary_key || supplied_key.is_some()))
         .map(|c| Assignment {
             column: c.name.clone(),
             value: Value::Runtime {
@@ -387,6 +387,13 @@ fn synth_adapter_insert(owner: &ClassId, table: &Table, schema: &Schema) -> Meth
             (Expr::new(Span::synthetic(), ExprNode::Seq { exprs }), ty_of_column(&k.col_type))
         }
     };
+    let generated: Vec<&crate::schema::Column> =
+        table.columns.iter().filter(|c| c.generated.is_some()).collect();
+    let body = if generated.is_empty() {
+        body
+    } else {
+        hydrate_generated_after_insert(table, &generated, body, &ret_ty)
+    };
 
     MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
@@ -407,6 +414,149 @@ fn synth_adapter_insert(owner: &ClassId, table: &Table, schema: &Schema) -> Meth
     }
 }
 
+/// After the INSERT has produced its key, read the database-owned generated
+/// values directly and fill only storage slots still holding nil. Rails'
+/// SQLite adapter uses `RETURNING` for this; the shared Db surface here uses
+/// a scalar SELECT so the same lifecycle contract works in both Ruby and the
+/// native Spinel emitter without constructing a second model (which would
+/// run `after_initialize`). Explicit non-nil assignments remain visible on
+/// the object through create callbacks; explicit nil is treated as unset,
+/// matching Rails' generated-attribute behavior.
+fn hydrate_generated_after_insert(
+    table: &Table,
+    generated: &[&crate::schema::Column],
+    insert: Expr,
+    key_ty: &Ty,
+) -> Expr {
+    let db = ClassId(Symbol::from("Db"));
+    let inserted_key = Symbol::from("__rh_inserted_key");
+    let stmt = Symbol::from("__rh_generated_stmt");
+    let mut stmts = vec![arel_assign(&inserted_key, insert)];
+
+    let projection = generated
+        .iter()
+        .map(|c| crate::naming::sql_ident(c.name.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Tables without an explicit primary key use SQLite's rowid, the value
+    // the insert visitor already returns in that case.
+    let key_name = key_column_name(table);
+    let key_sql = if key_column(table).is_some() {
+        crate::naming::sql_ident(key_name.as_str())
+    } else {
+        "rowid".to_string()
+    };
+    let key_type = key_value_type(table);
+    let (bind_method, escape_method) = match key_type {
+        ValueType::Str => ("bind_text", "escape_string"),
+        ValueType::Bool => ("bind_bool", "escape_bool"),
+        // Integer is the ordinary ActiveRecord primary-key shape. Other
+        // unusual key types retain the existing adapter's integer-key
+        // fallback, just as `_adapter_reload` does today.
+        _ => ("bind_int", "escape_int"),
+    };
+    let parameterized = crate::lower::arel::visitor::param_binds_enabled();
+    let sql = if parameterized {
+        arel_concat(vec![
+            arel_lit_str(format!(
+                "SELECT {} FROM {} WHERE {} = ",
+                projection,
+                crate::naming::sql_ident(table.name.as_str()),
+                key_sql,
+            )),
+            arel_lit_str("? LIMIT 1".to_string()),
+        ])
+    } else {
+        let escape = arel_db_call(
+            &db,
+            escape_method,
+            vec![var_ref(&inserted_key)],
+        );
+        arel_concat(vec![
+            arel_lit_str(format!(
+                "SELECT {} FROM {} WHERE {} = ",
+                projection,
+                crate::naming::sql_ident(table.name.as_str()),
+                key_sql,
+            )),
+            escape,
+            arel_lit_str(" LIMIT 1".to_string()),
+        ])
+    };
+    stmts.push(arel_assign(&stmt, arel_db_call(&db, "prepare", vec![sql])));
+    if parameterized {
+        stmts.push(arel_db_call(
+            &db,
+            bind_method,
+            vec![var_ref(&stmt), arel_lit_int(1), var_ref(&inserted_key)],
+        ));
+    }
+
+    let mut fill = Vec::with_capacity(generated.len());
+    for (index, col) in generated.iter().enumerate() {
+        let storage = super::schema::col_storage_name(col);
+        let mut is_nil = Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: Some(ivar_ref(&storage)),
+                method: Symbol::from("nil?"),
+                args: vec![],
+                block: None,
+                parenthesized: true,
+            },
+        );
+        is_nil.ty = Some(Ty::Bool);
+        let value = crate::lower::typing::with_ty(
+            arel_db_call(
+                &db,
+                super::schema::column_read_method_for(col),
+                vec![var_ref(&stmt), arel_lit_int(index as i64)],
+            ),
+            super::ty_of_column_slot(col),
+        );
+        let assign = Expr::new(
+            Span::synthetic(),
+            ExprNode::Assign {
+                target: crate::expr::LValue::Ivar { name: storage },
+                value,
+            },
+        );
+        fill.push(Expr::new(
+            Span::synthetic(),
+            ExprNode::If {
+                cond: is_nil,
+                then_branch: assign,
+                else_branch: super::nil_lit(),
+            },
+        ));
+    }
+    let mut step = Expr::new(
+        Span::synthetic(),
+        ExprNode::Send {
+            recv: Some(Expr::new(
+                Span::synthetic(),
+                ExprNode::Const { path: vec![Symbol::from("Db")] },
+            )),
+            method: Symbol::from("step?"),
+            args: vec![var_ref(&stmt)],
+            block: None,
+            parenthesized: true,
+        },
+    );
+    step.ty = Some(Ty::Bool);
+    stmts.push(Expr::new(
+        Span::synthetic(),
+        ExprNode::If {
+            cond: step,
+            then_branch: Expr::new(Span::synthetic(), ExprNode::Seq { exprs: fill }),
+            else_branch: super::nil_lit(),
+        },
+    ));
+    stmts.push(arel_db_call(&db, "finalize", vec![var_ref(&stmt)]));
+    stmts.push(crate::lower::typing::with_ty(var_ref(&inserted_key), key_ty.clone()));
+    Expr::new(Span::synthetic(), ExprNode::Seq { exprs: stmts })
+}
+
 /// `def _adapter_update` — instance method; reads ivars + @id.
 /// See `synth_adapter_insert` for the receiver-rationale.
 fn synth_adapter_update(owner: &ClassId, table: &Table, schema: &Schema) -> MethodDef {
@@ -414,7 +564,7 @@ fn synth_adapter_update(owner: &ClassId, table: &Table, schema: &Schema) -> Meth
     let assignments: Vec<Assignment> = table
         .columns
         .iter()
-        .filter(|c| !c.primary_key)
+        .filter(|c| !c.primary_key && c.generated.is_none())
         .map(|c| Assignment {
             column: c.name.clone(),
             value: Value::Runtime {
@@ -423,6 +573,7 @@ fn synth_adapter_update(owner: &ClassId, table: &Table, schema: &Schema) -> Meth
             },
         })
         .collect();
+    let has_assignments = !assignments.is_empty();
 
     let op = ArelOp::Update(Update {
         table: TableRef(table.name.clone()),
@@ -438,7 +589,14 @@ fn synth_adapter_update(owner: &ClassId, table: &Table, schema: &Schema) -> Meth
         name: Symbol::from("_adapter_update"),
         receiver: MethodReceiver::Instance,
         params: vec![],
-        body: SqliteVisitor.visit(&op, schema, owner),
+        // A model whose only non-key attributes are generated columns has
+        // nothing to write on update. Do not render `UPDATE ... SET WHERE`;
+        // generated values are database-owned and a no-op save stays a no-op.
+        body: if has_assignments {
+            SqliteVisitor.visit(&op, schema, owner)
+        } else {
+            super::nil_lit()
+        },
         signature: Some(fn_sig(vec![], Ty::Nil)),
         effects: EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),

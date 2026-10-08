@@ -880,27 +880,33 @@ fn visit_insert(ins: &Insert, schema: &Schema) -> Expr {
     let _ = lookup_table(schema, &ins.table.0); // validates table exists; not consumed beyond that
     let db = ClassId(Symbol::from(DB_MOD));
 
-    let cols_csv = ins
-        .assignments
-        .iter()
-        .map(|a| crate::naming::sql_ident(a.column.as_str()))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let mut segments: Vec<Expr> = vec![lit_str(format!(
-        "INSERT INTO {} ({}) VALUES (",
-        crate::naming::sql_ident(ins.table.0.as_str()),
-        cols_csv
-    ))];
-    for (idx, a) in ins.assignments.iter().enumerate() {
-        if idx > 0 {
-            segments.push(lit_str(", ".to_string()));
+    let sql = if ins.assignments.is_empty() {
+        lit_str(format!(
+            "INSERT INTO {} DEFAULT VALUES",
+            crate::naming::sql_ident(ins.table.0.as_str())
+        ))
+    } else {
+        let cols_csv = ins
+            .assignments
+            .iter()
+            .map(|a| crate::naming::sql_ident(a.column.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut segments = vec![lit_str(format!(
+            "INSERT INTO {} ({}) VALUES (",
+            crate::naming::sql_ident(ins.table.0.as_str()),
+            cols_csv
+        ))];
+        for (idx, a) in ins.assignments.iter().enumerate() {
+            if idx > 0 {
+                segments.push(lit_str(", ".to_string()));
+            }
+            segments.push(escape_value(&db, &a.value));
         }
-        segments.push(escape_value(&db, &a.value));
-    }
-    segments.push(lit_str(")".to_string()));
-
-    let exec_call = db_call(&db, "exec", vec![concat_chain(segments)]);
+        segments.push(lit_str(")".to_string()));
+        concat_chain(segments)
+    };
+    let exec_call = db_call(&db, "exec", vec![sql]);
     if !ins.returns_rowid {
         return exec_call;
     }
@@ -1360,6 +1366,8 @@ mod tests {
                         nullable: false,
                         default: None,
                         primary_key: true,
+                        generated: None,
+                        generated_text_compatible: None,
                     },
                     Column {
                         name: Symbol::from("title"),
@@ -1367,6 +1375,8 @@ mod tests {
                         nullable: false,
                         default: None,
                         primary_key: false,
+                        generated: None,
+                        generated_text_compatible: None,
                     },
                 ],
                 indexes: vec![],
@@ -1552,6 +1562,35 @@ mod tests {
         // exec ; last_insert_rowid
         assert_eq!(outer_kind(&body), "seq");
         assert_eq!(seq_len(&body), 2);
+    }
+
+    #[test]
+    fn insert_without_assignments_uses_default_values() {
+        let (schema, owner) = fixture_schema();
+        for returns_rowid in [false, true] {
+            let op = ArelOp::Insert(Insert {
+                table: TableRef(Symbol::from("articles")),
+                assignments: vec![],
+                returns_rowid,
+            });
+            let body = SqliteVisitor.visit(&op, &schema, &owner);
+            let exec = if returns_rowid {
+                let ExprNode::Seq { exprs } = body.node.as_ref() else {
+                    panic!("insert must return the last row id");
+                };
+                assert_eq!(exprs.len(), 2);
+                &exprs[0]
+            } else {
+                &body
+            };
+            let ExprNode::Send { method, args, .. } = exec.node.as_ref() else {
+                panic!("insert must execute SQL");
+            };
+            assert_eq!(method.as_str(), "exec");
+            assert!(matches!(args[0].node.as_ref(),
+                ExprNode::Lit { value: Literal::Str { value } }
+                    if value == "INSERT INTO articles DEFAULT VALUES"));
+        }
     }
 
     #[test]
