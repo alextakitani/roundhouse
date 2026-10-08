@@ -30,6 +30,8 @@ fn tiny_blog_round_trips() {
                     nullable: false,
                     default: None,
                     primary_key: true,
+                    generated: None,
+                    generated_text_compatible: None,
                 },
                 Column {
                     name: Symbol::from("title"),
@@ -37,6 +39,8 @@ fn tiny_blog_round_trips() {
                     nullable: false,
                     default: None,
                     primary_key: false,
+                    generated: None,
+                    generated_text_compatible: None,
                 },
             ],
             indexes: vec![],
