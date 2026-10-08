@@ -87,8 +87,11 @@ pub(crate) fn lower_model_delegates(app: &mut crate::App) {
                 target.clone(),
                 model_zero_argument_surface(
                     model,
+                    &app.models,
                     &models_by_name,
                     &concerns_by_name,
+                    &app.schema,
+                    &params_specs,
                     &mut method_cache,
                 ),
             ))
@@ -186,8 +189,11 @@ fn exact_positional_arity(method: &MethodDef) -> Option<usize> {
 
 fn model_zero_argument_surface(
     model: &Model,
+    all_models: &[Model],
     models: &HashMap<ClassId, &Model>,
     library_classes: &HashMap<ClassId, &LibraryClass>,
+    schema: &crate::schema::Schema,
+    params_specs: &crate::lower::controller_to_library::params::ParamsSpecs,
     cache: &mut HashMap<ClassId, MethodSurface>,
 ) -> MethodSurface {
     if let Some(surface) = cache.get(&model.name) {
@@ -197,28 +203,24 @@ fn model_zero_argument_surface(
     let mut surface = MethodSurface::default();
     if let Some(parent) = &model.parent {
         if let Some(parent_model) = models.get(parent) {
-            surface = model_zero_argument_surface(parent_model, models, library_classes, cache);
+            surface = model_zero_argument_surface(
+                parent_model,
+                all_models,
+                models,
+                library_classes,
+                schema,
+                params_specs,
+                cache,
+            );
         }
     }
 
-    for name in model
-        .attributes
-        .fields
-        .keys()
-        .map(|name| name.as_str().to_string())
-        .chain(
-            model
-                .associations()
-                .map(|association| association.name().as_str().to_string()),
-        )
-    {
-        surface
-            .methods
-            .insert(name.clone(), [0].into_iter().collect());
-        surface
-            .methods
-            .insert(format!("{name}="), [1].into_iter().collect());
-    }
+    // Use the same synthesized model methods that the emitter will lower;
+    // hand-building fields and association accessors here can silently drift
+    // from the real model surface as Rails support grows.
+    let model_methods =
+        crate::lower::model_to_library::build_methods(model, all_models, schema, params_specs);
+    add_method_definitions(model_methods.iter(), &mut surface);
 
     let mut seen = HashSet::new();
     // Surface insertion is last-definition-wins, and Ruby gives the last
