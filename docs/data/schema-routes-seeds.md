@@ -172,6 +172,11 @@ generated output and replacement of a generated output by an ordinary column
 are rejected. Renaming or dropping a source column that a generated expression
 uses is rejected without rewriting the source SQL; renaming or dropping an
 indexed generated output is also an explicit error.
+Assigning a default to a generated output is rejected before changing schema
+state, including during survey recovery. Ordinary defaults and generated-column
+nullability changes remain supported.
+`remove_reference` and `remove_belongs_to` cannot remove a generated output;
+their folded changes are also validated before altering generated expressions.
 The same metadata is read from a complete `GENERATED ALWAYS AS (...) STORED`
 or `VIRTUAL` clause in `structure.sql`; unsupported clauses cannot silently
 become writable columns. Roda emission rejects generated columns. SQLite DDL

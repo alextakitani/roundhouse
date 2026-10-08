@@ -1,10 +1,10 @@
 //! Migration folds must preserve schema metadata when a generated-column
 //! change is rejected, and must not retain stale generated/index references.
 
+use roundhouse::Symbol;
 use roundhouse::emit::shared::schema_sql::render_schema_statements;
 use roundhouse::ingest::{ingest_migration, ingest_schema};
 use roundhouse::schema::{Column, ColumnType, GeneratedColumnStorage, Schema, Table};
-use roundhouse::Symbol;
 
 fn generated_schema() -> Schema {
     ingest_schema(
@@ -52,6 +52,209 @@ end
         "db/schema.rb",
     )
     .expect("indexed generated-column schema should ingest")
+}
+
+fn reference_schema() -> Schema {
+    ingest_schema(
+        br#"ActiveRecord::Schema[8.1].define(version: 1) do
+  create_table "people", force: :cascade do |t|
+    t.string "name", default: "keep", null: false
+    t.references "author"
+    t.belongs_to "reviewer"
+    t.virtual "display_name", type: :string, as: "\"name\" || ' display'", stored: true
+  end
+end
+"#,
+        "db/schema.rb",
+    )
+    .expect("reference-column schema should ingest")
+}
+
+#[test]
+fn change_column_default_rejects_generated_columns_atomically() {
+    for (form, operation) in [
+        (
+            "positional",
+            r#"change_column_default :people, :display_name, "fallback""#,
+        ),
+        (
+            "from/to keyword",
+            r#"change_column_default :people, :display_name, from: nil, to: "fallback""#,
+        ),
+    ] {
+        let mut schema = generated_schema();
+        let original = schema.clone();
+        let error = apply_migration(&mut schema, &one_operation(operation))
+            .expect_err("a generated column cannot be assigned a default");
+
+        assert!(error.contains("generated column"), "{error}");
+        assert!(error.contains("default"), "{error}");
+        assert_eq!(
+            schema, original,
+            "the {form} default change must leave the entire schema unchanged"
+        );
+        let generated = column(table(&schema, "people"), "display_name");
+        assert!(generated.default.is_none());
+        assert_eq!(
+            generated.generated.as_ref().unwrap().expression,
+            "first_name || ' ' || last_name"
+        );
+    }
+}
+
+#[test]
+fn change_column_default_forms_still_update_ordinary_columns() {
+    for (operation, expected_default) in [
+        (
+            r#"change_column_default :people, :nickname, "public""#,
+            "public",
+        ),
+        (
+            r#"change_column_default :people, :nickname, from: nil, to: "public""#,
+            "public",
+        ),
+    ] {
+        let mut schema = generated_schema();
+        apply_migration(&mut schema, &one_operation(operation))
+            .expect("ordinary-column default changes remain supported");
+
+        let people = table(&schema, "people");
+        assert_eq!(
+            column(people, "nickname").default.as_deref(),
+            Some(expected_default)
+        );
+        assert_eq!(
+            column(people, "display_name")
+                .generated
+                .as_ref()
+                .unwrap()
+                .expression,
+            "first_name || ' ' || last_name"
+        );
+    }
+}
+
+#[test]
+fn change_column_null_remains_supported_for_generated_and_ordinary_columns() {
+    for target in ["display_name", "nickname"] {
+        let mut schema = generated_schema();
+        apply_migration(
+            &mut schema,
+            &one_operation(&format!("change_column_null :people, :{target}, false")),
+        )
+        .expect("change_column_null remains supported");
+
+        let changed = column(table(&schema, "people"), target);
+        assert!(!changed.nullable);
+        assert!(changed.default.is_none());
+        if target == "display_name" {
+            assert!(changed.generated.is_some());
+        }
+    }
+}
+
+#[test]
+fn reference_removal_aliases_cannot_remove_generated_outputs_or_stale_indexes() {
+    for (verb, operation) in [
+        (
+            "remove_reference",
+            "remove_reference :people, :display_name",
+        ),
+        (
+            "remove_belongs_to",
+            "remove_belongs_to :people, :display_name",
+        ),
+    ] {
+        for (kind, mut schema) in [
+            ("unindexed", generated_schema()),
+            ("indexed", indexed_generated_schema()),
+        ] {
+            let original = schema.clone();
+            let error = apply_migration(&mut schema, &one_operation(operation))
+                .expect_err("a reference-removal alias cannot remove a generated output");
+
+            assert!(error.contains("generated column"), "{error}");
+            assert_eq!(
+                schema, original,
+                "{verb} must preserve the {kind} generated output and its table metadata"
+            );
+        }
+    }
+}
+
+#[test]
+fn reference_removal_aliases_cannot_remove_and_recreate_generated_operands() {
+    for (verb, operations) in [
+        (
+            "remove_reference",
+            "remove_reference :people, :first_name\n    add_column :people, :first_name, :string",
+        ),
+        (
+            "remove_belongs_to",
+            "remove_belongs_to :people, :first_name\n    add_column :people, :first_name, :string",
+        ),
+    ] {
+        let mut schema = generated_schema();
+        let original = schema.clone();
+        let error = apply_migration(&mut schema, &one_operation(operations))
+            .expect_err("removing a generated expression operand must be rejected immediately");
+
+        assert!(error.contains("generated column"), "{error}");
+        assert!(error.contains(verb), "{error}");
+        assert_eq!(
+            schema, original,
+            "{verb} followed by a same-named replacement must leave the schema unchanged"
+        );
+        assert_eq!(
+            column(table(&schema, "people"), "first_name").col_type,
+            ColumnType::String { limit: None }
+        );
+    }
+}
+
+#[test]
+fn reference_removal_aliases_still_remove_ordinary_references() {
+    for (verb, target) in [
+        ("remove_reference", "author"),
+        ("remove_belongs_to", "reviewer"),
+    ] {
+        let mut schema = reference_schema();
+        let before = table(&schema, "people");
+        assert!(matches!(
+            &column(before, target).col_type,
+            ColumnType::Reference { .. }
+        ));
+
+        apply_migration(
+            &mut schema,
+            &one_operation(&format!("{verb} :people, :{target}")),
+        )
+        .expect("ordinary reference columns remain removable");
+
+        let people = table(&schema, "people");
+        assert!(
+            people
+                .columns
+                .iter()
+                .all(|column| column.name.as_str() != target)
+        );
+        assert_eq!(column(people, "name").default.as_deref(), Some("keep"));
+        assert!(!column(people, "name").nullable);
+        let other_reference = if target == "author" {
+            "reviewer"
+        } else {
+            "author"
+        };
+        assert!(matches!(
+            &column(people, other_reference).col_type,
+            ColumnType::Reference { .. }
+        ));
+        let generated = column(people, "display_name")
+            .generated
+            .as_ref()
+            .expect("the unrelated generated output remains present");
+        assert_eq!(generated.expression, r#""name" || ' display'"#);
+    }
 }
 
 fn apply_migration(schema: &mut Schema, body: &str) -> Result<(), String> {
@@ -177,10 +380,12 @@ fn unindexed_generated_outputs_can_be_renamed_or_removed() {
     )
     .expect("an unindexed generated output can be renamed safely");
     let renamed_table = table(&renamed, "people");
-    assert!(renamed_table
-        .columns
-        .iter()
-        .all(|column| column.name.as_str() != "display_name"));
+    assert!(
+        renamed_table
+            .columns
+            .iter()
+            .all(|column| column.name.as_str() != "display_name")
+    );
     let label = column(renamed_table, "label");
     let generated = label
         .generated
@@ -200,10 +405,12 @@ fn unindexed_generated_outputs_can_be_renamed_or_removed() {
         &one_operation("remove_column :people, :display_name"),
     )
     .expect("an unindexed generated output can be removed safely");
-    assert!(table(&removed, "people")
-        .columns
-        .iter()
-        .all(|column| column.name.as_str() != "display_name"));
+    assert!(
+        table(&removed, "people")
+            .columns
+            .iter()
+            .all(|column| column.name.as_str() != "display_name")
+    );
     let removed_ddl = render_schema_statements(&removed);
     assert!(!removed_ddl[0].contains("display_name"));
 }
@@ -220,18 +427,24 @@ fn unrelated_ordinary_column_changes_preserve_generated_metadata() {
     .expect("ordinary column changes remain supported");
 
     let people = table(&schema, "people");
-    assert!(people
-        .columns
-        .iter()
-        .any(|column| column.name.as_str() == "handle"));
-    assert!(people
-        .columns
-        .iter()
-        .all(|column| column.name.as_str() != "nickname"));
-    assert!(people
-        .columns
-        .iter()
-        .all(|column| column.name.as_str() != "obsolete"));
+    assert!(
+        people
+            .columns
+            .iter()
+            .any(|column| column.name.as_str() == "handle")
+    );
+    assert!(
+        people
+            .columns
+            .iter()
+            .all(|column| column.name.as_str() != "nickname")
+    );
+    assert!(
+        people
+            .columns
+            .iter()
+            .all(|column| column.name.as_str() != "obsolete")
+    );
     let first_name = column(people, "first_name");
     assert!(matches!(&first_name.col_type, ColumnType::Text));
     assert!(!first_name.nullable);

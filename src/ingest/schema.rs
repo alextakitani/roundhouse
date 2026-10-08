@@ -377,10 +377,22 @@ fn apply_migration_verb(
             if let (Some(t), Some(c)) = (arg_name(0), arg_name(1)) {
                 let positional = args.get(2).and_then(default_value);
                 let to_kwarg = kwarg_value(args.iter().skip(2), "to").and_then(|v| default_value(&v));
-                if let Some(table) = schema.tables.get_mut(&Symbol::from(t)) {
+                let default = to_kwarg.clone().or_else(|| positional.clone());
+                if let Some(table) = schema.tables.get(&Symbol::from(t.as_str())) {
+                    if table.columns.iter().any(|column| column.generated.is_some()) {
+                        let mut candidate = table.clone();
+                        for col in &mut candidate.columns {
+                            if col.name.as_str() == c {
+                                col.default = default.clone();
+                            }
+                        }
+                        validate_generated_migration_candidate(&candidate, verb, file)?;
+                    }
+                }
+                if let Some(table) = schema.tables.get_mut(&Symbol::from(t.as_str())) {
                     for col in &mut table.columns {
                         if col.name.as_str() == c {
-                            col.default = to_kwarg.clone().or_else(|| positional.clone());
+                            col.default = default.clone();
                         }
                     }
                 }
@@ -402,7 +414,27 @@ fn apply_migration_verb(
         }
         "remove_reference" | "remove_belongs_to" => {
             if let (Some(t), Some(name)) = (arg_name(0), arg_name(1)) {
-                if let Some(table) = schema.tables.get_mut(&Symbol::from(t)) {
+                if let Some(table) = schema.tables.get(&Symbol::from(t.as_str())) {
+                    if table.columns.iter().any(|column| {
+                        column.name.as_str() == name && column.generated.is_some()
+                    }) {
+                        return Err(IngestError::Unsupported {
+                            file: file.into(),
+                            message: format!(
+                                "generated column cannot be removed with `{verb}`: {}.{name} is not a reference",
+                                table.name.as_str()
+                            ),
+                        });
+                    }
+                    if table.columns.iter().any(|column| column.generated.is_some()) {
+                        let mut candidate = table.clone();
+                        candidate
+                            .columns
+                            .retain(|column| column.name.as_str() != name);
+                        validate_generated_migration_candidate(&candidate, verb, file)?;
+                    }
+                }
+                if let Some(table) = schema.tables.get_mut(&Symbol::from(t.as_str())) {
                     table.columns.retain(|x| x.name.as_str() != name);
                 }
             }
