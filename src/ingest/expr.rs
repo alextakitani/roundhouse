@@ -582,7 +582,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
                 && block.is_none()
                 && recv.is_some()
                 && args.len() == 1
-                && !matches!(&*args[0].node, ExprNode::ForwardArgs | ExprNode::ForwardKeywords)
+                && !matches!(&*args[0].node, ExprNode::ForwardArgs | ExprNode::ForwardKeywords | ExprNode::ForwardKeywordsWithPairs { .. })
             {
                 let r = recv.unwrap();
                 let mut defaults = args.into_iter().next().unwrap();
@@ -2596,21 +2596,65 @@ fn ingest_forwardable_arguments(
         } else {
             if let Some(hash) = arg.as_keyword_hash_node() {
                 let elements: Vec<_> = hash.elements().iter().collect();
-                if elements.iter().any(|e| e.as_assoc_splat_node().is_some_and(|s| s.value().is_none())) {
-                    if elements.len() != 1 {
-                        // Mixed forwarding remains outside this slice. Keep
-                        // its existing ledger identity; only lone `**` is new.
+                let anonymous_splats: Vec<usize> = elements
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, e)| {
+                        e.as_assoc_splat_node()
+                            .is_some_and(|s| s.value().is_none())
+                            .then_some(i)
+                    })
+                    .collect();
+                if !anonymous_splats.is_empty() {
+                    if elements.len() == 1 {
+                        let loc = elements[0].location();
+                        args.push(Expr::new(Span {
+                            file: super::sources::file_id(file),
+                            start: loc.start_offset() as u32,
+                            end: loc.end_offset() as u32,
+                        }, ExprNode::ForwardKeywords));
+                        continue;
+                    }
+                    if anonymous_splats.len() != 1
+                        || anonymous_splats[0] != elements.len() - 1
+                    {
                         return Err(IngestError::Unsupported {
                             file: file.into(),
                             message: "anonymous `**` keyword forwarding not yet supported".into(),
                         });
                     }
-                    let loc = elements[0].location();
+
+                    let mut entries = Vec::with_capacity(elements.len() - 1);
+                    for element in &elements[..elements.len() - 1] {
+                        let Some(assoc) = element.as_assoc_node() else {
+                            // In particular, a named `**options` before the
+                            // anonymous packet would require a second dynamic
+                            // merge in the IR. Keep that mixed shape explicit
+                            // on the unsupported ledger until it is modeled.
+                            return Err(IngestError::Unsupported {
+                                file: file.into(),
+                                message: "anonymous `**` keyword forwarding not yet supported".into(),
+                            });
+                        };
+                        let key = ingest_expr(&assoc.key(), file)?;
+                        if !matches!(
+                            &*key.node,
+                            ExprNode::Lit { value: Literal::Sym { .. } }
+                        ) {
+                            return Err(IngestError::Unsupported {
+                                file: file.into(),
+                                message: "anonymous `**` keyword forwarding requires static symbol keys".into(),
+                            });
+                        }
+                        let value = ingest_expr(&assoc.value(), file)?;
+                        entries.push((key, value));
+                    }
+                    let loc = hash.location();
                     args.push(Expr::new(Span {
                         file: super::sources::file_id(file),
                         start: loc.start_offset() as u32,
                         end: loc.end_offset() as u32,
-                    }, ExprNode::ForwardKeywords));
+                    }, ExprNode::ForwardKeywordsWithPairs { entries }));
                     continue;
                 }
             }

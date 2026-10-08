@@ -572,6 +572,12 @@ fn action_aggregate_equals_subtree_fold() {
             | ExprNode::ForwardKeywords
             | ExprNode::Defined { .. }
             | ExprNode::SelfRef => {}
+            ExprNode::ForwardKeywordsWithPairs { entries } => {
+                for (key, value) in entries {
+                    fold(key, acc);
+                    fold(value, acc);
+                }
+            }
             ExprNode::Hash { entries, .. } => {
                 for (k, v) in entries {
                     fold(k, acc);
@@ -1051,6 +1057,12 @@ fn collect_ivar_reads(expr: &roundhouse::expr::Expr, out: &mut Vec<(Symbol, Opti
             if let Some(v) = value { collect_ivar_reads(v, out); }
         }
         ExprNode::Splat { value } | ExprNode::KeywordSplat { value } => collect_ivar_reads(value, out),
+        ExprNode::ForwardKeywordsWithPairs { entries } => {
+            for (key, value) in entries {
+                collect_ivar_reads(key, out);
+                collect_ivar_reads(value, out);
+            }
+        }
         ExprNode::MultiAssign { value, .. } => collect_ivar_reads(value, out),
         ExprNode::While { cond, body, .. } => {
             collect_ivar_reads(cond, out);
@@ -1256,6 +1268,12 @@ fn collect_bare_name_sends(
             if let Some(v) = value { collect_bare_name_sends(v, out); }
         }
         ExprNode::Splat { value } | ExprNode::KeywordSplat { value } => collect_bare_name_sends(value, out),
+        ExprNode::ForwardKeywordsWithPairs { entries } => {
+            for (key, value) in entries {
+                collect_bare_name_sends(key, out);
+                collect_bare_name_sends(value, out);
+            }
+        }
         ExprNode::MultiAssign { value, .. } => collect_bare_name_sends(value, out),
         ExprNode::While { cond, body, .. } => {
             collect_bare_name_sends(cond, out);

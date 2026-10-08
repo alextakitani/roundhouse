@@ -5524,7 +5524,7 @@ impl Analyzer {
         mut arg_tys: Vec<Ty>,
         kw: SiteKeywords,
     ) -> Vec<Ty> {
-        if let Some(shape) = shape.filter(|s| s.keywords_by_kind) {
+        if let Some(shape) = shape.filter(|s| s.keywords_by_kind || kw.anonymous_forward) {
             if kw.group {
                 if let Some(placed) =
                     Self::bind_keyword_group(shape, &arg_tys, &kw.keys, kw.splat.as_ref())
@@ -5784,6 +5784,10 @@ impl Analyzer {
                             }
                             if all_sym { pairs } else { Vec::new() }
                         }
+                        // The anonymous packet is merged after these
+                        // pairs, so it can overwrite every explicit key.
+                        // Keep the group as unknown keyword evidence below
+                        // instead of inferring the explicit values as final.
                         _ => Vec::new(),
                     };
                     // Whether the last argument is the call's keyword
@@ -5791,7 +5795,10 @@ impl Analyzer {
                     // `**splat`, never a positional `{…}` literal.
                     let group = matches!(
                         args.last().map(|a| &*a.node),
-                        Some(ExprNode::Hash { kwargs: true, .. } | ExprNode::KeywordSplat { .. })
+                        Some(ExprNode::Hash { kwargs: true, .. }
+                            | ExprNode::KeywordSplat { .. }
+                            | ExprNode::ForwardKeywords
+                            | ExprNode::ForwardKeywordsWithPairs { .. })
                     );
                     // The splat merges over the literal, so each literal
                     // key may take the splat's value too.
@@ -5804,9 +5811,20 @@ impl Analyzer {
                                     .collect();
                                 (joined, Some(v))
                             }),
+                        Some(ExprNode::ForwardKeywordsWithPairs { .. }) => {
+                            // The opaque forwarded packet merges after the
+                            // literal entries and can override each key.
+                            // Its values are unavailable, so the signature
+                            // binder leaves named parameters uninferred.
+                            (Vec::new(), None)
+                        }
                         _ => (keys, None),
                     };
-                    let kw_tys = SiteKeywords { group, keys, splat };
+                    let anonymous_forward = matches!(
+                        args.last().map(|a| &*a.node),
+                        Some(ExprNode::ForwardKeywords | ExprNode::ForwardKeywordsWithPairs { .. })
+                    );
+                    let kw_tys = SiteKeywords { group, keys, splat, anonymous_forward };
                     // `Klass.new(a, b)` hands its arguments to
                     // `initialize` — that is all `Class#new` does with
                     // them — so the site is evidence for the
@@ -5843,6 +5861,12 @@ impl Analyzer {
                 for (k, v) in entries {
                     self.collect_send_sites(k, self_class, helpers, out);
                     self.collect_send_sites(v, self_class, helpers, out);
+                }
+            }
+            ExprNode::ForwardKeywordsWithPairs { entries } => {
+                for (key, value) in entries {
+                    self.collect_send_sites(key, self_class, helpers, out);
+                    self.collect_send_sites(value, self_class, helpers, out);
                 }
             }
             ExprNode::If { cond, then_branch, else_branch } => {
@@ -7140,6 +7164,9 @@ struct SiteKeywords {
     /// keyword the literal does not name can receive. `keys` then holds
     /// the literal's pairs.
     splat: Option<Ty>,
+    /// The opaque final `**` can override the explicit pairs, so they are
+    /// not type evidence for the receiving named parameters.
+    anonymous_forward: bool,
 }
 
 /// A method's declared parameter slots, in declaration order, as

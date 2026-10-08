@@ -118,7 +118,10 @@ fn walk(
     let forwards_keywords = match &*e.node {
         ExprNode::Send { args, .. } | ExprNode::Super { args: Some(args) } => args
             .iter()
-            .any(|a| matches!(&*a.node, ExprNode::ForwardKeywords)),
+            .any(|a| matches!(
+                &*a.node,
+                ExprNode::ForwardKeywords | ExprNode::ForwardKeywordsWithPairs { .. }
+            )),
         _ => false,
     };
     if forwards_keywords {
@@ -561,8 +564,18 @@ fn possible_full_destination(
 }
 
 fn has_forwarding(args: &[Expr]) -> bool {
-    args.iter()
-        .any(|a| matches!(&*a.node, ExprNode::ForwardArgs))
+    args.iter().any(|a| matches!(&*a.node, ExprNode::ForwardArgs))
+}
+
+fn has_source_packet(args: &[Expr]) -> bool {
+    args.iter().any(|a| {
+        matches!(
+            &*a.node,
+            ExprNode::ForwardArgs
+                | ExprNode::ForwardKeywords
+                | ExprNode::ForwardKeywordsWithPairs { .. }
+        )
+    })
 }
 
 fn constant_names_class(expr: &Expr, class: &ClassId) -> bool {
@@ -726,7 +739,7 @@ impl<'a> SourceContractIndex<'a> {
             let mut names = index.full_selectors.clone();
             fn collect(e: &Expr, names: &mut HashSet<Symbol>) {
                 if let ExprNode::Send { method, args, .. } = &*e.node
-                    && has_forwarding(args)
+                    && has_source_packet(args)
                 {
                     names.insert(method.clone());
                     if method.as_str() == "new" {
