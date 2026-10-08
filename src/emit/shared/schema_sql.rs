@@ -406,6 +406,7 @@ fn sqlite_type(ct: &ColumnType) -> &'static str {
         | ColumnType::DateTime
         | ColumnType::Time
         | ColumnType::Json
+        | ColumnType::Jsonb
         | ColumnType::Uuid => "TEXT",
         ColumnType::Reference { .. } => "INTEGER",
     }
@@ -415,9 +416,8 @@ fn sqlite_type(ct: &ColumnType) -> &'static str {
 /// creates for it (`NATIVE_DATABASE_TYPES`; `datetime` is Rails 7+'s
 /// `timestamp(6)`), in the spelling `pg_dump` prints.
 ///
-/// The IR is what ingest left: `jsonb` and `json` are both `Json`,
-/// which renders `jsonb` — the type Postgres apps use, and the one that
-/// has equality and a btree index; `timestamptz` is a `DateTime`, and
+/// Ingest preserves `json` and `jsonb` independently so PostgreSQL schema
+/// output retains the source type. `timestamptz` is a `DateTime`, and
 /// `citext` and the network types render as their text storage. A
 /// decimal scale without a precision, which Rails rejects, renders as a
 /// bare `numeric`.
@@ -437,7 +437,8 @@ fn postgres_type(ct: &ColumnType) -> String {
         ColumnType::DateTime => "timestamp(6) without time zone".into(),
         ColumnType::Time => "time without time zone".into(),
         ColumnType::Binary => "bytea".into(),
-        ColumnType::Json => "jsonb".into(),
+        ColumnType::Json => "json".into(),
+        ColumnType::Jsonb => "jsonb".into(),
         ColumnType::Uuid => "uuid".into(),
     }
 }
@@ -781,8 +782,8 @@ end
             (ColumnType::DateTime, "timestamp(6) without time zone"),
             (ColumnType::Time, "time without time zone"),
             (ColumnType::Binary, "bytea"),
-            // Ingest folds `jsonb` and `json` into one `Json`.
-            (ColumnType::Json, "jsonb"),
+            (ColumnType::Json, "json"),
+            (ColumnType::Jsonb, "jsonb"),
             (ColumnType::Uuid, "uuid"),
             // Not something Rails emits (it rejects a scale without a
             // precision): the scale is dropped rather than a precision
