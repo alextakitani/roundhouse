@@ -1693,6 +1693,11 @@ pub enum RouteSpec {
         /// `:bot_key` after `:room_id` rather than in front of `/rooms`.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         nest: bool,
+        /// Keep routes dispatchable without exporting their helper names
+        /// into the enclosing application. Isolated engine helpers belong
+        /// to the engine's mounted proxy, which this runtime does not model.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        suppress_helpers: bool,
         entries: Vec<RouteSpec>,
     },
 }

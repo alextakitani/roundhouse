@@ -2048,6 +2048,7 @@ mod tests {
             required_params: params.len(),
             path_params: params,
             named: false,
+            helpers_enabled: false,
             format: None,
             param_defaults: vec![],
             int_params: vec![],

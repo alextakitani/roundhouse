@@ -42,6 +42,312 @@ fn anonymous_keyword_forwarding_runs_without_capturing_or_reordering_values() {
     assert!(emitted.contains("request(kind: :get, path: path, **)"), "{emitted}");
 }
 
+#[path = "support/engine_mount.rs"]
+mod engine_mount;
+
+#[test]
+fn literal_isolated_engine_mount_runs_over_cruby_http() {
+    let run = engine_mount::overlay().run_ruby(engine_mount::CRUBY_ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("literal engine mount CRuby HTTP contract passed"));
+}
+
+#[test]
+fn engine_helper_calls_are_explicit_instead_of_using_host_helpers() {
+    let controller = r#"module Catalog
+  class ProductsController < ActionController::Base
+    def index
+      render plain: products_path
+    end
+  end
+end
+"#;
+    let (_emitted, app, errors) = engine_mount::overlay()
+        .write("vendor/catalog/app/controllers/catalog/products_controller.rb", controller)
+        .emit_with_app(roundhouse::project::BuildTarget::Ruby);
+    assert!(
+        engine_mount::has_error_in_source(&app, &errors, "vendor/catalog/app/controllers/catalog/products_controller.rb", "products_path"),
+        "engine helper collision was not explicit:\n{}",
+        engine_mount::describe_errors(&app, &errors)
+    );
+}
+
+#[test]
+fn reflective_engine_helpers_and_proxy_calls_are_explicit() {
+    let engine_controller = r#"module Catalog
+  class ProductsController < ActionController::Base
+    def reflective_symbol
+      send(:products_path)
+    end
+
+    def reflective_string
+      public_send("items_path")
+    end
+  end
+end
+"#;
+    let host_controller = r#"class HostController < ApplicationController
+  def host_products_reflection
+    public_send(:products_path)
+  end
+
+  def reflective_mount_helper
+    self.send(:catalog_path)
+  end
+
+  def reflective_symbol_proxy
+    catalog.send(:products_path)
+  end
+
+  def reflective_string_proxy
+    self.catalog.public_send("items_path")
+  end
+
+  def reflective_private_proxy
+    self.catalog.__send__("products_path")
+  end
+
+  def reflective_proxy_then_direct_helper
+    public_send(:catalog).items_path
+  end
+
+  def reflective_proxy_and_helper_chain
+    self.public_send("catalog").public_send(:items_path)
+  end
+
+  def reflective_send_proxy_and_helper
+    send(:catalog).send("products_path")
+  end
+end
+"#;
+    let engine_routes = "Catalog::Engine.routes.draw do\n  get \"/products\", to: \"products#index\"\n  get \"/items\", to: \"products#index\", as: :items\nend\n";
+    let host_routes = "Rails.application.routes.draw do\n  mount Catalog::Engine, at: \"/catalog\"\n  get \"/host/products\", to: \"host#reflective_symbol_proxy\", as: :products\nend\n";
+    let (_emitted, app, errors) = engine_mount::overlay()
+        .write("vendor/catalog/app/controllers/catalog/products_controller.rb", engine_controller)
+        .write("vendor/catalog/config/routes.rb", engine_routes)
+        .write("app/controllers/host_controller.rb", host_controller)
+        .write("config/routes.rb", host_routes)
+        .emit_with_app(roundhouse::project::BuildTarget::Ruby);
+    for (path, needle) in [
+        ("vendor/catalog/app/controllers/catalog/products_controller.rb", "send(:products_path)"),
+        ("vendor/catalog/app/controllers/catalog/products_controller.rb", "public_send(\"items_path\")"),
+        ("app/controllers/host_controller.rb", "catalog.send(:products_path)"),
+        ("app/controllers/host_controller.rb", "self.catalog.public_send(\"items_path\")"),
+        ("app/controllers/host_controller.rb", "self.catalog.__send__(\"products_path\")"),
+        ("app/controllers/host_controller.rb", "public_send(:catalog).items_path"),
+        ("app/controllers/host_controller.rb", "self.public_send(\"catalog\").public_send(:items_path)"),
+        ("app/controllers/host_controller.rb", "send(:catalog).send(\"products_path\")"),
+        ("app/controllers/host_controller.rb", "self.send(:catalog_path)"),
+    ] {
+        assert!(
+            engine_mount::has_error_on_source_line(&app, &errors, path, needle),
+            "reflective helper use {needle} in {path} was not a located mount error:\n{}",
+            engine_mount::describe_errors(&app, &errors)
+        );
+    }
+    assert!(
+        !engine_mount::has_error_on_source_line(
+            &app,
+            &errors,
+            "app/controllers/host_controller.rb",
+            "public_send(:products_path)"
+        ),
+        "host-authored products_path reflection was rejected:\n{}",
+        engine_mount::describe_errors(&app, &errors)
+    );
+}
+
+#[test]
+fn host_engine_helper_proxy_calls_are_explicit() {
+    let host = r#"class HostController < ApplicationController
+  def index
+    render plain: "host root"
+  end
+
+  def root_helper
+    render plain: root_path
+  end
+
+  def products_helper
+    render plain: products_path
+  end
+
+  def engine_proxy
+    render plain: catalog.products_path
+  end
+
+  def self_engine_proxy
+    render plain: self.catalog.items_path
+  end
+
+  def after
+    render plain: "host after"
+  end
+end
+"#;
+    let (_emitted, app, errors) = engine_mount::overlay()
+        .write("app/controllers/host_controller.rb", host)
+        .write(
+            "config/routes.rb",
+            "Rails.application.routes.draw do\n  root \"host#index\"\n  get \"/root-helper\", to: \"host#root_helper\"\n  get \"/products-helper\", to: \"host#products_helper\"\n  get \"/engine-proxy\", to: \"host#engine_proxy\"\n  get \"/self-engine-proxy\", to: \"host#self_engine_proxy\"\n  get \"/products\", to: \"products#index\", as: :products\n  get \"/catalog/products\", to: \"products#index\", as: :host_catalog_products\n  mount Catalog::Engine, at: \"/catalog\"\n  get \"/catalog/items\", to: \"items#index\", as: :host_catalog_items\n  get \"/after\", to: \"host#after\"\nend\n",
+        )
+        .emit_with_app(roundhouse::project::BuildTarget::Ruby);
+    assert!(
+        engine_mount::has_error_in_source(&app, &errors, "app/controllers/host_controller.rb", "products_path"),
+        "mounted engine proxy calls were not explicit:\n{}",
+        engine_mount::describe_errors(&app, &errors)
+    );
+    assert!(
+        engine_mount::has_error_on_source_line(&app, &errors, "app/controllers/host_controller.rb", "self.catalog.items_path"),
+        "self.catalog.items_path receiver was not rejected:\n{}",
+        engine_mount::describe_errors(&app, &errors)
+    );
+}
+
+#[test]
+fn host_root_helper_is_kept_while_engine_root_helper_is_an_error() {
+    let home = r#"module Catalog
+  class HomeController < ActionController::Base
+    def index
+      render plain: root_path
+    end
+  end
+end
+"#;
+    let (_emitted, app, errors) = engine_mount::overlay()
+        .write("vendor/catalog/app/controllers/catalog/home_controller.rb", home)
+        .emit_with_app(roundhouse::project::BuildTarget::Ruby);
+    assert!(
+        engine_mount::has_error_in_source(&app, &errors, "vendor/catalog/app/controllers/catalog/home_controller.rb", "root_path"),
+        "engine root helper did not retain an explicit error:\n{}",
+        engine_mount::describe_errors(&app, &errors)
+    );
+    assert!(
+        !engine_mount::has_error_in_source(&app, &errors, "app/controllers/host_controller.rb", "root_path"),
+        "the legitimate host root_path call was rejected: {errors:?}"
+    );
+}
+
+#[test]
+fn isolated_engine_paths_do_not_create_or_shadow_host_helpers() {
+    let host = r#"class HostController < ApplicationController
+  def index
+    render plain: "host root"
+  end
+
+  def fake_engine_helper
+    render plain: "host action"
+  end
+end
+"#;
+    let (emitted, app, errors) = engine_mount::overlay()
+        .write("app/controllers/host_controller.rb", host)
+        .write(
+            "config/routes.rb",
+            "Rails.application.routes.draw do\n  root \"host#index\"\n  mount Catalog::Engine, at: \"/catalog\"\n  get \"/host/catalog/products\", to: \"host#fake_engine_helper\", as: :catalog_products\nend\n",
+        )
+        .emit_with_app(roundhouse::project::BuildTarget::Ruby);
+    assert!(
+        errors.is_empty(),
+        "literal engine mount reported unexpected errors:\n{}",
+        engine_mount::describe_errors(&app, &errors)
+    );
+    let helpers = std::fs::read_to_string(emitted.join("app/route_helpers.rb")).expect("route helpers");
+    assert_eq!(
+        helpers.matches("def self.catalog_products_path").count(),
+        1,
+        "the host-authored route helper must remain available exactly once: {helpers}"
+    );
+    assert!(
+        helpers.contains("\"/host/catalog/products\""),
+        "catalog_products_path must retain the host route's path: {helpers}"
+    );
+    assert!(
+        !helpers.contains("def self.catalog_items_path"),
+        "the isolated engine's catalog_items_path leaked into host helpers: {helpers}"
+    );
+}
+
+#[test]
+fn helper_proxy_uses_in_library_jbuilder_and_configured_test_sources_are_explicit() {
+    let sources = [
+        (
+            "lib/engine_proxy_reference.rb",
+            "class EngineProxyReference\n  def self.path\n    catalog.products_path\n  end\nend\n",
+        ),
+        (
+            "app/views/host/index.json.jbuilder",
+            "json.url catalog.products_path\n",
+        ),
+        (
+            "spec/engine_proxy_reference_spec.rb",
+            "class EngineProxyReferenceSpec\n  def path\n    catalog.products_path\n  end\nend\n",
+        ),
+        (
+            "vendor/catalog/lib/catalog/path_reference.rb",
+            r#"module Catalog
+  class PathReference
+    def path
+      products_path
+    end
+
+    def self.engine_home
+      products_path
+    end
+
+    class Engine
+      def self.reference
+        "plain nested helper class"
+      end
+    end
+  end
+end
+"#,
+        ),
+    ];
+    for (path, source) in sources {
+        let mut overlay = engine_mount::overlay().write(path, source);
+        if path.starts_with("spec/") {
+            overlay = overlay.write("roundhouse.yml", "test_paths:\n  - spec\n");
+        }
+        let (_emitted, app, errors) = overlay.emit_with_app(roundhouse::project::BuildTarget::Ruby);
+        assert!(
+            engine_mount::has_error_in_source(&app, &errors, path, "products_path"),
+            "route helper call in {path} was not an explicit mount gap:\n{}",
+            engine_mount::describe_errors(&app, &errors)
+        );
+    }
+}
+
+#[test]
+fn engine_haml_helper_calls_keep_their_source_boundary() {
+    let path = "vendor/catalog/app/views/home/index.html.haml";
+    let (_emitted, app, errors) = engine_mount::overlay()
+        .write(path, "= root_path\n")
+        .emit_with_app(roundhouse::project::BuildTarget::Ruby);
+    assert!(
+        engine_mount::has_error_in_source(&app, &errors, path, "root_path"),
+        "bare engine helper in HAML was not rejected:\n{}",
+        engine_mount::describe_errors(&app, &errors)
+    );
+}
+
+#[test]
+fn dynamic_engine_route_targets_keep_their_source_boundary() {
+    let path = "vendor/catalog/config/routes.rb";
+    let (_emitted, app, errors) = engine_mount::overlay()
+        .write(
+            path,
+            "Catalog::Engine.routes.draw do\n  root to: redirect(root_path)\n  get \"/products\", to: \"products#index\"\nend\n",
+        )
+        .emit_with_app(roundhouse::project::BuildTarget::Ruby);
+    assert!(
+        engine_mount::has_error_in_source(&app, &errors, path, "dynamic targets"),
+        "dynamic engine route target was not rejected:\n{}",
+        engine_mount::describe_errors(&app, &errors)
+    );
+}
+
 #[test]
 fn critic_corrections_preserve_class_objects_reflection_and_operators() {
     emit_and_run::real_blog()
