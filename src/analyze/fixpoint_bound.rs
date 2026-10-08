@@ -1,9 +1,9 @@
 //! A size and depth bound on the types the whole-program fixpoint carries
 //! from one round to the next.
 //!
-//! Harvested returns and unified parameter types are the next round's
-//! input, so a method whose result reaches its own input rebuilds its type
-//! from the previous one every round. `harvest_return` cuts the direct
+//! Harvested returns, unified parameter types and harvested ivar types
+//! are the next round's input, so a method whose result reaches its own
+//! input rebuilds its type from the previous one every round. `harvest_return` cuts the direct
 //! case, a return that nests its own previous copy. Two shapes escape any
 //! comparison with earlier types:
 //!
@@ -237,6 +237,40 @@ mod tests {
         let wide = body::union_many(classes.chain([arr(Ty::Int)]).collect());
         assert!(measure(&wide).1 > MAX_NODES);
         assert_eq!(bound(wide), Ty::Untyped);
+    }
+
+    /// An ivar's type is carried too: the next round seeds it into every
+    /// method that reads it, and a write rebuilt from it (`@h = @h.…`)
+    /// grows it the same way.
+    #[test]
+    fn an_ivar_harvested_from_a_write_is_bounded() {
+        let mut value = crate::expr::Expr::new(
+            crate::span::Span::synthetic(),
+            crate::expr::ExprNode::Lit { value: crate::expr::Literal::Nil },
+        );
+        value.ty = Some(nested_arrays(MAX_DEPTH + 4));
+        let write = crate::expr::Expr::new(
+            crate::span::Span::synthetic(),
+            crate::expr::ExprNode::Assign { target: crate::expr::LValue::Ivar { name: Symbol::from("h") }, value },
+        );
+        let mut ivars = std::collections::HashMap::new();
+        super::super::extract_ivar_assignments(&write, &mut ivars);
+        assert_eq!(measure(&ivars[&Symbol::from("h")]).0, MAX_DEPTH);
+
+        // `@h["k"] = v` widens the Hash's value type from the written value.
+        let mut deep = crate::expr::Expr::new(
+            crate::span::Span::synthetic(),
+            crate::expr::ExprNode::Lit { value: crate::expr::Literal::Nil },
+        );
+        deep.ty = Some(nested_arrays(MAX_DEPTH + 4));
+        let ivar = crate::expr::Expr::new(crate::span::Span::synthetic(), crate::expr::ExprNode::Ivar { name: Symbol::from("g") });
+        let key = crate::expr::Expr::new(crate::span::Span::synthetic(), crate::expr::ExprNode::Lit { value: crate::expr::Literal::Nil });
+        let index_write = crate::expr::Expr::new(
+            crate::span::Span::synthetic(),
+            crate::expr::ExprNode::Assign { target: crate::expr::LValue::Index { recv: ivar, index: key }, value: deep },
+        );
+        super::super::extract_ivar_assignments(&index_write, &mut ivars);
+        assert_eq!(measure(&ivars[&Symbol::from("g")]).0, MAX_DEPTH);
     }
 
     #[test]
