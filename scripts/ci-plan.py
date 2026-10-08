@@ -63,6 +63,7 @@ SPINEL_TESTS = [
     "spinel_stmt_cache_lru",
     "db_sqlite_concurrency",
     "spinel_param_builder",
+    "spinel_net_http_start",
     "rails_compat_vectors_spinel",
     "spinel_pg_db",
     "generated_columns_spinel",
@@ -92,6 +93,15 @@ GENERATED_COLUMNS_SPINEL_INPUTS = {
     "src/lower/model_to_library/row.rs",
     "src/lower/model_to_library/schema.rs",
     "tests/support/emit_and_run.rs",
+}
+# Inputs of the reopened Net::HTTP gate (tests/spinel_net_http_start.rs):
+# the reopen and the two stub tables it compiles with.
+NET_HTTP_INPUTS = {
+    "runtime/spinel/net_http.rb",
+    "runtime/spinel/http_stub.rb",
+    "runtime/spinel/http_stub.rbs",
+    "runtime/spinel/tcp_socket_stub.rb",
+    "runtime/spinel/tcp_socket_stub.rbs",
 }
 SPINEL11 = [
     "spinel-build",
@@ -303,6 +313,8 @@ def native_coverage(path):
             )
         if any(word in name for word in ("param", "multipart", "request")):
             owned_tests.add("spinel_param_builder")
+        if path in NET_HTTP_INPUTS:
+            owned_tests.add("spinel_net_http_start")
         if name in {
             "date.rb",
             "date.rbs",

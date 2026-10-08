@@ -562,6 +562,11 @@ class Routing(unittest.TestCase):
             "runtime/spinel/multipart.rb": "spinel_param_builder",
             "runtime/spinel/date.rb": "date_columns_spinel",
             "runtime/spinel/active_support_date_parsing.rb": "date_columns_spinel",
+            "runtime/spinel/net_http.rb": "spinel_net_http_start",
+            "runtime/spinel/http_stub.rb": "spinel_net_http_start",
+            "runtime/spinel/http_stub.rbs": "spinel_net_http_start",
+            "runtime/spinel/tcp_socket_stub.rb": "spinel_net_http_start",
+            "runtime/spinel/tcp_socket_stub.rbs": "spinel_net_http_start",
         }
         for path, binary in cases.items():
             with self.subTest(path=path):
