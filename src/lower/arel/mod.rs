@@ -130,11 +130,12 @@ const RELATION_REFINERS: &[&str] = &[
 /// A finder terminates a relation but still needs that relation as its
 /// receiver. If the whole call cannot lift, hydrating only its receiver
 /// would strand `find_by`/`find_by!` on an Array, just as for a refiner.
+/// `sole`/`find_sole_by` likewise: unlike `first`, Array answers neither.
 /// Rails' per-column dynamic finders (`find_by_id`, `find_by_email!`, …)
 /// are the same shape as `find_by` and need the same treatment (#558).
 fn requires_relation_receiver(method: &str) -> bool {
     RELATION_REFINERS.contains(&method)
-        || matches!(method, "find_by" | "find_by!")
+        || matches!(method, "find_by" | "find_by!" | "sole" | "find_sole_by")
         || is_dynamic_finder(method)
 }
 

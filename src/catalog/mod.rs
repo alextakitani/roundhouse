@@ -288,6 +288,22 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         // record itself (not `Self | Nil` like `find_by`).
         return_kind: Some(ReturnKind::SelfType),
     },
+    // `sole` / `find_sole_by` (Rails 7.0) raise unless exactly one row
+    // matches, so they answer the record itself, like `find_by!`.
+    CatalogedMethod {
+        name: "sole",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "find_sole_by",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfType),
+    },
     // `find_or_initialize_by` reads, and on a miss builds an unsaved
     // instance in memory — a SELECT with no write either way.
     CatalogedMethod {
@@ -1456,6 +1472,13 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         return_kind: Some(ReturnKind::SelfType),
     },
     CatalogedMethod {
+        name: "find_sole_by",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
         name: "first!",
         receiver: ReceiverContext::Relation,
         effect: EffectClass::DbRead,
@@ -1839,7 +1862,7 @@ mod tests {
         // SqliteAdapter classified as Read must still be in the
         // catalog as DbRead under at least one receiver context.
         for m in [
-            "all", "find", "find_by", "find_by!", "first", "last",
+            "all", "find", "find_by", "find_by!", "sole", "find_sole_by", "first", "last",
             "where", "limit", "offset", "order", "group", "having",
             "joins", "includes", "preload", "select", "distinct",
             "count", "exists?", "pluck", "pick", "take",
@@ -1897,7 +1920,7 @@ mod tests {
     #[test]
     fn terminal_reads_are_classified() {
         for m in [
-            "all", "find", "find_by", "find_by!", "first", "last",
+            "all", "find", "find_by", "find_by!", "sole", "find_sole_by", "first", "last",
             "take", "count", "exists?", "pluck", "pick",
             "sum", "average", "maximum", "minimum",
         ] {
