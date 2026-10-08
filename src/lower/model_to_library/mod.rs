@@ -1280,13 +1280,14 @@ fn build_methods_with_finder_inputs(
 ///     `@parsed_url` reader left the ivar untyped/unread and Spinel's
 ///     strict emit failed with `error[ivar_unresolved]`.
 ///   * Column / association / scope synthesizers still win over a
-///     duplicate body name (the corpus does not redefine those). The
-///     replace predicate matches unsigned bare-ivar attr_* halves only
-///     (`signature: None`); schema column readers stamp a signature and
-///     are never replaced.
+///     duplicate body name. A later source-level `delegate` may replace
+///     an earlier real method, but only when that method was already
+///     selected from the model body; generated framework methods are not
+///     reordered by source spans.
 fn push_user_methods(methods: &mut Vec<MethodDef>, model: &Model) {
     use crate::dialect::{AccessorKind, ModelBodyItem};
     use crate::expr::{ExprNode, LValue};
+    let mut selected_source_methods = HashSet::new();
     for item in &model.body {
         let ModelBodyItem::Method { method, .. } = item else { continue };
         if let Some(idx) = methods
@@ -1324,18 +1325,22 @@ fn push_user_methods(methods: &mut Vec<MethodDef>, model: &Model) {
                     }
                     AccessorKind::Method => false,
                 };
-            let incoming_is_later_source_definition =
+            let incoming_is_later_delegate =
                 method.receiver == crate::dialect::MethodReceiver::Instance
+                    && !method.name_span.is_synthetic()
+                    && method.name_span.start == method.name_span.end
+                    && selected_source_methods.contains(&existing.name_span)
                     && existing.name_span.file == method.name_span.file
                     && method.name_span.start > existing.name_span.start;
-            if incoming_is_real
-                && (existing_is_attr_half || incoming_is_later_source_definition)
-            {
+            if incoming_is_real && (existing_is_attr_half || incoming_is_later_delegate) {
+                selected_source_methods.remove(&existing.name_span);
                 methods[idx] = method.clone();
+                selected_source_methods.insert(method.name_span);
             }
             continue;
         }
         methods.push(method.clone());
+        selected_source_methods.insert(method.name_span);
     }
 }
 

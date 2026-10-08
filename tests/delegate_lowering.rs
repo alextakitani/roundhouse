@@ -357,6 +357,31 @@ fn a_later_unsupported_delegate_does_not_leave_an_earlier_forwarder() {
 }
 
 #[test]
+fn a_later_model_delegate_replaces_an_earlier_method_with_the_same_name() {
+    let mut files = tree("");
+    files.insert(
+        PathBuf::from("app/models/account.rb"),
+        b"class Account < ApplicationRecord\n  def title\n    \"account title\"\n  end\nend\n"
+            .to_vec(),
+    );
+    files.insert(
+        PathBuf::from("app/models/page.rb"),
+        b"class Page < ApplicationRecord\n  belongs_to :account\n  def title\n    \"local title\"\n  end\n  delegate :title, to: :account\nend\n".to_vec(),
+    );
+
+    let mut app = ingest_app_from_tree(files).expect("ingest");
+    let page = emit_model(&mut app, "page.rb");
+    assert!(
+        page.contains("def title\n    self.account.title\n  end"),
+        "a delegate declared after a same-named method must win in source order:\n{page}"
+    );
+    assert!(
+        !page.contains("local title"),
+        "the earlier method body must not survive the later delegate:\n{page}"
+    );
+}
+
+#[test]
 fn a_delegate_to_a_private_target_method_is_left_alone() {
     let mut files = tree("");
     files.insert(
