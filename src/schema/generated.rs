@@ -1,13 +1,28 @@
 //! Validation for the deliberately small generated-column expression
-//! subset that Roundhouse can render to both SQLite and PostgreSQL.
+//! subsets that Roundhouse can render to SQLite and PostgreSQL.
 //!
 //! Keeping the original SQL on [`super::GeneratedColumn`] is important for
-//! schema round-trips. This parser is only a gate: it accepts string
-//! literals, references to ordinary text/string columns, `||`, and
-//! `coalesce(...)`. It does not rewrite expressions or guess at casts,
-//! JSON operators, arbitrary functions, or other database-specific SQL.
+//! schema round-trips. This parser is only a gate: the default portable
+//! subset accepts string literals, references to ordinary text/string
+//! columns, `||`, and `coalesce(...)`. An explicit PostgreSQL DDL path also
+//! accepts a bounded set of text casts. It does not rewrite expressions or
+//! pass through arbitrary functions or database-specific SQL.
 
 use super::{Column, ColumnType, Table};
+
+/// Expression syntax admitted while ingesting generated-column schema
+/// metadata. This is a source-expression validation mode, not a project
+/// database selector. Application ingest uses [`Portable`](Self::Portable)
+/// so PostgreSQL-only syntax remains unsupported by current targets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GeneratedExpressionDialect {
+    /// The existing expression grammar shared by SQLite and PostgreSQL DDL.
+    #[default]
+    Portable,
+    /// The portable grammar plus the bounded text-cast grammar used by the
+    /// PostgreSQL schema-DDL renderer.
+    Postgres,
+}
 
 #[derive(Clone, Debug)]
 enum Expr {
@@ -15,12 +30,15 @@ enum Expr {
     Column { name: String, quoted: bool },
     Concat(Box<Expr>, Box<Expr>),
     Coalesce(Vec<Expr>),
+    TextCast(Box<Expr>),
 }
 
-/// Check the supported expression grammar and its referenced columns.
-/// The table is complete before this is called, so forward references
-/// cannot accidentally be mistaken for an untyped identifier.
-pub(crate) fn validate_column(table: &Table, column: &Column) -> Result<(), String> {
+/// Check a generated column using an explicit source-expression grammar.
+pub(crate) fn validate_column_with_dialect(
+    table: &Table,
+    column: &Column,
+    dialect: GeneratedExpressionDialect,
+) -> Result<(), String> {
     let Some(generated) = &column.generated else {
         return Ok(());
     };
@@ -52,19 +70,21 @@ pub(crate) fn validate_column(table: &Table, column: &Column) -> Result<(), Stri
         );
     }
 
-    let expression = Parser::new(&generated.expression).parse()?;
+    let expression = Parser::new(&generated.expression, dialect).parse()?;
     validate_expr(&expression, table)
 }
 
-/// All generated-column errors for a table, preserving the column name
-/// so callers can ledger every unsupported declaration in survey mode.
-pub(crate) fn validate_table(table: &Table) -> Vec<(String, String)> {
+/// Check every generated output under one source-expression grammar.
+pub(crate) fn validate_table_with_dialect(
+    table: &Table,
+    dialect: GeneratedExpressionDialect,
+) -> Vec<(String, String)> {
     let mut errors: Vec<(String, String)> = table
         .columns
         .iter()
         .filter(|column| column.generated.is_some())
         .filter_map(|column| {
-            validate_column(table, column)
+            validate_column_with_dialect(table, column, dialect)
                 .err()
                 .map(|message| (column.name.as_str().to_string(), message))
         })
@@ -139,19 +159,23 @@ fn validate_expr(expr: &Expr, table: &Table) -> Result<(), String> {
             }
             Ok(())
         }
+        Expr::TextCast(expression) => validate_expr(expression, table),
     }
 }
 
 struct Parser<'a> {
     source: &'a str,
     position: usize,
+    dialect: GeneratedExpressionDialect,
 }
 
 impl<'a> Parser<'a> {
-    fn new(source: &'a str) -> Self {
+    /// Create a parser whose explicit dialect controls admission of PostgreSQL-only cast syntax.
+    fn new(source: &'a str, dialect: GeneratedExpressionDialect) -> Self {
         Self {
             source,
             position: 0,
+            dialect,
         }
     }
 
@@ -177,14 +201,32 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_concat(&mut self) -> Result<Expr, String> {
-        let mut expression = self.parse_atom()?;
+        let mut expression = self.parse_postfix()?;
         loop {
             self.skip_space();
             if !self.consume("||") {
                 return Ok(expression);
             }
-            let right = self.parse_atom()?;
+            let right = self.parse_postfix()?;
             expression = Expr::Concat(Box::new(expression), Box::new(right));
+        }
+    }
+
+    /// Parse a primary expression and its postfix casts; Portable mode rejects PostgreSQL casts.
+    fn parse_postfix(&mut self) -> Result<Expr, String> {
+        let mut expression = self.parse_atom()?;
+        loop {
+            self.skip_space();
+            if !self.source[self.position..].starts_with("::") {
+                return Ok(expression);
+            }
+            if self.dialect != GeneratedExpressionDialect::Postgres {
+                return Err(self.unsupported_at("PostgreSQL casts are unsupported"));
+            }
+            self.position += 2;
+            self.skip_space();
+            self.parse_text_cast_type()?;
+            expression = Expr::TextCast(Box::new(expression));
         }
     }
 
@@ -208,6 +250,12 @@ impl<'a> Parser<'a> {
                 let name = self.read_identifier();
                 self.skip_space();
                 if self.peek_char() == Some('(') {
+                    if name.eq_ignore_ascii_case("cast")
+                        && self.dialect == GeneratedExpressionDialect::Postgres
+                    {
+                        self.position += 1;
+                        return self.parse_cast_function();
+                    }
                     if !name.eq_ignore_ascii_case("coalesce") {
                         return Err(format!(
                             "generated expression function `{name}` is unsupported"
@@ -233,6 +281,56 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse CAST(expr AS target) using the same narrow target allowlist as postfix casts.
+    fn parse_cast_function(&mut self) -> Result<Expr, String> {
+        let expression = self.parse_concat()?;
+        self.skip_space();
+        if !self.consume_keyword("as") {
+            return Err(self.unsupported_at("expected `AS` in PostgreSQL CAST"));
+        }
+        self.skip_space();
+        self.parse_text_cast_type()?;
+        self.skip_space();
+        if !self.consume(")") {
+            return Err(self.unsupported_at("expected `)` after PostgreSQL CAST"));
+        }
+        Ok(Expr::TextCast(Box::new(expression)))
+    }
+
+    /// Accept only unbounded text, varchar, or character varying targets; reject length modifiers.
+    fn parse_text_cast_type(&mut self) -> Result<(), String> {
+        let Some(ch) = self.peek_char() else {
+            return Err(self.unsupported_at("expected a text cast target"));
+        };
+        if !is_ident_start(ch) {
+            return Err(self.unsupported_at("expected a text cast target"));
+        }
+        let first = self.read_identifier();
+        match first.to_ascii_lowercase().as_str() {
+            "text" | "varchar" => {}
+            "character" => {
+                self.skip_space();
+                if !self.consume_keyword("varying") {
+                    return Err(
+                        "only unbounded text, varchar, or character varying casts are supported in PostgreSQL generated expressions".into(),
+                    );
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "PostgreSQL generated-expression cast target `{first}` is unsupported; only unbounded text, varchar, and character varying are supported"
+                ));
+            }
+        }
+        self.skip_space();
+        if self.peek_char() == Some('(') {
+            return Err(
+                "length-limited casts are unsupported in PostgreSQL generated expressions".into(),
+            );
+        }
+        Ok(())
+    }
+
     fn parse_coalesce(&mut self) -> Result<Expr, String> {
         let mut args = Vec::new();
         loop {
@@ -254,6 +352,7 @@ impl<'a> Parser<'a> {
         Ok(Expr::Coalesce(args))
     }
 
+    /// Consume one SQL string literal, accepting doubled apostrophes and rejecting backslash escapes.
     fn read_string(&mut self) -> Result<(), String> {
         self.position += 1; // opening apostrophe
         loop {
@@ -330,6 +429,21 @@ impl<'a> Parser<'a> {
         } else {
             false
         }
+    }
+
+    /// Match a SQL keyword without case sensitivity while requiring an identifier boundary.
+    fn consume_keyword(&mut self, keyword: &str) -> bool {
+        let remaining = &self.source[self.position..];
+        let Some(prefix) = remaining.get(..keyword.len()) else {
+            return false;
+        };
+        if !prefix.eq_ignore_ascii_case(keyword)
+            || remaining[keyword.len()..].chars().next().is_some_and(is_ident_continue)
+        {
+            return false;
+        }
+        self.position += keyword.len();
+        true
     }
 
     fn peek_char(&self) -> Option<char> {
