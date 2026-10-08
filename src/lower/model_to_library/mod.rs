@@ -1325,7 +1325,8 @@ fn push_user_methods(methods: &mut Vec<MethodDef>, model: &Model) {
                     AccessorKind::Method => false,
                 };
             let incoming_is_later_source_definition =
-                existing.name_span.file == method.name_span.file
+                method.receiver == crate::dialect::MethodReceiver::Instance
+                    && existing.name_span.file == method.name_span.file
                     && method.name_span.start > existing.name_span.start;
             if incoming_is_real
                 && (existing_is_attr_half || incoming_is_later_source_definition)
