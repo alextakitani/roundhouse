@@ -925,6 +925,7 @@ fn table_from_create_table(
                 primary_key: true,
                 generated: None,
                 generated_text_compatible: None,
+                generated_int4_compatible: None,
             }),
             Some(t) => column_with_type(t, id_name.clone(), &opts, &table_name, file),
         };
@@ -1035,6 +1036,7 @@ fn virtual_table_from_call(call: &ruby_prism::CallNode<'_>) -> Option<(Symbol, T
             primary_key: false,
             generated: None,
             generated_text_compatible: None,
+            generated_int4_compatible: None,
         })
         .collect();
     Some((
@@ -1136,6 +1138,7 @@ fn view_columns_from_sql(sql: &str, tables: &IndexMap<Symbol, Table>) -> Vec<Col
             primary_key: false,
             generated: None,
             generated_text_compatible: None,
+            generated_int4_compatible: None,
         });
     }
     columns
@@ -1202,6 +1205,7 @@ fn timestamp_columns() -> [Column; 2] {
         primary_key: false,
         generated: None,
         generated_text_compatible: None,
+        generated_int4_compatible: None,
     };
     [col("created_at"), col("updated_at")]
 }
@@ -1218,6 +1222,7 @@ fn reference_column(name: &str) -> Column {
         primary_key: false,
         generated: None,
         generated_text_compatible: None,
+        generated_int4_compatible: None,
     }
 }
 
@@ -1506,6 +1511,20 @@ fn column_with_type(
         "inet" | "cidr" | "macaddr" | "enum" | "citext"
     ) || (type_name == "text" && opts.limit.is_some()))
     .then_some(false);
+    // Rails' PostgreSQL adapter maps integer limits 1 and 2 to smallint,
+    // 3 and 4 to integer, and 5 through 8 to bigint. The shared ordinary
+    // IR keeps limits 1/2 as Integer, so preserve only the negative fact
+    // needed to reject them as generated int4 results. Invalid sizes also
+    // cannot be treated as exact int4; 5..=8 are already BigInt above.
+    let generated_int4_compatible = if type_name == "integer" {
+        match opts.limit {
+            Some(0 | 1 | 2) => Some(false),
+            Some(3 | 4) | None | Some(5..=8) => None,
+            Some(_) => Some(false),
+        }
+    } else {
+        None
+    };
 
     Ok(Column {
         name: Symbol::from(col_name),
@@ -1515,6 +1534,7 @@ fn column_with_type(
         primary_key: false,
         generated: None,
         generated_text_compatible,
+        generated_int4_compatible,
     })
 }
 
