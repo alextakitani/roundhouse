@@ -11,6 +11,9 @@ use std::path::PathBuf;
 use roundhouse::emit::ruby;
 use roundhouse::ingest::ingest_app_from_tree;
 
+#[path = "support/emit_and_run.rs"]
+mod emit_and_run;
+
 fn tree(files: &[(&str, &str)]) -> HashMap<PathBuf, Vec<u8>> {
     files
         .iter()
@@ -133,7 +136,10 @@ fn emitted(suffix: &str) -> String {
         .unwrap_or_else(|| {
             panic!(
                 "no emitted file ending in {suffix}; got: {:?}",
-                files.iter().map(|f| f.path.display().to_string()).collect::<Vec<_>>()
+                files
+                    .iter()
+                    .map(|f| f.path.display().to_string())
+                    .collect::<Vec<_>>()
             )
         })
 }
@@ -166,4 +172,95 @@ fn controller_create_threads_where_scope_not_array_reader() {
             && ctrl.contains("where_scope(room_id: @room.id)"),
         "must re-root through Message + where_scope:\n{ctrl}"
     );
+}
+
+#[test]
+fn emitted_concern_create_persists_the_association_foreign_key() {
+    emit_and_run::empty_app()
+        .write(
+            "db/schema.rb",
+            r#"ActiveRecord::Schema.define do
+  create_table "rooms", force: :cascade do |t|
+    t.string "name", null: false
+  end
+  create_table "messages", force: :cascade do |t|
+    t.integer "room_id", null: false
+    t.string "body"
+    t.string "client_message_id"
+  end
+end
+"#,
+        )
+        .write(
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        )
+        .write(
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n",
+        )
+        .write(
+            "app/models/room.rb",
+            "class Room < ApplicationRecord\n  has_many :messages\nend\n",
+        )
+        .write(
+            "app/models/message.rb",
+            "class Message < ApplicationRecord\n  include Message::Attachment\n  belongs_to :room\nend\n",
+        )
+        .write(
+            "app/models/message/attachment.rb",
+            r#"module Message::Attachment
+  extend ActiveSupport::Concern
+
+  module ClassMethods
+    def create_with_attachment!(attributes)
+      create!(attributes).tap(&:process_attachment)
+    end
+  end
+
+  def process_attachment
+  end
+end
+"#,
+        )
+        .write(
+            "config/routes.rb",
+            "Rails.application.routes.draw do\n  resources :rooms do\n    resources :messages, only: :create\n  end\nend\n",
+        )
+        .write(
+            "app/controllers/messages_controller.rb",
+            r#"class MessagesController < ApplicationController
+  def create
+    @room = Room.find(params[:room_id])
+    @message = @room.messages.create_with_attachment!(message_params)
+  end
+
+  private
+    def message_params
+      params.require(:message).permit(:body, :client_message_id)
+    end
+end
+"#,
+        )
+        .run_ruby(r#"
+room = Room.create!(name: "hq")
+require_relative "app/controllers/messages_controller"
+ActionController::Base.allow_forgery_protection = false
+controller = MessagesController.new
+ActionController::Current.controller = controller
+controller.request = ActionDispatch::TestRequest.create("HTTP_HOST" => "app.example", "REQUEST_METHOD" => "POST")
+ActionController::Current.request = controller.request
+controller.request_method = "POST"
+controller.params = {
+  "room_id" => room.id.to_s,
+  "message" => { "body" => "hello", "client_message_id" => "runtime" }
+}
+controller.process_action(:create)
+message = Message.where(room_id: room.id).first
+raise "controller create did not persist a message" unless message
+raise "association foreign key was not threaded" unless message.room_id == room.id
+raise "message was not persisted" unless Message.where(room_id: room.id).count == 1
+puts "concern association create passed"
+"#)
+        .assert_passes();
 }

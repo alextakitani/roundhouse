@@ -156,7 +156,10 @@ fn emitted(files: &[roundhouse::emit::EmittedFile], suffix: &str) -> String {
         .unwrap_or_else(|| {
             panic!(
                 "no emitted file ending in {suffix}; got: {:?}",
-                files.iter().map(|f| f.path.display().to_string()).collect::<Vec<_>>(),
+                files
+                    .iter()
+                    .map(|f| f.path.display().to_string())
+                    .collect::<Vec<_>>(),
             )
         })
 }
@@ -308,7 +311,7 @@ end
             "app/models/webhook.rb",
             r#"class Webhook
   def self.deliver(note)
-    bag = { text: "x" }
+    bag = build_bag
     note.class.wrap!(bag)
   end
 end
@@ -349,17 +352,112 @@ end
     );
 }
 
-/// Body-wins is not census-wins-always: an opaque local still collapses
-/// the binding when the body does not need a Hash.
+/// A PORO's own `new(attributes)` is not an Active Record hash consumer.
+/// The implicit receiver must not be enough to classify a helper-only
+/// argument as `Attrs`.
 #[test]
-fn opaque_local_still_poisons_when_body_does_not_need_hash() {
+fn implicit_new_on_plain_library_class_does_not_force_attrs() {
+    let mut app = ingest_app_from_tree(tree(&[
+        ("db/schema.rb", SCHEMA),
+        (
+            "app/models/note.rb",
+            "class Note < ApplicationRecord\nend\n",
+        ),
+        (
+            "app/models/request_envelope.rb",
+            r#"class RequestEnvelope
+  def self.wrap!(attributes)
+    new(attributes)
+  end
+
+  def self.new(attributes)
+    attributes
+  end
+end
+"#,
+        ),
+        (
+            "app/controllers/notes_controller.rb",
+            r#"class NotesController < ApplicationController
+  def create
+    RequestEnvelope.wrap!(note_params)
+  end
+
+  private
+    def note_params
+      params.require(:note).permit(:text)
+    end
+end
+"#,
+        ),
+    ]))
+    .expect("ingest");
+    roundhouse::session::analyze_and_lower(&mut app);
+    let ctrl = emitted(
+        &ruby::emit_lowered_controllers(&app),
+        "app/controllers/notes_controller.rb",
+    );
+    assert!(
+        !ctrl.contains("note_params.to_attrs"),
+        "a plain class's implicit new must preserve the params helper:\n{ctrl}"
+    );
+}
+
+/// The `attributes` referenced inside this lambda belongs to the lambda,
+/// not the enclosing method's parameter. Do not let that nested `create!`
+/// cause the outer method's helper site to convert.
+#[test]
+fn shadowing_lambda_parameter_does_not_force_attrs() {
+    let mut app = ingest_app_from_tree(tree(&[
+        ("db/schema.rb", SCHEMA),
+        (
+            "app/models/note.rb",
+            r#"class Note < ApplicationRecord
+  def self.wrap!(attributes)
+    callback = ->(attributes) { create!(attributes) }
+    attributes
+  end
+end
+"#,
+        ),
+        (
+            "app/controllers/notes_controller.rb",
+            r#"class NotesController < ApplicationController
+  def create
+    Note.wrap!(note_params)
+  end
+
+  private
+    def note_params
+      params.require(:note).permit(:text)
+    end
+end
+"#,
+        ),
+    ]))
+    .expect("ingest");
+    roundhouse::session::analyze_and_lower(&mut app);
+    let ctrl = emitted(
+        &ruby::emit_lowered_controllers(&app),
+        "app/controllers/notes_controller.rb",
+    );
+    assert!(
+        !ctrl.contains("note_params.to_attrs"),
+        "a shadowed lambda parameter must not force Attrs:\n{ctrl}"
+    );
+}
+
+/// An opaque non-Hash caller still vetoes conversion, even if another
+/// caller passes a params helper and the body calls `create!`.
+#[test]
+fn opaque_non_hash_caller_blocks_hash_body_conversion() {
     let mut app = ingest_app_from_tree(tree(&[
         ("db/schema.rb", SCHEMA),
         (
             "app/models/note.rb",
             r#"class Note < ApplicationRecord
   def self.echo!(attributes)
-    attributes
+    create!(attributes)
   end
 end
 "#,
@@ -367,9 +465,8 @@ end
         (
             "app/models/webhook.rb",
             r#"class Webhook
-  def self.deliver(note)
-    bag = { text: "x" }
-    note.class.echo!(bag)
+  def self.deliver
+    Note.echo!("not a hash")
   end
 end
 "#,
@@ -405,6 +502,6 @@ end
     );
     assert!(
         !ctrl.contains("note_params.to_attrs"),
-        "opaque local without hash-only body must not force Attrs:\n{ctrl}"
+        "an opaque non-Hash caller vetoes conversion:\n{ctrl}"
     );
 }
