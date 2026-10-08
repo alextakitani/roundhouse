@@ -8,6 +8,7 @@
 //! in-memory tree (wasm transpile entry point). [`ingest_app`] is the
 //! convenience wrapper for the disk case.
 
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
@@ -247,15 +248,21 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
         .into_iter()
         .filter(|ignored| !lib_dir_is_explicitly_required(vfs, dir, ignored))
         .collect();
-    let helper_sources = route_helper_sources(
-        vfs,
-        dir,
-        &path_gems,
-        &engine_routes,
-        &roots,
-        &additional_test_paths,
-        &lib_ignores,
-    );
+    // Helper-source scanning reads and compiles a second copy of app sources.
+    // Defer it until an engine mount is accepted and needs proxy diagnostics;
+    // the same snapshot serves every accepted mount in this route set.
+    let helper_sources = OnceCell::new();
+    let load_helper_sources = || {
+        route_helper_sources(
+            vfs,
+            dir,
+            &path_gems,
+            &engine_routes,
+            &roots,
+            &additional_test_paths,
+            &lib_ignores,
+        )
+    };
     let mut app = App::new();
     // `enum` columns declared inside a concern's `included do`, keyed by
     // the module. Local rather than a field on `App`: they exist only
@@ -1296,6 +1303,7 @@ end
                 &block_wrappers,
                 &engine_routes,
                 &helper_sources,
+                &load_helper_sources,
             ))? {
                 // `to: redirect("/x")` routes point at actions nobody
                 // wrote, so write them: one controller, one action per
@@ -4900,11 +4908,11 @@ fn engine_route_sources<V: Vfs + ?Sized>(
     sources
 }
 
-/// Sources where route helpers can be called. This is collected only when
-/// source-backed engines exist, and only from the app roots the normal walker
-/// already treats as live code. Engine origin is retained for the helper
-/// boundary check so a host `root_path` can remain valid while an engine's
-/// same-named helper is rejected.
+/// Sources where route helpers can be called. This is collected on the first
+/// accepted source-backed engine mount only, and only from the app roots the
+/// normal walker already treats as live code. Engine origin is retained for
+/// the helper boundary check so a host `root_path` can remain valid while an
+/// engine's same-named helper is rejected.
 fn route_helper_sources<V: Vfs + ?Sized>(
     vfs: &V,
     dir: &Path,

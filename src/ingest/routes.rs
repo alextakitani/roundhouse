@@ -21,7 +21,7 @@
 //! the resource name and optional `controllers:` overrides; it does
 //! not claim Warden or Devise controller runtime.
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
 
 use indexmap::IndexMap;
@@ -91,19 +91,30 @@ pub fn ingest_routes_with_dsl(
     draws: &HashMap<String, (Vec<u8>, String)>,
     block_wrappers: &HashSet<String>,
 ) -> IngestResult<RouteTable> {
-    ingest_routes_with_engines(source, file, draws, block_wrappers, &HashMap::new(), &[])
+    ingest_routes_with_engines(
+        source,
+        file,
+        draws,
+        block_wrappers,
+        &HashMap::new(),
+        &OnceCell::new(),
+        &|| Vec::new(),
+    )
 }
 
 /// Whole-app route ingest with path-sourced isolated engine route sets.
 /// A direct engine mount expands to an ordinary scope so the shared
-/// flattener and target routers own path and controller composition.
+/// flattener and target routers own path and controller composition. The
+/// helper-source loader runs only after a mount is accepted and reaches the
+/// proxy-use scan; its `OnceCell` snapshot is reused by later accepted mounts.
 pub(super) fn ingest_routes_with_engines(
     source: &[u8],
     file: &str,
     draws: &HashMap<String, (Vec<u8>, String)>,
     block_wrappers: &HashSet<String>,
     engine_routes: &HashMap<String, EngineRouteSource>,
-    helper_sources: &[RouteHelperSource],
+    helper_sources: &OnceCell<Vec<RouteHelperSource>>,
+    load_helper_sources: &dyn Fn() -> Vec<RouteHelperSource>,
 ) -> IngestResult<RouteTable> {
     super::sources::register(file, &String::from_utf8_lossy(source));
     let result = super::prism::parse(source, file);
@@ -113,6 +124,7 @@ pub(super) fn ingest_routes_with_engines(
         wrappers: block_wrappers,
         engine_routes,
         helper_sources,
+        load_helper_sources,
         concerns: RefCell::new(HashMap::new()),
         active: RefCell::new(Vec::new()),
         hoisted: RefCell::new(Vec::new()),
@@ -205,7 +217,10 @@ struct Ctx<'a> {
     wrappers: &'a HashSet<String>,
     /// Exact source-backed engine classes with literal isolated namespaces.
     engine_routes: &'a HashMap<String, EngineRouteSource>,
-    helper_sources: &'a [RouteHelperSource],
+    /// Per-route-ingest snapshot shared by all accepted-mount helper scans.
+    helper_sources: &'a OnceCell<Vec<RouteHelperSource>>,
+    /// Invoked by the first accepted mount that reaches helper-use diagnosis.
+    load_helper_sources: &'a dyn Fn() -> Vec<RouteHelperSource>,
     /// `concern :name do |options| … end`, by name. A concern is a macro
     /// re-run at each `concerns :name` call site, so its body is kept as
     /// source and re-read there.
@@ -368,6 +383,8 @@ fn ingest_literal_engine_mount(
     let empty_draws = HashMap::new();
     let empty_wrappers = HashSet::new();
     let empty_engine_routes = HashMap::new();
+    let empty_helper_sources = OnceCell::new();
+    let empty_helper_loader = || Vec::new();
     for draw in draws {
         let Some(block) = draw.block().and_then(|node| node.as_block_node()) else { continue };
         let Some(body) = block.body() else { continue };
@@ -396,7 +413,8 @@ fn ingest_literal_engine_mount(
             draws: &empty_draws,
             wrappers: &empty_wrappers,
             engine_routes: &empty_engine_routes,
-            helper_sources: &[],
+            helper_sources: &empty_helper_sources,
+            load_helper_sources: &empty_helper_loader,
             concerns: RefCell::new(HashMap::new()),
             active: RefCell::new(Vec::new()),
             hoisted: RefCell::new(Vec::new()),
@@ -449,7 +467,8 @@ fn diagnose_engine_helper_uses(
         format!("{proxy}_path"),
         format!("{proxy}_url"),
     ]);
-    for source in cx.helper_sources {
+    let helper_sources = cx.helper_sources.get_or_init(|| (cx.load_helper_sources)());
+    for source in helper_sources {
         let engine_origin = source.engine_class.as_deref() == Some(engine_class);
         let parsed = ruby_prism::parse(&source.source);
         let mut finder = HelperUseFinder {
@@ -2898,3 +2917,161 @@ pub(super) fn controller_class_name(short: &str) -> String {
 /// Every action `resources`/`resource` can generate a route for.
 const ALL_RESOURCE_ACTIONS: [&str; 7] =
     ["index", "show", "new", "create", "edit", "update", "destroy"];
+
+#[cfg(test)]
+mod lazy_helper_source_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn engine_source(class: &str, namespace: &str, action: &str) -> EngineRouteSource {
+        let source = format!(
+            "{class}.routes.draw do\n  get \"/{action}\", to: \"{action}#index\", as: :{action}\nend\n"
+        );
+        EngineRouteSource {
+            source: source.into_bytes(),
+            file: format!("vendor/{}/config/routes.rb", namespace.to_lowercase()),
+            namespace: namespace.to_string(),
+            app_root: format!("vendor/{}/app", namespace.to_lowercase()),
+        }
+    }
+
+    fn eligible_engines() -> HashMap<String, EngineRouteSource> {
+        HashMap::from([
+            (
+                "Catalog::Engine".to_string(),
+                engine_source("Catalog::Engine", "Catalog", "products"),
+            ),
+            (
+                "Billing::Engine".to_string(),
+                engine_source("Billing::Engine", "Billing", "items"),
+            ),
+        ])
+    }
+
+    fn ingest_with_loader(
+        source: &str,
+        engines: &HashMap<String, EngineRouteSource>,
+        helper_sources: &OnceCell<Vec<RouteHelperSource>>,
+        load_helper_sources: &dyn Fn() -> Vec<RouteHelperSource>,
+    ) -> RouteTable {
+        ingest_routes_with_engines(
+            source.as_bytes(),
+            "config/routes.rb",
+            &HashMap::new(),
+            &HashSet::new(),
+            engines,
+            helper_sources,
+            load_helper_sources,
+        )
+        .expect("route input is supported by the parser")
+    }
+
+    #[test]
+    fn helper_sources_stay_unloaded_without_an_accepted_mount() {
+        super::super::sources::reset();
+        let engines = eligible_engines();
+        let loads = Cell::new(0);
+        let loader = || {
+            loads.set(loads.get() + 1);
+            Vec::new()
+        };
+        let helper_sources = OnceCell::new();
+        let routes = ingest_with_loader(
+            "Rails.application.routes.draw do\n  get \"/home\", to: \"home#index\"\nend\n",
+            &engines,
+            &helper_sources,
+            &loader,
+        );
+        assert_eq!(loads.get(), 0, "unmounted eligible engines must not scan sources");
+        assert!(helper_sources.get().is_none());
+        assert!(routes.diagnostics.is_empty());
+
+        // An unsupported mount still reports its existing located diagnostic,
+        // but it must not trigger the helper scan before admission succeeds.
+        super::super::sources::reset();
+        let helper_sources = OnceCell::new();
+        let routes = ingest_with_loader(
+            "Rails.application.routes.draw do\n  get \"/home\", to: \"home#index\"\n  mount Catalog::Engine, at: ENV.fetch(\"MOUNT_PATH\")\nend\n",
+            &engines,
+            &helper_sources,
+            &loader,
+        );
+        assert_eq!(loads.get(), 0, "unsupported mounts must not scan sources");
+        assert!(helper_sources.get().is_none());
+        let diagnostic = routes
+            .diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.message.contains("route mount")
+                    && diagnostic.message.contains("dynamic mount paths")
+            })
+            .expect("unsupported dynamic mount diagnostic is retained");
+        let route_file_id = super::super::sources::file_id("config/routes.rb");
+        assert_ne!(route_file_id.0, 0, "mount source must be registered");
+        assert_eq!(diagnostic.span.file, route_file_id);
+        assert_eq!(
+            super::super::sources::line_at("config/routes.rb", diagnostic.span.start as usize),
+            Some(3),
+            "mount diagnostic keeps its original source location"
+        );
+        assert!(!routes.entries.is_empty(), "the sibling host route is retained");
+    }
+
+    #[test]
+    fn accepted_mounts_share_one_helper_snapshot_and_keep_source_spans() {
+        super::super::sources::reset();
+
+        let engines = eligible_engines();
+        let loads = Cell::new(0);
+        let loader = || {
+            loads.set(loads.get() + 1);
+            let original =
+                "catalog.products_path\ncatalog_path\nbilling.items_path\nbilling_path\n";
+            vec![RouteHelperSource {
+                source: original.as_bytes().to_vec(),
+                original: original.to_string(),
+                file: "app/controllers/route_helpers.rb".to_string(),
+                engine_class: None,
+                erb_map: None,
+            }]
+        };
+        let helper_sources = OnceCell::new();
+        let routes = ingest_with_loader(
+            "Rails.application.routes.draw do\n  mount Catalog::Engine, at: \"/catalog\"\n  mount Billing::Engine, at: \"/billing\"\nend\n",
+            &engines,
+            &helper_sources,
+            &loader,
+        );
+
+        assert_eq!(
+            loads.get(),
+            1,
+            "accepted mounts must reuse the collected snapshot"
+        );
+        assert!(helper_sources.get().is_some());
+        assert_eq!(
+            routes.diagnostics.len(),
+            4,
+            "engine and mounted-proxy helper uses remain diagnosed"
+        );
+        let helper_file_id = super::super::sources::file_id("app/controllers/route_helpers.rb");
+        assert_ne!(helper_file_id.0, 0, "diagnostic source must be registered");
+        assert!(routes.diagnostics.iter().all(|diagnostic| {
+            diagnostic.message.contains("engine helper proxies are not composed")
+                && diagnostic.span.file == helper_file_id
+        }));
+        let mut diagnostic_lines: Vec<_> = routes
+            .diagnostics
+            .iter()
+            .map(|diagnostic| {
+                super::super::sources::line_at(
+                    "app/controllers/route_helpers.rb",
+                    diagnostic.span.start as usize,
+                )
+                .expect("helper source span maps to a registered line")
+            })
+            .collect();
+        diagnostic_lines.sort_unstable();
+        assert_eq!(diagnostic_lines, vec![1, 2, 3, 4]);
+    }
+}
