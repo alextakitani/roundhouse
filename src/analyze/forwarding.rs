@@ -13,6 +13,9 @@ use crate::ident::{ClassId, Symbol};
 use crate::span::Span;
 use crate::ty::Ty;
 
+mod constructor;
+pub(crate) use constructor::{ConstructorContract, constructor_contracts};
+
 pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     let contracts = SourceContractIndex::new(app);
@@ -75,7 +78,10 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
         }
     }
     for (span, policy) in keyword_calls_with_index(app, &contracts) {
-        if matches!(policy, KeywordPolicy::Refuse | KeywordPolicy::RefuseOrdinarySuper) {
+        if matches!(
+            policy,
+            KeywordPolicy::Refuse | KeywordPolicy::RefuseOrdinarySuper
+        ) {
             out.push(keyword_refusal(span, policy));
         }
     }
@@ -116,18 +122,21 @@ fn walk(
     out: &mut Vec<Diagnostic>,
 ) {
     let forwards_keywords = match &*e.node {
-        ExprNode::Send { args, .. } | ExprNode::Super { args: Some(args) } => args
-            .iter()
-            .any(|a| matches!(
-                &*a.node,
-                ExprNode::ForwardKeywords | ExprNode::ForwardKeywordsWithPairs { .. }
-            )),
+        ExprNode::Send { args, .. } | ExprNode::Super { args: Some(args) } => {
+            args.iter().any(|a| {
+                matches!(
+                    &*a.node,
+                    ExprNode::ForwardKeywords | ExprNode::ForwardKeywordsWithPairs { .. }
+                )
+            })
+        }
         _ => false,
     };
     if forwards_keywords {
-        let source_ok = enclosing.params.iter().any(|p| {
-            p.keyword && p.rest && p.name.as_str().is_empty() && !p.forwarding
-        });
+        let source_ok = enclosing
+            .params
+            .iter()
+            .any(|p| p.keyword && p.rest && p.name.as_str().is_empty() && !p.forwarding);
         let resolved = destination(app, contracts, Some((owner, enclosing)), e);
         let reason = if !source_ok {
             Some("anonymous keyword forwarding has no enclosing anonymous keyword-rest declaration")
@@ -210,7 +219,11 @@ fn keyword_contract_error(
     if method.unsupported_formals.is_some() {
         return Some("forwarding destination has an unrepresented parameter declaration");
     }
-    if method.params.iter().any(|p| p.from_keyword || p.from_kwrest) {
+    if method
+        .params
+        .iter()
+        .any(|p| p.from_keyword || p.from_kwrest)
+    {
         return Some("forwarding destination has flattened keyword parameters");
     }
     let unretained = if matches!(&*call.node, ExprNode::Super { .. }) {
@@ -233,7 +246,10 @@ fn keyword_contract_error(
         || destinations.iter().any(|(_, (candidate, _))| {
             !accepts_keywords(candidate)
                 || candidate.unsupported_formals.is_some()
-                || candidate.params.iter().any(|p| p.from_keyword || p.from_kwrest)
+                || candidate
+                    .params
+                    .iter()
+                    .any(|p| p.from_keyword || p.from_kwrest)
         })
     {
         return Some("forwarding destination has no verified keyword parameter ABI");
@@ -334,17 +350,18 @@ fn destination<'a>(
         }
         ExprNode::Super { .. } => {
             let (owner, enclosing) = context?;
-            contracts.ancestors(
-                owner,
-                &enclosing.name,
-                enclosing.receiver,
-                &mut HashSet::new(),
-            )
-            .map(|(method, model)| ResolvedDestination {
-                method,
-                model,
-                lookup_owner: owner.clone(),
-            })
+            contracts
+                .ancestors(
+                    owner,
+                    &enclosing.name,
+                    enclosing.receiver,
+                    &mut HashSet::new(),
+                )
+                .map(|(method, model)| ResolvedDestination {
+                    method,
+                    model,
+                    lookup_owner: owner.clone(),
+                })
         }
         _ => None,
     }
@@ -502,6 +519,19 @@ pub(crate) fn keyword_calls(app: &App) -> HashMap<Span, KeywordPolicy> {
     keyword_calls_with_index(app, &contracts)
 }
 
+pub(crate) fn keyword_calls_and_constructor_contracts(
+    app: &App,
+) -> (
+    HashMap<Span, KeywordPolicy>,
+    HashMap<ClassId, ConstructorContract<'_>>,
+) {
+    let contracts = SourceContractIndex::new(app);
+    (
+        keyword_calls_with_index(app, &contracts),
+        constructor::constructor_contracts_with_index(app, &contracts),
+    )
+}
+
 fn keyword_calls_with_index(
     app: &App,
     contracts: &SourceContractIndex<'_>,
@@ -543,13 +573,8 @@ fn keyword_calls_with_index(
                     .as_ref()
                     .is_some_and(|d| d.method.params.iter().any(|p| p.forwarding))
                 {
-                    if contract_error(
-                        context,
-                        e,
-                        resolved.map(|d| (d.method, d.model)),
-                        contracts,
-                    )
-                    .is_none()
+                    if contract_error(context, e, resolved.map(|d| (d.method, d.model)), contracts)
+                        .is_none()
                     {
                         KeywordPolicy::Native
                     } else {
@@ -634,7 +659,8 @@ fn possible_full_destination(
 }
 
 fn has_forwarding(args: &[Expr]) -> bool {
-    args.iter().any(|a| matches!(&*a.node, ExprNode::ForwardArgs))
+    args.iter()
+        .any(|a| matches!(&*a.node, ExprNode::ForwardArgs))
 }
 
 fn has_source_packet(args: &[Expr]) -> bool {
@@ -741,6 +767,7 @@ fn constructed_instance(
 struct SourceContractIndex<'a> {
     parents: HashMap<ClassId, &'a ClassId>,
     includes: HashMap<ClassId, Vec<ClassId>>,
+    unmodeled_constructor_lookup: HashSet<ClassId>,
     fragments: HashMap<ClassId, usize>,
     instance: HashMap<(ClassId, Symbol), (&'a MethodDef, bool)>,
     class: HashMap<(ClassId, Symbol), (&'a MethodDef, bool)>,
@@ -762,6 +789,7 @@ impl<'a> SourceContractIndex<'a> {
         let mut index = Self {
             parents: HashMap::new(),
             includes: HashMap::new(),
+            unmodeled_constructor_lookup: HashSet::new(),
             fragments: HashMap::new(),
             instance: HashMap::new(),
             class: HashMap::new(),
@@ -780,6 +808,16 @@ impl<'a> SourceContractIndex<'a> {
             );
             index.add_methods(&class.name, class.methods.iter(), false);
             index.virtual_owners.push(&class.name);
+            if class
+                .unknown_calls
+                .iter()
+                .any(constructor::is_constructor_lookup_mutation)
+                || constructor::methods_mutate_constructor_lookup(class.methods.iter())
+            {
+                index
+                    .unmodeled_constructor_lookup
+                    .insert(class.name.clone());
+            }
         }
         for model in &app.models {
             index.add_fragment(
@@ -791,6 +829,15 @@ impl<'a> SourceContractIndex<'a> {
                 index.add_methods(&model.name, model.methods(), true);
             }
             index.virtual_owners.push(&model.name);
+            if model.body.iter().any(|item| {
+                matches!(item, crate::dialect::ModelBodyItem::Unknown { expr, .. } if constructor::is_constructor_lookup_mutation(expr))
+            })
+                || constructor::methods_mutate_constructor_lookup(model.methods())
+            {
+                index
+                    .unmodeled_constructor_lookup
+                    .insert(model.name.clone());
+            }
         }
         for module in &app.test_modules {
             index.add_fragment(
@@ -954,15 +1001,7 @@ impl<'a> SourceContractIndex<'a> {
                 .parent(owner)
                 .and_then(|parent| reaches(index, parent, selector, span, receiver, seen))
         }
-        reaches(
-            self,
-            owner,
-            selector,
-            span,
-            receiver,
-            &mut HashSet::new(),
-        )
-        .unwrap_or(false)
+        reaches(self, owner, selector, span, receiver, &mut HashSet::new()).unwrap_or(false)
     }
 
     fn verified_hierarchy(&self, owner: &ClassId, seen: &mut HashSet<ClassId>) -> bool {
