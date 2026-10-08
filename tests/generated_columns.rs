@@ -11,6 +11,7 @@ use roundhouse::project::{BuildTarget, target_files};
 use roundhouse::schema::generated::GeneratedExpressionDialect;
 use roundhouse::schema::{GeneratedColumnStorage, Schema, Table};
 
+/// Builds the portable generated-column fixture used by the baseline behavior tests.
 fn schema() -> Schema {
     ingest_schema(
         br#"ActiveRecord::Schema[8.1].define(version: 1) do
@@ -28,6 +29,7 @@ end
     .expect("generated-column schema should ingest")
 }
 
+/// Finds a table by name and reports the missing name in test failures.
 fn table<'a>(schema: &'a Schema, name: &str) -> &'a Table {
     schema
         .tables
@@ -35,6 +37,7 @@ fn table<'a>(schema: &'a Schema, name: &str) -> &'a Table {
         .unwrap_or_else(|| panic!("missing table {name}"))
 }
 
+/// Finds a column by name and lists the available columns when an assertion fixture is incomplete.
 fn column<'a>(table: &'a Table, name: &str) -> &'a roundhouse::schema::Column {
     table
         .columns
@@ -722,6 +725,7 @@ end
     );
 }
 
+/// Confirms that the explicit structure-DDL path preserves casts while the portable path rejects them.
 #[test]
 fn structure_sql_keeps_supported_generated_columns_and_rejects_casts() {
     let source = br#"CREATE TABLE public.people (

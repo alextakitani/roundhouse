@@ -41,6 +41,8 @@ use crate::{Symbol, TableRef};
 
 use super::{IngestError, IngestResult};
 
+/// Ingest a structure dump with the Portable generated-expression grammar.
+/// PostgreSQL-only casts require the explicit DDL-dialect entry point.
 pub fn ingest_structure_sql(source: &[u8], file: &str) -> IngestResult<Schema> {
     ingest_structure_sql_with_generated_expression_dialect(
         source,
@@ -103,6 +105,7 @@ pub fn ingest_structure_sql_with_generated_expression_dialect(
 // Statement dispatch
 // ---------------------------------------------------------------------
 
+/// Dispatch one top-level dump statement to its schema handler.
 fn dispatch_statement(
     stmt: &str,
     file: &str,
@@ -224,6 +227,7 @@ fn record_unmodeled(gaps: &mut Vec<IngestError>, seen_heads: &mut HashSet<String
 // CREATE TABLE
 // ---------------------------------------------------------------------
 
+/// Parse one `CREATE TABLE` and validate generated expressions under `dialect`.
 fn handle_create_table(
     stmt: &str,
     file: &str,

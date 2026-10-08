@@ -275,6 +275,7 @@ fn reference_removal_aliases_still_remove_ordinary_references() {
     }
 }
 
+/// Applies one migration through the default Portable expression-validation path.
 fn apply_migration(schema: &mut Schema, body: &str) -> Result<(), String> {
     ingest_migration(body.as_bytes(), "db/migrate/change_people.rb", schema)
         .map_err(|error| error.to_string())
@@ -291,6 +292,7 @@ fn apply_postgres_migration(schema: &mut Schema, body: &str) -> Result<(), Strin
     .map_err(|error| error.to_string())
 }
 
+/// Finds a named table so migration tests can compare the resulting schema state.
 fn table<'a>(schema: &'a Schema, name: &str) -> &'a Table {
     schema
         .tables
@@ -298,6 +300,7 @@ fn table<'a>(schema: &'a Schema, name: &str) -> &'a Table {
         .unwrap_or_else(|| panic!("missing table {name}"))
 }
 
+/// Finds a named column for migration-state assertions.
 fn column<'a>(table: &'a Table, name: &str) -> &'a Column {
     table
         .columns
@@ -306,6 +309,7 @@ fn column<'a>(table: &'a Table, name: &str) -> &'a Column {
         .unwrap_or_else(|| panic!("missing column {name} on {}", table.name.as_str()))
 }
 
+/// Wraps a migration operation in the minimal Rails class needed by the ingester.
 fn one_operation(operation: &str) -> String {
     format!(
         "class ChangePeople < ActiveRecord::Migration[8.1]\n  def change\n    {operation}\n  end\nend\n"

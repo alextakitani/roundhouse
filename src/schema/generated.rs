@@ -115,6 +115,7 @@ fn is_text_type(col_type: &ColumnType) -> bool {
     )
 }
 
+/// Validate expression references and operand types against the complete table schema.
 fn validate_expr(expr: &Expr, table: &Table) -> Result<(), String> {
     match expr {
         Expr::String => Ok(()),
@@ -200,6 +201,7 @@ impl<'a> Parser<'a> {
         Ok(expression)
     }
 
+    /// Parse a left-associative `||` chain whose operands may include allowed postfix casts.
     fn parse_concat(&mut self) -> Result<Expr, String> {
         let mut expression = self.parse_postfix()?;
         loop {
@@ -230,6 +232,7 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse a string, column, parenthesized expression, `coalesce`, or enabled PostgreSQL `CAST` primary.
     fn parse_atom(&mut self) -> Result<Expr, String> {
         self.skip_space();
         match self.peek_char() {

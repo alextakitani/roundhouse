@@ -26,6 +26,8 @@ use super::util::{
 };
 use super::{IngestError, IngestResult};
 
+/// Ingest a Rails schema with the Portable generated-expression grammar.
+/// PostgreSQL-only casts require the explicit DDL-dialect entry point.
 pub fn ingest_schema(source: &[u8], file: &str) -> IngestResult<Schema> {
     ingest_schema_with_generated_expression_dialect(
         source,
@@ -208,6 +210,7 @@ const UNSUPPORTED_VERBS: &[&str] = &[
     "up_only",
 ];
 
+/// Apply one recognized schema-changing migration verb under the selected expression dialect.
 fn apply_migration_verb(
     verb: &str,
     call: &ruby_prism::CallNode<'_>,
@@ -1240,6 +1243,7 @@ fn default_value(node: &Node<'_>) -> Option<String> {
     bool_value(node).map(|b| b.to_string()).or_else(|| string_value(node))
 }
 
+/// Collect column options while retaining array metadata omitted by the normalized column type.
 fn parse_column_opts<'pr>(nodes: impl Iterator<Item = &'pr Node<'pr>>) -> ColumnOpts {
     let mut opts = ColumnOpts::default();
     for node in nodes {
