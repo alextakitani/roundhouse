@@ -450,6 +450,82 @@ end
 /// An opaque non-Hash caller still vetoes conversion, even if another
 /// caller passes a params helper and the body calls `create!`.
 #[test]
+fn compound_parallel_and_rescue_writes_veto_hash_local_inference() {
+    let mut app = ingest_app_from_tree(tree(&[
+        ("db/schema.rb", SCHEMA),
+        (
+            "app/models/note.rb",
+            r#"class Note < ApplicationRecord
+  def self.compound!(attributes)
+    create!(attributes)
+  end
+
+  def self.parallel!(attributes)
+    create!(attributes)
+  end
+
+  def self.rescued!(attributes)
+    create!(attributes)
+  end
+end
+"#,
+        ),
+        (
+            "app/models/webhook.rb",
+            r#"class Webhook
+  def self.compound
+    attributes = { text: "initial" }
+    attributes ||= "not a hash"
+    Note.compound!(attributes)
+  end
+
+  def self.parallel
+    attributes = { text: "initial" }
+    attributes, other = ["not a hash", nil]
+    Note.parallel!(attributes)
+  end
+
+  def self.rescued
+    attributes = { text: "initial" }
+    begin
+      raise "failure"
+    rescue => attributes
+      Note.rescued!(attributes)
+    end
+  end
+end
+"#,
+        ),
+        (
+            "app/controllers/notes_controller.rb",
+            r#"class NotesController < ApplicationController
+  def create
+    Note.compound!(note_params)
+    Note.parallel!(note_params)
+    Note.rescued!(note_params)
+  end
+
+  private
+    def note_params
+      params.require(:note).permit(:text)
+    end
+end
+"#,
+        ),
+    ]))
+    .expect("ingest");
+    roundhouse::session::analyze_and_lower(&mut app);
+    let ctrl = emitted(
+        &ruby::emit_lowered_controllers(&app),
+        "app/controllers/notes_controller.rb",
+    );
+    assert!(
+        !ctrl.contains("note_params.to_attrs"),
+        "non-Hash compound, parallel, and rescue writes must veto Attrs conversion:\n{ctrl}"
+    );
+}
+
+#[test]
 fn opaque_non_hash_caller_blocks_hash_body_conversion() {
     let mut app = ingest_app_from_tree(tree(&[
         ("db/schema.rb", SCHEMA),

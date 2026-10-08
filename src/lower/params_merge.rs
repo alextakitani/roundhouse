@@ -689,6 +689,39 @@ fn definitely_hash_local(body: &Expr, name: &Symbol) -> bool {
     let mut assigned = false;
     let mut only_hashes = true;
     walk_without_shadowed_lambda_params(body, name, &mut |e| {
+        match &*e.node {
+            ExprNode::OpAssign {
+                target: LValue::Var {
+                    name: assigned_name,
+                    ..
+                },
+                ..
+            } if assigned_name == name => {
+                assigned = true;
+                only_hashes = false;
+                return;
+            }
+            ExprNode::MultiAssign { targets, .. }
+                if targets.iter().any(|target| {
+                    matches!(target, LValue::Var { name: assigned_name, .. } if assigned_name == name)
+                }) =>
+            {
+                assigned = true;
+                only_hashes = false;
+                return;
+            }
+            ExprNode::BeginRescue { rescues, .. }
+                if rescues
+                    .iter()
+                    .any(|rescue| rescue.binding.as_ref() == Some(name)) =>
+            {
+                assigned = true;
+                only_hashes = false;
+                return;
+            }
+            _ => {}
+        }
+
         let ExprNode::Assign {
             target:
                 LValue::Var {
