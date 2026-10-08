@@ -774,6 +774,18 @@ impl<'a> BodyTyper<'a> {
         block_ret: Option<&Ty>,
         args: &[crate::expr::Expr],
     ) -> Ty {
+        self.dispatch_on(recv_ty, method, block_ret, args, false)
+    }
+
+    // The class object and its instances are the same `Ty::Class`, so only the caller, which sees the receiver expression, can tell the side.
+    pub(super) fn dispatch_on(
+        &self,
+        recv_ty: Option<&Ty>,
+        method: &Symbol,
+        block_ret: Option<&Ty>,
+        args: &[crate::expr::Expr],
+        instance_receiver: bool,
+    ) -> Ty {
         // `Parameters` is a Hash-shaped bag: what its own class does not
         // answer (`fetch`, `each`, `map`, `count`, ...) is the Hash
         // reading over Symbol -> param value. Done here,
@@ -1327,10 +1339,12 @@ impl<'a> BodyTyper<'a> {
                             }
                         }
                     }
-                    if let Some(ty) = cls.class_methods.get(method) {
-                        return unwrap_fn_ret(&subst(ty));
-                    }
-                    if let Some(ty) = cls.instance_methods.get(method) {
+                    let (first, second) = if instance_receiver {
+                        (&cls.instance_methods, &cls.class_methods)
+                    } else {
+                        (&cls.class_methods, &cls.instance_methods)
+                    };
+                    if let Some(ty) = first.get(method).or_else(|| second.get(method)) {
                         return unwrap_fn_ret(&subst(ty));
                     }
                     // Mixed-in modules (`include IntervalHelper`)

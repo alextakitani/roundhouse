@@ -140,6 +140,8 @@ pub struct Ctx {
     /// `ActiveRecord::Base … lacks a shared runtime` on the template
     /// itself is noise that hides the real ledger.
     pub claimed_macro_template: bool,
+    // `!class_side` cannot stand in: scope bodies type with it false, and their bare `active` is the scope.
+    pub instance_body: bool,
 }
 
 /// User-class dispatch data: table name (if any), instance shape,
@@ -1286,6 +1288,7 @@ impl<'a> BodyTyper<'a> {
                         if let Some(receiver) = recv.as_ref() {
                             block_ctx.self_ty = recv_ty.clone();
                             block_ctx.class_side = self.is_class_object(receiver, ctx);
+                            block_ctx.instance_body = false;
                         }
                     }
                     let method_ref_ty = self.analyze_expr(b, &block_ctx);
@@ -1462,7 +1465,15 @@ impl<'a> BodyTyper<'a> {
                 {
                     return t;
                 }
-                let dispatched = self.dispatch(recv_ty.as_ref(), method, block_ret.as_ref(), args);
+                // `x.class` is not a class reference to `is_class_object`, yet types as the same flat `Ty::Class` as an instance.
+                let via_dot_class = recv.as_ref().is_some_and(|r| {
+                    matches!(&*r.node, ExprNode::Send { method: m, args, .. } if m.as_str() == "class" && args.is_empty())
+                });
+                let instance_receiver = recv.as_ref().map_or(ctx.instance_body, |_| !class_object_receiver)
+                    && !via_dot_class
+                    && matches!(&recv_ty, Some(Ty::Class { id, .. }) if id.0.as_str() != "Class");
+                let dispatched =
+                    self.dispatch_on(recv_ty.as_ref(), method, block_ret.as_ref(), args, instance_receiver);
                 if let Some(receiver) = recv.as_mut() {
                     receiver.decisions &= !crate::expr::RESOLVED_OPERATOR_RECEIVER;
                     if matches!(method.as_str(), "+" | "-" | "*" | "/" | "**" | "%" | "<" | "<=" | ">" | ">=")

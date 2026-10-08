@@ -42,6 +42,58 @@ fn anonymous_keyword_forwarding_runs_without_capturing_or_reordering_values() {
     assert!(emitted.contains("request(kind: :get, path: path, **)"), "{emitted}");
 }
 
+/// A class object and its instances that define the same names: each
+/// side's call types and runs as that side's method.
+#[test]
+fn same_named_class_and_instance_methods_run_on_their_own_side() {
+    let run = emit_and_run::real_blog()
+        .write(
+            "app/models/greeter.rb",
+            "class Greeter
+  def self.call(name)
+    new(name).call
+  end
+
+  def initialize(name)
+    @name = name
+  end
+
+  def call
+    \"hello \" + @name
+  end
+end
+",
+        )
+        .edit(
+            "app/models/article.rb",
+            "  validates :title, presence: true\n",
+            "  validates :title, presence: true
+
+  def self.headline
+    [:class]
+  end
+
+  def headline
+    title.to_s
+  end
+
+  def shout
+    headline.upcase
+  end
+",
+        )
+        .run_ruby(
+            "raise \"class call\" unless Greeter.call(\"a\") == \"hello a\"
+raise \"instance call\" unless Greeter.new(\"b\").call == \"hello b\"
+raise \"class headline\" unless Article.headline == [:class]
+raise \"instance headline\" unless Article.new(title: \"hi\").shout == \"HI\"
+puts \"same-named sides passed\"
+",
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("same-named sides passed"));
+}
+
 #[path = "support/engine_mount.rs"]
 mod engine_mount;
 
