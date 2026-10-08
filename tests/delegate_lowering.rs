@@ -115,7 +115,8 @@ fn delegate_target_surface_respects_ruby_concern_precedence() {
     );
     files.insert(
         PathBuf::from("app/models/profile.rb"),
-        b"class Profile < ApplicationRecord\n  include PrivateName\n  include PublicName\nend\n".to_vec(),
+        b"class Profile < ApplicationRecord\n  include PrivateName\n  include PublicName\nend\n"
+            .to_vec(),
     );
     files.insert(
         PathBuf::from("app/models/page.rb"),
@@ -135,7 +136,8 @@ fn delegate_target_surface_respects_ruby_concern_precedence() {
 
     files.insert(
         PathBuf::from("app/models/profile.rb"),
-        b"class Profile < ApplicationRecord\n  include PublicName\n  include PrivateName\nend\n".to_vec(),
+        b"class Profile < ApplicationRecord\n  include PublicName\n  include PrivateName\nend\n"
+            .to_vec(),
     );
     let app = ingest_app_from_tree(files).expect("ingest");
     let page = app
@@ -391,7 +393,8 @@ fn class_method_calls_do_not_suppress_instance_delegates() {
     );
     files.insert(
         PathBuf::from("app/models/concerns/title_calls.rb"),
-        b"module TitleCalls\n  def self.preview\n    title(\"from concern\")\n  end\nend\n".to_vec(),
+        b"module TitleCalls\n  def self.preview\n    title(\"from concern\")\n  end\nend\n"
+            .to_vec(),
     );
     files.insert(
         PathBuf::from("app/models/page.rb"),

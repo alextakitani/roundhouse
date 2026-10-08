@@ -71,13 +71,44 @@ pub fn lower_delegates(app: &mut crate::App) {
         }
     }
 
+    lower_library_class_delegates(app, &model_concerns);
+}
+
+fn lower_library_class_delegates(
+    app: &mut crate::App,
+    model_concerns: &std::collections::HashSet<crate::ident::ClassId>,
+) {
+    let mut non_model_concerns = std::collections::HashSet::new();
+    let mut pending: Vec<_> = app
+        .library_classes
+        .iter()
+        .filter(|class| !class.is_module)
+        .flat_map(|class| class.includes.iter().cloned())
+        .collect();
+    while let Some(concern) = pending.pop() {
+        if !non_model_concerns.insert(concern.clone()) {
+            continue;
+        }
+        if let Some(class) = app
+            .library_classes
+            .iter()
+            .find(|class| class.name == concern)
+        {
+            pending.extend(class.includes.iter().cloned());
+        }
+    }
+
     let mut generated: Vec<(usize, Vec<MethodDef>)> = Vec::new();
     for (i, lc) in app.library_classes.iter_mut().enumerate() {
         // Keep module declarations deferred when that module contributes to
         // a model: association targets can only be checked against the
         // concrete model after its concern declarations have been spliced.
-        // Other library modules retain the ordinary delegate expansion.
-        if lc.is_module && model_concerns.contains(&lc.name) {
+        // If a non-model class also includes the module, retain the ordinary
+        // expansion so that consumer does not lose its delegate methods.
+        if lc.is_module
+            && model_concerns.contains(&lc.name)
+            && !non_model_concerns.contains(&lc.name)
+        {
             continue;
         }
         let methods = expand_delegates_in_class(lc);
@@ -387,6 +418,32 @@ mod tests {
                 .iter()
                 .any(|method| method.name.as_str() == "email"),
             "a module not used as a model concern retains ordinary delegate lowering"
+        );
+        assert!(concern.unknown_calls.is_empty());
+    }
+
+    #[test]
+    fn a_module_shared_with_a_non_model_class_keeps_its_delegate() {
+        let mut app = crate::App::default();
+        let mut concern =
+            library_class("class SharedProfileAccess\n  delegate :email, to: :profile\nend\n");
+        concern.is_module = true;
+        let service = library_class(
+            "class ProfileService\n  include SharedProfileAccess\n  attr_reader :profile\nend\n",
+        );
+        app.library_classes.extend([concern, service]);
+        let model_concerns = [crate::ident::ClassId(Symbol::from("SharedProfileAccess"))]
+            .into_iter()
+            .collect();
+
+        lower_library_class_delegates(&mut app, &model_concerns);
+
+        let concern = &app.library_classes[0];
+        assert!(
+            concern
+                .methods
+                .iter()
+                .any(|method| method.name.as_str() == "email")
         );
         assert!(concern.unknown_calls.is_empty());
     }
