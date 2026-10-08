@@ -682,9 +682,9 @@ fn scan_body(
     });
 }
 
-/// Whether `name` is assigned only Hash literals in this body. The IR does
-/// not preserve lexical binding identity across lambdas, so name matching
-/// excludes lambdas that shadow the candidate local.
+/// Whether `name` is assigned only Hash literals, on every path that reaches
+/// its use. The IR does not preserve lexical binding identity across lambdas,
+/// so name matching excludes lambdas that shadow the candidate local.
 fn definitely_hash_local(body: &Expr, name: &Symbol) -> bool {
     let mut assigned = false;
     let mut only_hashes = true;
@@ -740,7 +740,35 @@ fn definitely_hash_local(body: &Expr, name: &Symbol) -> bool {
         assigned = true;
         only_hashes &= is_hash;
     });
-    assigned && only_hashes
+    assigned && only_hashes && hash_assignment_covers_all_paths(body, name)
+}
+
+/// Whether a Hash assignment to `name` is guaranteed by this expression.
+/// Sequences can establish the value before or after a conditional; an `if`
+/// only establishes it when both branches do.
+fn hash_assignment_covers_all_paths(expr: &Expr, name: &Symbol) -> bool {
+    match &*expr.node {
+        ExprNode::Assign {
+            target:
+                LValue::Var {
+                    name: assigned_name,
+                    ..
+                },
+            value,
+        } => assigned_name == name && matches!(&*value.node, ExprNode::Hash { .. }),
+        ExprNode::Seq { exprs } => exprs
+            .iter()
+            .any(|statement| hash_assignment_covers_all_paths(statement, name)),
+        ExprNode::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            hash_assignment_covers_all_paths(then_branch, name)
+                && hash_assignment_covers_all_paths(else_branch, name)
+        }
+        _ => false,
+    }
 }
 
 /// Runtime slots that take the Symbol-keyed hash a params object has to

@@ -154,8 +154,7 @@ fn concern_create_with_attachment_takes_assoc_scope() {
         "spliced concern method must take the association relation:\n{message}"
     );
     assert!(
-        message.contains("scope_attributes.merge(attributes)")
-            || message.contains("__rel.scope_attributes.merge(attributes)"),
+        message.contains("create!(__rel.scope_attributes.merge(attributes))"),
         "create must merge association scope under attributes:\n{message}"
     );
 }

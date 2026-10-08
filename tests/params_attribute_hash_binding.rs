@@ -526,6 +526,82 @@ end
 }
 
 #[test]
+fn conditional_hash_local_requires_assignment_on_every_path() {
+    let mut app = ingest_app_from_tree(tree(&[
+        ("db/schema.rb", SCHEMA),
+        (
+            "app/models/note.rb",
+            r#"class Note < ApplicationRecord
+  def self.branch_only!(attributes)
+    create!(attributes)
+  end
+
+  def self.all_paths!(attributes)
+    create!(attributes)
+  end
+end
+"#,
+        ),
+        (
+            "app/models/webhook.rb",
+            r#"class Webhook
+  def self.branch_only(flag)
+    attributes = { text: "initial" } if flag
+    Note.branch_only!(attributes)
+  end
+
+  def self.all_paths(flag)
+    if flag
+      attributes = { text: "first" }
+    else
+      attributes = { text: "second" }
+    end
+    Note.all_paths!(attributes)
+  end
+end
+"#,
+        ),
+        (
+            "app/controllers/notes_controller.rb",
+            r#"class NotesController < ApplicationController
+  def create
+    Note.branch_only!(note_params)
+    Note.all_paths!(note_params)
+  end
+
+  private
+    def note_params
+      params.require(:note).permit(:text)
+    end
+end
+"#,
+        ),
+    ]))
+    .expect("ingest");
+    roundhouse::session::analyze_and_lower(&mut app);
+    let ctrl = emitted(
+        &ruby::emit_lowered_controllers(&app),
+        "app/controllers/notes_controller.rb",
+    );
+    let branch_only = ctrl
+        .lines()
+        .find(|line| line.contains("Note.branch_only!"))
+        .expect("branch-only call is emitted");
+    assert!(
+        !branch_only.contains(".to_attrs"),
+        "a conditional-only Hash assignment does not prove the local is a Hash:\n{ctrl}"
+    );
+    let all_paths = ctrl
+        .lines()
+        .find(|line| line.contains("Note.all_paths!"))
+        .expect("all-paths call is emitted");
+    assert!(
+        all_paths.contains(".to_attrs"),
+        "Hash assignments on both branches should still permit Attrs conversion:\n{ctrl}"
+    );
+}
+
+#[test]
 fn opaque_non_hash_caller_blocks_hash_body_conversion() {
     let mut app = ingest_app_from_tree(tree(&[
         ("db/schema.rb", SCHEMA),
