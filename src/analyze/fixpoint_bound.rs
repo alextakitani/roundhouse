@@ -256,6 +256,21 @@ mod tests {
         let mut ivars = std::collections::HashMap::new();
         super::super::extract_ivar_assignments(&write, &mut ivars);
         assert_eq!(measure(&ivars[&Symbol::from("h")]).0, MAX_DEPTH);
+
+        // `@h["k"] = v` widens the Hash's value type from the written value.
+        let mut deep = crate::expr::Expr::new(
+            crate::span::Span::synthetic(),
+            crate::expr::ExprNode::Lit { value: crate::expr::Literal::Nil },
+        );
+        deep.ty = Some(nested_arrays(MAX_DEPTH + 4));
+        let ivar = crate::expr::Expr::new(crate::span::Span::synthetic(), crate::expr::ExprNode::Ivar { name: Symbol::from("g") });
+        let key = crate::expr::Expr::new(crate::span::Span::synthetic(), crate::expr::ExprNode::Lit { value: crate::expr::Literal::Nil });
+        let index_write = crate::expr::Expr::new(
+            crate::span::Span::synthetic(),
+            crate::expr::ExprNode::Assign { target: crate::expr::LValue::Index { recv: ivar, index: key }, value: deep },
+        );
+        super::super::extract_ivar_assignments(&index_write, &mut ivars);
+        assert_eq!(measure(&ivars[&Symbol::from("g")]).0, MAX_DEPTH);
     }
 
     #[test]

@@ -7797,7 +7797,7 @@ fn widen_hash_ivar_value(out: &mut HashMap<Symbol, Ty>, name: &Symbol, incoming:
         // the Crystal collector's "fresh entry" branch.
         out.insert(
             name.clone(),
-            Ty::Hash { key: Box::new(Ty::Str), value: Box::new(incoming.clone()) },
+            fixpoint_bound::bound(Ty::Hash { key: Box::new(Ty::Str), value: Box::new(incoming.clone()) }),
         );
         return;
     };
@@ -7815,7 +7815,7 @@ fn widen_hash_ivar_value(out: &mut HashMap<Symbol, Ty>, name: &Symbol, incoming:
         // The general widening is exactly the canonical type join.
         Box::new(crate::analyze::body::union_of((**value).clone(), incoming.clone()))
     };
-    out.insert(name.clone(), Ty::Hash { key, value });
+    out.insert(name.clone(), fixpoint_bound::bound(Ty::Hash { key, value }));
 }
 
 // Diagnostic emission -----------------------------------------------------
