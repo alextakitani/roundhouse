@@ -166,6 +166,12 @@ types, enums, `citext`, and fixed-width characters) remain unsupported here.
 Column names that are SQL keywords must be double-quoted in the expression.
 Unresolved keyword splats in column options are rejected because they can hide
 generated-column metadata.
+Migration folding permits renaming or dropping an unindexed generated output
+when the resulting table still validates. `change_column` on an existing
+generated output and replacement of a generated output by an ordinary column
+are rejected. Renaming or dropping a source column that a generated expression
+uses is rejected without rewriting the source SQL; renaming or dropping an
+indexed generated output is also an explicit error.
 The same metadata is read from a complete `GENERATED ALWAYS AS (...) STORED`
 or `VIRTUAL` clause in `structure.sql`; unsupported clauses cannot silently
 become writable columns. Roda emission rejects generated columns. SQLite DDL

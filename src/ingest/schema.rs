@@ -221,6 +221,30 @@ fn apply_migration_verb(
             }
         }
         "add_column" | "change_column" => {
+            // Check an existing generated target before interpreting the
+            // requested type/options. Even an unknown replacement type
+            // must not bypass the explicit generated-column boundary.
+            if verb == "change_column" {
+                if let (Some(t), Some(c)) = (arg_name(0), arg_name(1)) {
+                    let targets_generated = schema
+                        .tables
+                        .get(&Symbol::from(t.as_str()))
+                        .is_some_and(|table| {
+                            table.columns.iter().any(|column| {
+                                column.name.as_str() == c.as_str()
+                                    && column.generated.is_some()
+                            })
+                        });
+                    if targets_generated {
+                        return Err(IngestError::Unsupported {
+                            file: file.into(),
+                            message: format!(
+                                "generated column changes are not supported: {t}.{c}"
+                            ),
+                        });
+                    }
+                }
+            }
             if let (Some(t), Some(c), Some(ty)) = (arg_name(0), arg_name(1), arg_name(2)) {
                 let option_args = &args[3..];
                 if has_column_option_splats(option_args) {
@@ -251,38 +275,80 @@ fn apply_migration_verb(
                     let opts = parse_column_opts(option_args.iter());
                     column_with_type(&ty, c, &opts, &t, file)?
                 };
-                if let Some(table) = schema.tables.get_mut(&Symbol::from(t.as_str())) {
-                    // change_column replaces; add_column after a
-                    // replace-shaped history stays idempotent.
-                    table.columns.retain(|x| x.name != col.name);
-                    if col.generated.is_some() {
-                        let mut candidate = table.clone();
-                        candidate.columns.push(col.clone());
-                        if let Some((invalid_column, message)) =
-                            crate::schema::generated::validate_table(&candidate).into_iter().next()
-                        {
-                            return Err(IngestError::Unsupported {
-                                file: file.into(),
-                                message: format!("generated column dropped: {t}.{invalid_column}: {message}"),
-                            });
-                        }
+                if let Some(table) = schema.tables.get(&Symbol::from(t.as_str())) {
+                    // This fold replaces a same-named column for both
+                    // verbs. Do not let an ordinary add/change erase the
+                    // generated expression and make the field writable.
+                    if col.generated.is_none()
+                        && table.columns.iter().any(|existing| {
+                            existing.name == col.name && existing.generated.is_some()
+                        })
+                    {
+                        return Err(IngestError::Unsupported {
+                            file: file.into(),
+                            message: format!(
+                                "generated column `{}.{}` cannot be replaced by an ordinary column with `{verb}`",
+                                t,
+                                col.name.as_str(),
+                            ),
+                        });
                     }
+                    // Validate the replacement against the complete
+                    // candidate before changing the folded schema. This
+                    // keeps failed generated replacements (and ordinary
+                    // replacements that invalidate generated operands)
+                    // from erasing the previous metadata in survey mode.
+                    let mut candidate = table.clone();
+                    candidate.columns.retain(|existing| existing.name != col.name);
+                    candidate.columns.push(col.clone());
+                    if table.columns.iter().any(|column| column.generated.is_some())
+                        || col.generated.is_some()
+                    {
+                        validate_generated_migration_candidate(&candidate, verb, file)?;
+                    }
+                }
+                // change_column replaces; add_column after a
+                // replace-shaped history stays idempotent.
+                if let Some(table) = schema.tables.get_mut(&Symbol::from(t.as_str())) {
+                    table.columns.retain(|x| x.name != col.name);
                     table.columns.push(col);
                 }
             }
         }
         "remove_column" => {
             if let (Some(t), Some(c)) = (arg_name(0), arg_name(1)) {
-                if let Some(table) = schema.tables.get_mut(&Symbol::from(t)) {
+                if let Some(table) = schema.tables.get(&Symbol::from(t.as_str())) {
                     refuse_predicate_column(verb, table, &c, file)?;
+                    refuse_indexed_generated_column_mutation(verb, table, &c, file)?;
+                    if table.columns.iter().any(|column| column.generated.is_some()) {
+                        let mut candidate = table.clone();
+                        candidate.columns.retain(|column| column.name.as_str() != c);
+                        validate_generated_migration_candidate(&candidate, verb, file)?;
+                    }
+                }
+                if let Some(table) = schema.tables.get_mut(&Symbol::from(t.as_str())) {
                     table.columns.retain(|x| x.name.as_str() != c);
                 }
             }
         }
         "rename_column" => {
             if let (Some(t), Some(old), Some(new)) = (arg_name(0), arg_name(1), arg_name(2)) {
-                if let Some(table) = schema.tables.get_mut(&Symbol::from(t)) {
+                if let Some(table) = schema.tables.get(&Symbol::from(t.as_str())) {
                     refuse_predicate_column(verb, table, &old, file)?;
+                    if old != new {
+                        refuse_indexed_generated_column_mutation(verb, table, &old, file)?;
+                        if table.columns.iter().any(|column| column.generated.is_some()) {
+                            let mut candidate = table.clone();
+                            for column in &mut candidate.columns {
+                                if column.name.as_str() == old {
+                                    column.name = Symbol::from(new.clone());
+                                }
+                            }
+                            validate_generated_migration_candidate(&candidate, verb, file)?;
+                        }
+                    }
+                }
+                if let Some(table) = schema.tables.get_mut(&Symbol::from(t.as_str())) {
                     for col in &mut table.columns {
                         if col.name.as_str() == old {
                             col.name = Symbol::from(new.clone());
@@ -413,6 +479,66 @@ fn refuse_predicate_column(
             index.name.as_str()
         ),
     })
+}
+
+/// Renaming or removing an indexed generated output would leave its index
+/// referring to a column name the fold no longer knows. Ordinary index
+/// mutation remains governed by the existing migration-fold behavior.
+fn refuse_indexed_generated_column_mutation(
+    verb: &str,
+    table: &Table,
+    column: &str,
+    file: &str,
+) -> Result<(), IngestError> {
+    let is_generated = table.columns.iter().any(|existing| {
+        existing.name.as_str() == column && existing.generated.is_some()
+    });
+    if !is_generated {
+        return Ok(());
+    }
+    let Some(index) = table
+        .indexes
+        .iter()
+        .find(|index| index.columns.iter().any(|indexed| indexed.as_str() == column))
+    else {
+        return Ok(());
+    };
+    let action = match verb {
+        "rename_column" => "renamed",
+        "remove_column" => "removed",
+        _ => "mutated",
+    };
+    Err(IngestError::Unsupported {
+        file: file.into(),
+        message: format!(
+            "generated column index mutation is unsupported: {}.{column} is used by index `{}` and cannot be {action} without rewriting the index",
+            table.name.as_str(),
+            index.name.as_str()
+        ),
+    })
+}
+
+/// Keep migration-derived schema state unchanged when a candidate
+/// mutation breaks a generated expression or another generated-table
+/// invariant. Expressions remain source SQL; renames never rewrite them.
+fn validate_generated_migration_candidate(
+    table: &Table,
+    verb: &str,
+    file: &str,
+) -> Result<(), IngestError> {
+    if let Some((column, reason)) = crate::schema::generated::validate_table(table)
+        .into_iter()
+        .next()
+    {
+        return Err(IngestError::Unsupported {
+            file: file.into(),
+            message: format!(
+                "generated column mutation is unsupported: {verb} on {}.{column}: {reason}",
+                table.name.as_str()
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Whether `predicate` names `column`: outside its string literals, a

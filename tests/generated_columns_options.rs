@@ -154,6 +154,93 @@ end
 }
 
 #[test]
+fn ordinary_change_column_still_updates_an_ordinary_schema_column() {
+    let mut schema = ingest_schema(
+        br#"ActiveRecord::Schema[8.1].define(version: 1) do
+  create_table "people", force: :cascade do |t|
+    t.string "first_name"
+  end
+end
+"#,
+        "db/schema.rb",
+    )
+    .expect("ordinary schema column");
+    ingest_migration(
+        br#"class ChangeFirstName < ActiveRecord::Migration[8.1]
+  def change
+    change_column :people, :first_name, :text, null: false
+  end
+end
+"#,
+        "db/migrate/change_first_name.rb",
+        &mut schema,
+    )
+    .expect("ordinary change_column remains supported");
+
+    let column = schema.tables[&roundhouse::Symbol::from("people")]
+        .columns
+        .iter()
+        .find(|column| column.name.as_str() == "first_name")
+        .expect("changed column");
+    assert!(matches!(&column.col_type, ColumnType::Text));
+    assert!(!column.nullable);
+    assert!(column.generated.is_none());
+}
+
+#[test]
+fn migration_replacements_do_not_drop_existing_generated_metadata() {
+    for operation in [
+        "change_column :people, :display_name, :string, null: false",
+        "change_column :people, :display_name, :unknown_type",
+        "add_column :people, :display_name, :string, null: false",
+    ] {
+        let mut schema = ingest_schema(
+            br#"ActiveRecord::Schema[8.1].define(version: 1) do
+  create_table "people", force: :cascade do |t|
+    t.string "first_name"
+    t.string "last_name"
+    t.virtual "display_name", type: :string, as: "first_name || ' ' || last_name", stored: true
+  end
+end
+"#,
+            "db/schema.rb",
+        )
+        .expect("generated schema column");
+        let migration = format!(
+            r#"class ReplaceDisplayName < ActiveRecord::Migration[8.1]
+  def change
+    {operation}
+  end
+end
+"#
+        );
+        let error = ingest_migration(
+            migration.as_bytes(),
+            "db/migrate/replace_display_name.rb",
+            &mut schema,
+        )
+        .expect_err("ordinary replacement must not erase generated metadata")
+        .to_string();
+        assert!(error.contains("people.display_name"), "{error}");
+        assert!(error.contains("generated column"), "{error}");
+
+        let column = schema.tables[&roundhouse::Symbol::from("people")]
+            .columns
+            .iter()
+            .find(|column| column.name.as_str() == "display_name")
+            .expect("rejected migration must leave the existing column in place");
+        let generated = column
+            .generated
+            .as_ref()
+            .expect("rejected migration must retain generated metadata");
+        assert_eq!(
+            generated.expression, "first_name || ' ' || last_name",
+            "{operation}"
+        );
+    }
+}
+
+#[test]
 fn keyword_as_and_stored_options_still_fail_on_ordinary_column_calls() {
     for options in [
         r#"as: "first_name""#,
