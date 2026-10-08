@@ -221,9 +221,9 @@ fn model_zero_argument_surface(
     }
 
     let mut seen = HashSet::new();
-    // Surface insertion is last-definition-wins. Walk the include list in
-    // reverse so Ruby's first-included concern retains method precedence.
-    for include in crate::analyze::model_includes(model).into_iter().rev() {
+    // Surface insertion is last-definition-wins, and Ruby gives the last
+    // included concern lookup precedence. Preserve source order here.
+    for include in crate::analyze::model_includes(model) {
         append_concern_surface(&include, library_classes, &mut seen, &mut surface);
     }
     add_method_definitions(model.methods(), &mut surface);

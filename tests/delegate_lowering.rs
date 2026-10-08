@@ -99,7 +99,7 @@ fn private_delegate_visibility_is_preserved_for_models_and_library_classes() {
 }
 
 #[test]
-fn delegate_target_surface_respects_first_included_concern_precedence() {
+fn delegate_target_surface_respects_ruby_concern_precedence() {
     let mut files = tree("");
     files.insert(
         PathBuf::from("db/schema.rb"),
@@ -122,6 +122,21 @@ fn delegate_target_surface_respects_first_included_concern_precedence() {
         b"class Page < ApplicationRecord\n  belongs_to :profile\n  delegate :name, to: :profile\nend\n".to_vec(),
     );
 
+    let app = ingest_app_from_tree(files.clone()).expect("ingest");
+    let page = app
+        .models
+        .iter()
+        .find(|model| model.name.0.as_str() == "Page")
+        .expect("Page");
+    assert!(
+        page.methods().any(|method| method.name.as_str() == "name"),
+        "a later public concern method must be eligible for delegation"
+    );
+
+    files.insert(
+        PathBuf::from("app/models/profile.rb"),
+        b"class Profile < ApplicationRecord\n  include PublicName\n  include PrivateName\nend\n".to_vec(),
+    );
     let app = ingest_app_from_tree(files).expect("ingest");
     let page = app
         .models
@@ -130,7 +145,7 @@ fn delegate_target_surface_respects_first_included_concern_precedence() {
         .expect("Page");
     assert!(
         page.methods().all(|method| method.name.as_str() != "name"),
-        "the delegate must not expose the public shadowed method from the second include"
+        "a later private concern method must shadow the earlier public method"
     );
     assert!(page.body.iter().any(|item| matches!(
         item,
