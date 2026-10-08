@@ -67,6 +67,61 @@ fn a_model_delegate_under_private_visibility_is_not_emitted_as_public() {
 }
 
 #[test]
+fn survey_mode_skips_only_private_delegate_declarations() {
+    let mut files = tree("");
+    files.insert(
+        PathBuf::from("app/models/account.rb"),
+        b"class Account < ApplicationRecord\n  private\n  delegate :name, to: :profile\n  def retained\n    true\n  end\nend\n"
+            .to_vec(),
+    );
+    files.insert(
+        PathBuf::from("lib/private_service.rb"),
+        b"class PrivateService\n  private\n  delegate :name, to: :profile\n  def retained\n    true\n  end\nend\n"
+            .to_vec(),
+    );
+
+    let strict_error = ingest_app_from_tree(files.clone())
+        .expect_err("strict ingest still rejects private library-class delegates");
+    assert!(strict_error
+        .to_string()
+        .contains("delegate under non-public visibility"));
+
+    roundhouse::ingest::survey::activate();
+    let app = ingest_app_from_tree(files).expect("survey ingest retains containing classes");
+    let errors = roundhouse::ingest::survey::drain();
+
+    assert!(!errors.is_empty(), "{errors:?}");
+    assert!(errors.iter().all(|error| {
+        error
+            .to_string()
+            .contains("delegate under non-public visibility")
+    }));
+    assert!(errors
+        .iter()
+        .any(|error| error.to_string().contains("app/models/account.rb")));
+    assert!(errors
+        .iter()
+        .any(|error| error.to_string().contains("lib/private_service.rb")));
+    let account = app
+        .models
+        .iter()
+        .find(|model| model.name.0.as_str() == "Account")
+        .expect("model containing a refused declaration remains available");
+    assert!(account
+        .methods()
+        .any(|method| method.name.as_str() == "retained"));
+    let service = app
+        .library_classes
+        .iter()
+        .find(|class| class.name.0.as_str() == "PrivateService")
+        .expect("library class containing a refused declaration remains available");
+    assert!(service
+        .methods
+        .iter()
+        .any(|method| method.name.as_str() == "retained"));
+}
+
+#[test]
 fn model_delegates_decline_collection_receivers_and_targets_that_yield() {
     let mut files = tree("");
     files.insert(

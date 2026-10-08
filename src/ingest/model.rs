@@ -411,8 +411,14 @@ pub(super) fn ingest_model_with_enum_constants(
                 if let ModelBodyItem::Method { method, .. } = &mut item {
                     visibility.apply(&statement, method);
                 } else if let ModelBodyItem::Unknown { .. } = &item {
-                    visibility.check_model_item(&statement, file)?;
-                    visibility.check_delegate_declaration(&statement, file)?;
+                    if let Err(err) = visibility.check_model_item(&statement, file) {
+                        super::survey::continue_or_fail(err)?;
+                        continue;
+                    }
+                    if let Err(err) = visibility.check_delegate_declaration(&statement, file) {
+                        super::survey::continue_or_fail(err)?;
+                        continue;
+                    }
                 }
                 item.set_leading_blank_line(leading_blank && i == 0);
                 body.push(item);
