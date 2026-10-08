@@ -50,6 +50,33 @@ pub(super) fn definition<'pr>(node: &Node<'pr>) -> Option<ruby_prism::DefNode<'p
 }
 
 impl Visibility {
+    /// Resolve the lexical default applying to a declaration in registered
+    /// source. Synthesis passes use this when they turn DSL calls into
+    /// methods after the source walk has discarded the parser's visibility
+    /// table.
+    pub(super) fn declaration_default(source: &str, file: &str, offset: usize) -> MethodVisibility {
+        let parsed = ruby_prism::parse(source.as_bytes());
+        let root = parsed.node();
+        let Some((_, class)) = super::util::find_all_classes_with_scope(&root)
+            .into_iter()
+            .filter(|(_, class)| {
+                let location = class.location();
+                location.start_offset() <= offset && offset < location.end_offset()
+            })
+            .min_by_key(|(_, class)| {
+                let location = class.location();
+                location.end_offset() - location.start_offset()
+            })
+        else {
+            return MethodVisibility::Public;
+        };
+        let body = class.body();
+        Self::resolve(body.as_ref(), file, None)
+            .ok()
+            .and_then(|visibility| visibility.defaults.get(&offset).copied())
+            .unwrap_or_default()
+    }
+
     pub(super) fn resolve(
         body: Option<&Node<'_>>,
         file: &str,
@@ -98,35 +125,6 @@ impl Visibility {
             return Err(Self::unsupported(
                 file,
                 "visibility of model accessors or aliases requires a local MethodDef",
-            ));
-        }
-        Ok(())
-    }
-
-    /// ActiveSupport `delegate` defines a method at the declaration site,
-    /// so a bare `private`/`protected` marker applies to that generated
-    /// method. The current expander emits public methods only; refuse that
-    /// declaration rather than changing Ruby visibility.
-    pub(super) fn check_delegate_declaration(
-        &self,
-        statement: &Node<'_>,
-        file: &str,
-    ) -> IngestResult<()> {
-        let Some(call) = statement.as_call_node() else {
-            return Ok(());
-        };
-        if call.receiver().is_some() || constant_id_str(&call.name()) != "delegate" {
-            return Ok(());
-        }
-        let visibility = self
-            .defaults
-            .get(&statement.location().start_offset())
-            .copied()
-            .unwrap_or_default();
-        if visibility != MethodVisibility::Public {
-            return Err(Self::unsupported(
-                file,
-                "delegate under non-public visibility is not modeled",
             ));
         }
         Ok(())

@@ -49,76 +49,53 @@ fn emit_model(app: &mut roundhouse::App, suffix: &str) -> String {
 }
 
 #[test]
-fn a_model_delegate_under_private_visibility_is_not_emitted_as_public() {
+fn private_delegate_visibility_is_preserved_for_models_and_library_classes() {
     let mut files = tree("");
     files.insert(
         PathBuf::from("app/models/account.rb"),
-        b"class Account < ApplicationRecord\n  private\n  delegate :name, to: :profile\nend\n"
-            .to_vec(),
+        b"class Account < ApplicationRecord\n  has_one :profile\n  private\n  delegate :display_name, to: :profile\nend\n".to_vec(),
     );
-    let error =
-        ingest_app_from_tree(files).expect_err("private delegate visibility is not modeled");
-    assert!(
-        error
-            .to_string()
-            .contains("delegate under non-public visibility is not modeled"),
-        "unexpected ingest error: {error}"
-    );
-}
-
-#[test]
-fn survey_mode_skips_only_private_delegate_declarations() {
-    let mut files = tree("");
     files.insert(
-        PathBuf::from("app/models/account.rb"),
-        b"class Account < ApplicationRecord\n  private\n  delegate :name, to: :profile\n  def retained\n    true\n  end\nend\n"
-            .to_vec(),
+        PathBuf::from("db/schema.rb"),
+        b"ActiveRecord::Schema.define do\n  create_table \"accounts\" do |t|\n    t.string \"name\"\n  end\n  create_table \"profiles\" do |t|\n    t.integer \"account_id\"\n    t.string \"display_name\"\n  end\nend\n".to_vec(),
+    );
+    files.insert(
+        PathBuf::from("app/models/profile.rb"),
+        b"class Profile < ApplicationRecord\n  belongs_to :account\n  def display_name\n    \"profile\"\n  end\nend\n".to_vec(),
     );
     files.insert(
         PathBuf::from("lib/private_service.rb"),
-        b"class PrivateService\n  private\n  delegate :name, to: :profile\n  def retained\n    true\n  end\nend\n"
-            .to_vec(),
+        b"class PrivateService\n  attr_reader :profile\n  private\n  delegate :display_name, to: :profile\nend\n".to_vec(),
     );
 
-    let strict_error = ingest_app_from_tree(files.clone())
-        .expect_err("strict ingest still rejects private library-class delegates");
-    assert!(strict_error
-        .to_string()
-        .contains("delegate under non-public visibility"));
-
-    roundhouse::ingest::survey::activate();
-    let app = ingest_app_from_tree(files).expect("survey ingest retains containing classes");
-    let errors = roundhouse::ingest::survey::drain();
-
-    assert!(!errors.is_empty(), "{errors:?}");
-    assert!(errors.iter().all(|error| {
-        error
-            .to_string()
-            .contains("delegate under non-public visibility")
-    }));
-    assert!(errors
-        .iter()
-        .any(|error| error.to_string().contains("app/models/account.rb")));
-    assert!(errors
-        .iter()
-        .any(|error| error.to_string().contains("lib/private_service.rb")));
+    let app = ingest_app_from_tree(files).expect("ingest");
     let account = app
         .models
         .iter()
         .find(|model| model.name.0.as_str() == "Account")
-        .expect("model containing a refused declaration remains available");
-    assert!(account
+        .expect("Account");
+    let account_delegate = account
         .methods()
-        .any(|method| method.name.as_str() == "retained"));
+        .find(|method| method.name.as_str() == "display_name")
+        .expect("model delegate");
+    assert_eq!(
+        account_delegate.visibility,
+        roundhouse::dialect::MethodVisibility::Private
+    );
     let service = app
         .library_classes
         .iter()
         .find(|class| class.name.0.as_str() == "PrivateService")
-        .expect("library class containing a refused declaration remains available");
-    assert!(service
+        .expect("PrivateService");
+    let service_delegate = service
         .methods
         .iter()
-        .any(|method| method.name.as_str() == "retained"));
+        .find(|method| method.name.as_str() == "display_name")
+        .expect("library-class delegate");
+    assert_eq!(
+        service_delegate.visibility,
+        roundhouse::dialect::MethodVisibility::Private
+    );
 }
 
 #[test]

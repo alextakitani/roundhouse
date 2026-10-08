@@ -1994,14 +1994,6 @@ fn walk_decl_body_with_visibility<'pr>(
                             && !SORBET_ANNOTATIONS.contains(&kw)
                             && !is_sorbet_annotation_mixin(&call)
                         {
-                            if kw == "delegate" {
-                                if let Err(err) =
-                                    visibility.check_delegate_declaration(&statement, file)
-                                {
-                                    super::survey::continue_or_fail(err)?;
-                                    continue;
-                                }
-                            }
                             if let Ok(e) = ingest_expr(&stmt, file) {
                                 out.unknown_calls.push(e);
                             }

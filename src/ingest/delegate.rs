@@ -36,7 +36,7 @@
 //! the arity coming from the TARGET's own signature rather than from
 //! call sites.
 
-use crate::dialect::{LibraryClass, MethodDef, MethodReceiver};
+use crate::dialect::{LibraryClass, MethodDef, MethodReceiver, MethodVisibility};
 use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::Symbol;
 
@@ -52,6 +52,7 @@ struct Delegation {
     /// it can't; callers fall back to the pass's own `"<delegate>"`
     /// label for a synthesis-failure report rather than misattribute.
     file: String,
+    visibility: MethodVisibility,
 }
 
 #[derive(Default)]
@@ -137,6 +138,7 @@ pub(crate) fn expand_delegates_in_class(lc: &mut LibraryClass) -> Vec<MethodDef>
         &[],
         &std::collections::HashSet::new(),
         None,
+        &[],
     )
 }
 
@@ -147,6 +149,7 @@ pub(super) fn expand_delegates(
     additional_method_bodies: &[Expr],
     blocked_names: &std::collections::HashSet<String>,
     supported_target_methods: Option<&std::collections::HashSet<(String, String, usize)>>,
+    sources: &[crate::span::SourceFile],
 ) -> Vec<MethodDef> {
     let called_with_args = names_called_with_arguments(methods, additional_method_bodies);
     let delegates = take_delegate_decls_from_calls(
@@ -154,6 +157,7 @@ pub(super) fn expand_delegates(
         &called_with_args,
         blocked_names,
         supported_target_methods,
+        sources,
     );
     if delegates.is_empty() {
         return Vec::new();
@@ -169,7 +173,19 @@ pub(super) fn expand_delegates(
         crate::ingest::ingest_library_classes(src.as_bytes(), "<delegate>")
     });
     match parsed {
-        Ok(classes) if diags.is_empty() => classes.into_iter().flat_map(|c| c.methods).collect(),
+        Ok(classes) if diags.is_empty() => classes
+            .into_iter()
+            .flat_map(|class| class.methods)
+            .map(|mut method| {
+                if let Some(delegate) = delegates
+                    .iter()
+                    .find(|delegate| delegate.name == method.name.as_str())
+                {
+                    method.visibility = delegate.visibility;
+                }
+                method
+            })
+            .collect(),
         Ok(_) => {
             record_synthesis_failure(&delegates, &diags);
             Vec::new()
@@ -188,6 +204,7 @@ fn take_delegate_decls_from_calls(
     called_with_args: &CallsWithArguments,
     blocked_names: &std::collections::HashSet<String>,
     supported_target_methods: Option<&std::collections::HashSet<(String, String, usize)>>,
+    sources: &[crate::span::SourceFile],
 ) -> Vec<Delegation> {
     let mut out: Vec<Delegation> = Vec::new();
     unknown_calls.retain(|call| {
@@ -277,12 +294,25 @@ fn take_delegate_decls_from_calls(
             }
         }
         let Some(target) = to else { return true };
-        if names.is_empty()
-            || !valid_delegate_target(target.as_str())
-            || names
-                .iter()
-                .any(|name| !valid_delegate_method(name.as_str()))
+        if names.is_empty() || !valid_delegate_target(target.as_str()) {
+            return true;
+        }
+        if names
+            .iter()
+            .any(|name| !valid_delegate_method(name.as_str()))
         {
+            let file = super::sources::path_of(call.span.file).unwrap_or_default();
+            let names = names
+                .iter()
+                .map(|name| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            super::survey::record(&crate::ingest::IngestError::Unsupported {
+                file,
+                message: format!(
+                    "delegate forwarder for `{names}` could not be synthesized: invalid method name"
+                ),
+            });
             return true;
         }
         let generated_names: Vec<_> = names
@@ -317,6 +347,28 @@ fn take_delegate_decls_from_calls(
         // not evidence this pass can't cover it — it's what every
         // setter call looks like, delegated or not.
         let file = super::sources::path_of(call.span.file).unwrap_or_default();
+        let visibility = super::sources::with_text(&file, |source| {
+            super::visibility::Visibility::declaration_default(
+                source,
+                &file,
+                call.span.start as usize,
+            )
+        })
+        .or_else(|| {
+            call.span
+                .file
+                .0
+                .checked_sub(1)
+                .and_then(|index| sources.get(index as usize))
+                .map(|source| {
+                    super::visibility::Visibility::declaration_default(
+                        &source.text,
+                        &source.path,
+                        call.span.start as usize,
+                    )
+                })
+        })
+        .unwrap_or_default();
         let mut entries = Vec::new();
         for m in names {
             let prefix = prefix
@@ -356,6 +408,7 @@ fn take_delegate_decls_from_calls(
                 target: target.clone(),
                 name,
                 file: file.clone(),
+                visibility,
             });
         }
         if unknown_option {
@@ -619,6 +672,7 @@ mod tests {
             &called_with_args,
             &std::collections::HashSet::new(),
             None,
+            &[],
         )
     }
 
@@ -771,6 +825,7 @@ mod tests {
             &called_with_args,
             &std::collections::HashSet::new(),
             None,
+            &[],
         );
         assert!(
             delegates.is_empty(),
@@ -792,6 +847,7 @@ mod tests {
             &called_with_args,
             &["title".to_string()].into_iter().collect(),
             None,
+            &[],
         );
         assert!(
             delegates.is_empty(),
