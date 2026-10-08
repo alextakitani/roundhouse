@@ -59,6 +59,10 @@ use crate::ident::Symbol;
 mod constructor;
 use constructor::InstanceCallParams;
 
+pub(super) fn lexical_refinement_calls(app: &App) -> std::collections::HashSet<crate::span::Span> {
+    constructor::lexical_refinement_calls(app)
+}
+
 pub fn apply_helper_kwarg_positional_lowering(app: &mut App) -> Vec<crate::diagnostic::Diagnostic> {
     // Refused/native markers remain intact for diagnosis; only ordinary
     // producers rejoin this pass's established positional normalization.
@@ -66,10 +70,10 @@ pub fn apply_helper_kwarg_positional_lowering(app: &mut App) -> Vec<crate::diagn
     let mut diagnostics = Vec::new();
     let (plans, constructors) =
         crate::analyze::forwarding::keyword_calls_and_constructor_contracts(app);
-    let constructor_splat_classes = super::forwarding::constructor_splat_classes(&constructors);
-    let instance_params = InstanceCallParams::new(app, constructors);
+    let constructor_names = super::forwarding::constructor_names(app, &constructors);
+    let instance_params = InstanceCallParams::new(app, constructors, &constructor_names);
     let class_params = library_class_call_params(app);
-    let _ = super::forwarding::apply_with_plans(app, &plans, &constructor_splat_classes);
+    let _ = super::forwarding::apply_with_plans(app, &plans, &constructor_names);
     super::for_each_hook_body(app, &mut |expr| {
         constructor::refuse_keyword_splats(expr, &instance_params, &mut diagnostics);
     });

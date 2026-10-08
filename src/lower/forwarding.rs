@@ -13,14 +13,36 @@ use std::collections::{HashMap, HashSet};
 
 pub(super) fn apply(app: &mut App) -> Vec<Diagnostic> {
     let (plans, constructors) = keyword_calls_and_constructor_contracts(app);
-    let constructor_splat_classes = constructor_splat_classes(&constructors);
-    apply_with_plans(app, &plans, &constructor_splat_classes)
+    let names = constructor_names(app, &constructors);
+    apply_with_plans(app, &plans, &names)
 }
 
-pub(super) fn constructor_splat_classes(
+pub(super) struct ConstructorNames {
+    pub(super) splat_classes: HashSet<String>,
+    pub(super) unqualified_class_ids: HashMap<String, String>,
+    pub(super) ambiguous_names: HashSet<String>,
+    pub(super) lexical_refinement_calls: HashSet<crate::span::Span>,
+    pub(super) model_names: HashSet<String>,
+}
+
+pub(super) fn constructor_names(
+    app: &App,
     constructors: &HashMap<ClassId, ConstructorContract<'_>>,
-) -> HashSet<String> {
-    constructors
+) -> ConstructorNames {
+    let (unqualified_class_ids, ambiguous_names) = unqualified_constructor_names(
+        app.library_classes
+            .iter()
+            .map(|class| &class.name)
+            .chain(app.rails_application.iter().map(|class| &class.name))
+            .chain(
+                app.test_modules
+                    .iter()
+                    .flat_map(|module| module.inner_classes.iter())
+                    .map(|class| &class.name),
+            )
+            .chain(app.models.iter().map(|model| &model.name)),
+    );
+    let mut splat_classes: HashSet<String> = constructors
         .iter()
         .filter_map(|(class, contract)| match contract {
             ConstructorContract::Initialize(method)
@@ -37,13 +59,50 @@ pub(super) fn constructor_splat_classes(
             }
             _ => None,
         })
-        .collect()
+        .collect();
+    splat_classes.extend(ambiguous_names.iter().cloned());
+    ConstructorNames {
+        splat_classes,
+        unqualified_class_ids,
+        ambiguous_names,
+        lexical_refinement_calls: super::helper_kwargs::lexical_refinement_calls(app),
+        model_names: app
+            .models
+            .iter()
+            .map(|model| model.name.0.as_str().to_string())
+            .collect(),
+    }
+}
+
+fn unqualified_constructor_names<'a>(
+    class_ids: impl Iterator<Item = &'a ClassId>,
+) -> (HashMap<String, String>, HashSet<String>) {
+    let mut unqualified_class_ids = HashMap::new();
+    let mut ambiguous_names = HashSet::new();
+    for class_id in class_ids {
+        let full_name = class_id.0.as_str();
+        let simple_name = full_name.rsplit("::").next().unwrap_or(full_name);
+        match unqualified_class_ids.entry(simple_name.to_string()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(full_name.to_string());
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                if entry.get() != full_name {
+                    ambiguous_names.insert(simple_name.to_string());
+                }
+            }
+        }
+    }
+    for name in &ambiguous_names {
+        unqualified_class_ids.remove(name);
+    }
+    (unqualified_class_ids, ambiguous_names)
 }
 
 pub(super) fn apply_with_plans(
     app: &mut App,
     plans: &HashMap<crate::span::Span, KeywordPolicy>,
-    constructor_splat_classes: &HashSet<String>,
+    names: &ConstructorNames,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     for (span, policy) in plans {
@@ -57,7 +116,7 @@ pub(super) fn apply_with_plans(
     fn project(
         e: &mut Expr,
         plans: &std::collections::HashMap<crate::span::Span, KeywordPolicy>,
-        constructor_splat_classes: &HashSet<String>,
+        names: &ConstructorNames,
     ) {
         if plans.get(&e.span) == Some(&KeywordPolicy::Legacy) {
             let (args, constructor_splat) = match &mut *e.node {
@@ -77,7 +136,12 @@ pub(super) fn apply_with_plans(
                                 ) || matches!(
                                     &recv.ty,
                                     Some(crate::ty::Ty::Class { id, .. })
-                                        if constructor_splat_classes.contains(id.0.as_str())
+                                        if names.splat_classes.contains(
+                                            names.unqualified_class_ids
+                                                .get(id.0.as_str())
+                                                .map_or(id.0.as_str(), String::as_str)
+                                        ) || names.ambiguous_names.contains(id.0.as_str())
+                                            || names.lexical_refinement_calls.contains(&e.span)
                                 ))
                         });
                     (Some(args), constructor_splat)
@@ -93,9 +157,36 @@ pub(super) fn apply_with_plans(
                 }
             }
         }
-        e.node
-            .for_each_child_mut(&mut |c| project(c, plans, constructor_splat_classes));
+        e.node.for_each_child_mut(&mut |c| project(c, plans, names));
     }
-    super::for_each_forwarding_body(app, &mut |e| project(e, plans, constructor_splat_classes));
+    super::for_each_forwarding_body(app, &mut |e| project(e, plans, names));
     diagnostics
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unqualified_constructor_names;
+    use crate::ident::{ClassId, Symbol};
+
+    #[test]
+    fn repeated_fragments_are_not_short_name_collisions() {
+        let classes = [
+            ClassId(Symbol::from("Outer::Item")),
+            ClassId(Symbol::from("Outer::Item")),
+        ];
+        let (names, ambiguous) = unqualified_constructor_names(classes.iter());
+        assert_eq!(names.get("Item").map(String::as_str), Some("Outer::Item"));
+        assert!(ambiguous.is_empty());
+    }
+
+    #[test]
+    fn distinct_classes_with_the_same_short_name_are_ambiguous() {
+        let classes = [
+            ClassId(Symbol::from("Outer::Item")),
+            ClassId(Symbol::from("Admin::Item")),
+        ];
+        let (names, ambiguous) = unqualified_constructor_names(classes.iter());
+        assert!(!names.contains_key("Item"));
+        assert!(ambiguous.contains("Item"));
+    }
 }

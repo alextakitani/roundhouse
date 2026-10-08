@@ -525,9 +525,11 @@ pub(crate) fn keyword_calls_and_constructor_contracts(
     HashMap<Span, KeywordPolicy>,
     HashMap<ClassId, ConstructorContract<'_>>,
 ) {
-    let contracts = SourceContractIndex::new(app);
+    let mut contracts = SourceContractIndex::new(app);
+    let plans = keyword_calls_with_index(app, &contracts);
+    constructor::index_unmodeled_lookup_mutations(app, &mut contracts);
     (
-        keyword_calls_with_index(app, &contracts),
+        plans,
         constructor::constructor_contracts_with_index(app, &contracts),
     )
 }
@@ -767,6 +769,7 @@ fn constructed_instance(
 struct SourceContractIndex<'a> {
     parents: HashMap<ClassId, &'a ClassId>,
     includes: HashMap<ClassId, Vec<ClassId>>,
+    modules: HashSet<ClassId>,
     unmodeled_constructor_lookup: HashSet<ClassId>,
     fragments: HashMap<ClassId, usize>,
     instance: HashMap<(ClassId, Symbol), (&'a MethodDef, bool)>,
@@ -789,6 +792,7 @@ impl<'a> SourceContractIndex<'a> {
         let mut index = Self {
             parents: HashMap::new(),
             includes: HashMap::new(),
+            modules: HashSet::new(),
             unmodeled_constructor_lookup: HashSet::new(),
             fragments: HashMap::new(),
             instance: HashMap::new(),
@@ -801,6 +805,9 @@ impl<'a> SourceContractIndex<'a> {
         let mut class_owners = HashSet::new();
         for class in classes(app) {
             class_owners.insert(class.name.clone());
+            if class.is_module {
+                index.modules.insert(class.name.clone());
+            }
             index.add_fragment(
                 &class.name,
                 class.parent.as_ref(),
@@ -808,16 +815,6 @@ impl<'a> SourceContractIndex<'a> {
             );
             index.add_methods(&class.name, class.methods.iter(), false);
             index.virtual_owners.push(&class.name);
-            if class
-                .unknown_calls
-                .iter()
-                .any(constructor::is_constructor_lookup_mutation)
-                || constructor::methods_mutate_constructor_lookup(class.methods.iter())
-            {
-                index
-                    .unmodeled_constructor_lookup
-                    .insert(class.name.clone());
-            }
         }
         for model in &app.models {
             index.add_fragment(
@@ -829,15 +826,6 @@ impl<'a> SourceContractIndex<'a> {
                 index.add_methods(&model.name, model.methods(), true);
             }
             index.virtual_owners.push(&model.name);
-            if model.body.iter().any(|item| {
-                matches!(item, crate::dialect::ModelBodyItem::Unknown { expr, .. } if constructor::is_constructor_lookup_mutation(expr))
-            })
-                || constructor::methods_mutate_constructor_lookup(model.methods())
-            {
-                index
-                    .unmodeled_constructor_lookup
-                    .insert(model.name.clone());
-            }
         }
         for module in &app.test_modules {
             index.add_fragment(
@@ -1008,7 +996,7 @@ impl<'a> SourceContractIndex<'a> {
         if !seen.insert(owner.clone()) {
             return true;
         }
-        self.fragments.get(owner).copied().unwrap_or(0) <= 1
+        (self.fragments.get(owner).copied().unwrap_or(0) <= 1 || self.modules.contains(owner))
             && self
                 .parent(owner)
                 .is_none_or(|parent| self.verified_hierarchy(parent, seen))

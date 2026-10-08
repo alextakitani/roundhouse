@@ -16,8 +16,10 @@ pub(super) struct InstanceCallParams {
     pub(super) custom_new_slots: HashMap<(String, Symbol), Vec<Slot>>,
     custom_new: HashSet<String>,
     pub(super) unknown_new: HashSet<String>,
-    lexical_refinement_calls: HashSet<crate::span::Span>,
+    pub(super) lexical_refinement_calls: HashSet<crate::span::Span>,
     unqualified_class_ids: HashMap<String, String>,
+    ambiguous_names: HashSet<String>,
+    model_names: HashSet<String>,
 }
 
 impl InstanceCallParams {
@@ -27,6 +29,7 @@ impl InstanceCallParams {
             crate::ident::ClassId,
             crate::analyze::forwarding::ConstructorContract<'_>,
         >,
+        names: &super::super::forwarding::ConstructorNames,
     ) -> Self {
         let mut slots: HashMap<(String, Symbol), Vec<Slot>> = HashMap::new();
         for class in &app.library_classes {
@@ -53,21 +56,7 @@ impl InstanceCallParams {
         let mut custom_new = HashSet::new();
         let mut custom_new_slots = HashMap::new();
         let mut unknown_new = HashSet::new();
-        let mut unqualified_class_ids = HashMap::new();
-        let mut ambiguous_names = HashSet::new();
-        for class_id in constructors.keys() {
-            let full_name = class_id.0.as_str();
-            let simple_name = full_name.rsplit("::").next().unwrap_or(full_name);
-            if unqualified_class_ids
-                .insert(simple_name.to_string(), full_name.to_string())
-                .is_some()
-            {
-                ambiguous_names.insert(simple_name.to_string());
-            }
-        }
-        for name in ambiguous_names {
-            unqualified_class_ids.remove(&name);
-        }
+        let unqualified_class_ids = names.unqualified_class_ids.clone();
         for (class_id, contract) in constructors {
             add_constructor_slots(
                 &class_id,
@@ -83,52 +72,151 @@ impl InstanceCallParams {
             custom_new_slots,
             custom_new,
             unknown_new,
-            lexical_refinement_calls: lexical_refinement_calls(app),
+            lexical_refinement_calls: names.lexical_refinement_calls.clone(),
             unqualified_class_ids,
+            ambiguous_names: names.ambiguous_names.clone(),
+            model_names: names.model_names.clone(),
         }
     }
 }
 
-fn lexical_refinement_calls(app: &App) -> HashSet<crate::span::Span> {
-    fn contains_using(expr: &Expr) -> bool {
-        matches!(&*expr.node, ExprNode::Send { method, .. } if method.as_str() == "using") || {
-            let mut found = false;
-            expr.node
-                .for_each_child(&mut |child| found |= contains_using(child));
-            found
-        }
-    }
-    fn collect_new_calls(expr: &Expr, spans: &mut HashSet<crate::span::Span>) {
-        if matches!(&*expr.node, ExprNode::Send { method, .. } if method.as_str() == "new") {
-            spans.insert(expr.span);
+pub(super) fn lexical_refinement_calls(app: &App) -> HashSet<crate::span::Span> {
+    fn using_spans(expr: &Expr, owner: &str, activations: &mut Vec<(String, crate::span::Span)>) {
+        if matches!(&*expr.node, ExprNode::Send { method, .. } if method.as_str() == "using") {
+            activations.push((owner.to_string(), expr.span));
         }
         expr.node
-            .for_each_child(&mut |child| collect_new_calls(child, spans));
+            .for_each_child(&mut |child| using_spans(child, owner, activations));
+    }
+    fn collect_new_calls(
+        expr: &Expr,
+        refinements: &[crate::span::Span],
+        calls: &mut HashSet<crate::span::Span>,
+    ) {
+        if matches!(&*expr.node, ExprNode::Send { method, .. } if method.as_str() == "new")
+            && refinements
+                .iter()
+                .any(|using| using.file == expr.span.file && using.start < expr.span.start)
+        {
+            calls.insert(expr.span);
+        }
+        expr.node
+            .for_each_child(&mut |child| collect_new_calls(child, refinements, calls));
+    }
+
+    fn refinements_for(
+        owner: &str,
+        activations: &[(String, crate::span::Span)],
+    ) -> Vec<crate::span::Span> {
+        activations
+            .iter()
+            .filter(|(scope, _)| {
+                scope.is_empty()
+                    || owner == scope
+                    || owner
+                        .strip_prefix(scope)
+                        .is_some_and(|tail| tail.starts_with("::"))
+            })
+            .map(|(_, span)| *span)
+            .collect()
+    }
+
+    let mut activations = Vec::new();
+    for class in &app.library_classes {
+        let owner = class.name.0.as_str();
+        for expr in &class.unknown_calls {
+            using_spans(expr, owner, &mut activations);
+        }
+        for (_, expr) in &class.constants {
+            using_spans(expr, owner, &mut activations);
+        }
+    }
+    for model in &app.models {
+        for item in &model.body {
+            if let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item {
+                using_spans(expr, model.name.0.as_str(), &mut activations);
+            }
+        }
+    }
+    for (index, source) in app.sources.iter().enumerate() {
+        if !source.path.ends_with(".rb") {
+            continue;
+        }
+        let parsed = ruby_prism::parse(source.text.as_bytes());
+        let Some(program) = parsed.node().as_program_node() else {
+            continue;
+        };
+        struct TopLevelUsing {
+            spans: Vec<(u32, u32)>,
+        }
+        impl<'pr> ruby_prism::Visit<'pr> for TopLevelUsing {
+            fn visit_call_node(&mut self, call: &ruby_prism::CallNode<'pr>) {
+                if call.receiver().is_none() && call.name().as_slice() == b"using" {
+                    let location = call.location();
+                    self.spans
+                        .push((location.start_offset() as u32, location.end_offset() as u32));
+                }
+                ruby_prism::visit_call_node(self, call);
+            }
+
+            fn visit_class_node(&mut self, _: &ruby_prism::ClassNode<'pr>) {}
+
+            fn visit_module_node(&mut self, _: &ruby_prism::ModuleNode<'pr>) {}
+
+            fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {}
+
+            fn visit_singleton_class_node(&mut self, _: &ruby_prism::SingletonClassNode<'pr>) {}
+        }
+        let mut using = TopLevelUsing { spans: Vec::new() };
+        ruby_prism::Visit::visit(&mut using, &program.as_node());
+        for (start, end) in using.spans {
+            activations.push((
+                String::new(),
+                crate::span::Span {
+                    file: crate::span::FileId(index as u32 + 1),
+                    start,
+                    end,
+                },
+            ));
+        }
     }
 
     let mut spans = HashSet::new();
     for class in &app.library_classes {
-        if class.unknown_calls.iter().any(contains_using) {
+        let refinements = refinements_for(class.name.0.as_str(), &activations);
+        if !refinements.is_empty() {
+            for expr in &class.unknown_calls {
+                collect_new_calls(expr, &refinements, &mut spans);
+            }
+            for (_, expr) in &class.constants {
+                collect_new_calls(expr, &refinements, &mut spans);
+            }
+            for expr in &class.class_ivar_initializers {
+                collect_new_calls(expr, &refinements, &mut spans);
+            }
             for method in &class.methods {
-                collect_new_calls(&method.body, &mut spans);
+                collect_new_calls(&method.body, &refinements, &mut spans);
                 for default in method
                     .params
                     .iter()
                     .filter_map(|param| param.default.as_ref())
                 {
-                    collect_new_calls(default, &mut spans);
+                    collect_new_calls(default, &refinements, &mut spans);
                 }
             }
         }
     }
     for model in &app.models {
-        if model.body.iter().any(|item| {
-            matches!(item, crate::dialect::ModelBodyItem::Unknown { expr, .. } if contains_using(expr))
-        }) {
+        let refinements = refinements_for(model.name.0.as_str(), &activations);
+        if !refinements.is_empty() {
             for method in model.methods() {
-                collect_new_calls(&method.body, &mut spans);
-                for default in method.params.iter().filter_map(|param| param.default.as_ref()) {
-                    collect_new_calls(default, &mut spans);
+                collect_new_calls(&method.body, &refinements, &mut spans);
+                for default in method
+                    .params
+                    .iter()
+                    .filter_map(|param| param.default.as_ref())
+                {
+                    collect_new_calls(default, &refinements, &mut spans);
                 }
             }
         }
@@ -208,6 +296,18 @@ pub(super) fn refuse_keyword_splats(
         .unqualified_class_ids
         .get(id.0.as_str())
         .map_or(id.0.as_str(), String::as_str);
+    if params.ambiguous_names.contains(id.0.as_str())
+        && !params.model_names.contains(class_name)
+        && has_keyword_arguments(args)
+    {
+        refuse_constructor(
+            expr.span,
+            &mut expr.diagnostic,
+            "cannot verify constructor lookup because this unqualified class name is ambiguous",
+            diagnostics,
+        );
+        return;
+    }
     if params.lexical_refinement_calls.contains(&expr.span) && has_keyword_arguments(args) {
         refuse_constructor(
             expr.span,
@@ -273,7 +373,11 @@ fn rewrite_instance_call(
     ) {
         return;
     }
-    if params.slots.is_empty() && params.unknown_new.is_empty() {
+    if params.slots.is_empty()
+        && params.unknown_new.is_empty()
+        && params.ambiguous_names.is_empty()
+        && params.lexical_refinement_calls.is_empty()
+    {
         return;
     }
     let ExprNode::Send {
@@ -297,6 +401,19 @@ fn rewrite_instance_call(
     } else {
         id.0.as_str()
     };
+    if is_constructor
+        && params.ambiguous_names.contains(id.0.as_str())
+        && !params.model_names.contains(class_id)
+        && has_keyword_arguments(args)
+    {
+        refuse_constructor(
+            expr.span,
+            &mut expr.diagnostic,
+            "cannot verify constructor lookup because this unqualified class name is ambiguous",
+            diagnostics,
+        );
+        return;
+    }
     if is_constructor
         && params.lexical_refinement_calls.contains(&expr.span)
         && has_keyword_arguments(args)

@@ -228,6 +228,22 @@ class SingletonIncludedConstructor
   end
 end
 
+module SingletonPrependedNew
+  def new(label:)
+    "prepended singleton:#{label}"
+  end
+end
+
+class SingletonPrependedConstructor
+  class << self
+    prepend SingletonPrependedNew
+  end
+
+  def initialize(label: "default")
+    @label = label
+  end
+end
+
 class OtherConstructorContext
   LABEL = "caller label"
 
@@ -286,6 +302,7 @@ class UnsafeConstructorCalls
       RegexDefaultConstructor.new(step: 2),
       PrependedConstructor.new(label: "z"),
       SingletonIncludedConstructor.new(label: "z"),
+      SingletonPrependedConstructor.new(label: "z"),
       ReceiverExtendedConstructor.new(label: "z"),
       ClassEvalConstructor.new(label: "z"),
       HookConstructor.new(label: "z"),
@@ -433,6 +450,7 @@ fn unsafe_keyword_order_and_duplicate_keys_are_rejected() {
     for call in [
         "PrependedConstructor.new(label: \"z\")",
         "SingletonIncludedConstructor.new(label: \"z\")",
+        "SingletonPrependedConstructor.new(label: \"z\")",
         "ReceiverExtendedConstructor.new(label: \"z\")",
         "ClassEvalConstructor.new(label: \"z\")",
         "HookConstructor.new(label: \"z\")",
@@ -724,10 +742,32 @@ module ConstructorRefinement
 end
 
 class RefinedCaller
+  BEFORE = RefinedTarget.new(label: "before constant")
+
+  def self.before_refinement
+    RefinedTarget.new(label: "before")
+  end
+
   using ConstructorRefinement
+
+  AFTER = RefinedTarget.new(**{ label: "after constant" })
 
   def self.build
     RefinedTarget.new(label: "z")
+  end
+end
+
+module OuterRefinementScope
+  using ConstructorRefinement
+
+  def self.marker
+    :outer
+  end
+
+  class NestedCaller
+    def self.build
+      RefinedTarget.new(label: "nested scope")
+    end
   end
 end
 "#;
@@ -743,6 +783,62 @@ end
                 if construct.as_str() == "constructor keyword arguments"
         )),
         "a using/refinement scope can replace `.new`, so the call cannot be rebound to initialize"
+    );
+    let before_call = "RefinedTarget.new(label: \"before\")";
+    let before_start = source.find(before_call).expect("pre-refinement call") as u32;
+    assert!(
+        lower_diagnostics.iter().all(|diagnostic| {
+            diagnostic.span.start != before_start
+                || !matches!(
+                    &diagnostic.kind,
+                    roundhouse::diagnostic::DiagnosticKind::Unsupported { construct, .. }
+                        if construct.as_str() == "constructor keyword arguments"
+                )
+        }),
+        "a method defined before `using` is outside the refinement scope"
+    );
+    let before_constant = "RefinedTarget.new(label: \"before constant\")";
+    let before_constant_start = source
+        .find(before_constant)
+        .expect("pre-refinement constant") as u32;
+    assert!(
+        lower_diagnostics.iter().all(|diagnostic| {
+            diagnostic.span.start != before_constant_start
+                || !matches!(
+                    &diagnostic.kind,
+                    roundhouse::diagnostic::DiagnosticKind::Unsupported { construct, .. }
+                        if construct.as_str() == "constructor keyword arguments"
+                )
+        }),
+        "a constant initializer before `using` is outside the refinement scope"
+    );
+    let after_constant = "RefinedTarget.new(**{ label: \"after constant\" })";
+    let after_constant_start = source
+        .find(after_constant)
+        .expect("post-refinement constant") as u32;
+    assert!(
+        lower_diagnostics.iter().any(|diagnostic| {
+            diagnostic.span.start == after_constant_start
+                && matches!(
+                    &diagnostic.kind,
+                    roundhouse::diagnostic::DiagnosticKind::Unsupported { construct, .. }
+                        if construct.as_str() == "constructor keyword arguments"
+                )
+        }),
+        "a constructor splat in the active refinement scope must be preserved and refused"
+    );
+    let nested_call = "RefinedTarget.new(label: \"nested scope\")";
+    let nested_start = source.find(nested_call).expect("nested refinement call") as u32;
+    assert!(
+        lower_diagnostics.iter().any(|diagnostic| {
+            diagnostic.span.start == nested_start
+                && matches!(
+                    &diagnostic.kind,
+                    roundhouse::diagnostic::DiagnosticKind::Unsupported { construct, .. }
+                        if construct.as_str() == "constructor keyword arguments"
+                )
+        }),
+        "a refinement activated in an enclosing lexical scope applies to nested class methods"
     );
 }
 
