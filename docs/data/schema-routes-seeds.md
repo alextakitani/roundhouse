@@ -160,17 +160,29 @@ t.virtual "display_name", type: :string,
   as: "first_name || ' ' || coalesce(last_name, '')", stored: true
 ```
 
-The initial expression subset is deliberately bounded: unbounded string/text
+The portable expression subset is deliberately bounded: unbounded string/text
 columns, SQL string literals, parentheses, `||`, and `coalesce` with at least
 two arguments. Expressions are validated against the complete table and kept
-verbatim. PostgreSQL casts, JSON operators, other functions, generated-column
-references, defaults, generated keys/timestamps, and length-limited result or
-operand types remain explicit errors. A table must contain an ordinary column.
-Source types normalized to text for ordinary model typing (such as network
-types, enums, `citext`, and fixed-width characters) remain unsupported here.
-Column names that are SQL keywords must be double-quoted in the expression.
-Unresolved keyword splats in column options are rejected because they can hide
-generated-column metadata.
+verbatim. A separate PostgreSQL DDL-only ingest API opts into the same subset
+plus `::text`, `::varchar`, `::character varying`, and equivalent
+`CAST(... AS ...)` forms over unbounded string/text expressions. The default
+application ingest remains portable, so PostgreSQL-only casts still fail app
+checking and cannot reach current SQLite project emission. Use
+`ingest_schema_with_generated_expression_dialect` or the corresponding
+`structure.sql`/migration entry point with
+`schema::generated::GeneratedExpressionDialect::Postgres`, then call
+`render_schema_statements_for(..., Dialect::Postgres)` to render DDL. This
+source-expression mode is not a database selector and does not enable
+PostgreSQL model persistence or a PostgreSQL application target.
+
+JSON operators, casts to non-text types, other functions, generated-column
+references, defaults, generated keys/timestamps, length-limited casts or
+operand types remain explicit errors. A table must contain an ordinary
+column. Source types normalized to text for ordinary model typing (such as
+network types, enums, `citext`, and fixed-width characters) remain unsupported
+here. Column names that are SQL keywords must be double-quoted in the
+expression. Unresolved keyword splats in column options are rejected because
+they can hide generated-column metadata.
 Migration folding permits renaming or dropping an unindexed generated output
 when the resulting table still validates. `change_column` on an existing
 generated output and replacement of a generated output by an ordinary column
@@ -187,7 +199,8 @@ or `VIRTUAL` clause in `structure.sql`; unsupported clauses cannot silently
 become writable columns. Roda emission rejects generated columns. SQLite DDL
 supports both modes; the separate PostgreSQL DDL renderer currently accepts
 stored columns only, even though PostgreSQL 18 also supports virtual columns.
-This does not enable a PostgreSQL runtime backend.
+PostgreSQL text casts require the explicit DDL-only ingest mode described
+above; this does not enable a PostgreSQL runtime backend.
 
 Normal model inserts and updates omit generated columns, while SELECT and
 reload retain them. Generated attributes start nil, including a database
