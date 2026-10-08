@@ -1063,21 +1063,23 @@ fn parse_column_opts<'pr>(nodes: impl Iterator<Item = &'pr Node<'pr>>) -> Column
     opts
 }
 
-/// Whether the migration option list names any Rails-generated-column
-/// field. `as:` and `stored:` must never be ignored and turn a computed
-/// column into an ordinary writable column.
+/// Whether the option list names any Rails-generated-column field.
+/// `as:` and `stored:` must never be ignored and turn a computed column
+/// into an ordinary writable column. `type:` alone is not a generated
+/// column marker: ordinary references/belongs_to declarations may carry
+/// it as an option.
 fn has_generated_column_options(nodes: &[Node<'_>]) -> bool {
     nodes.iter().any(|node| {
         node.as_keyword_hash_node().is_some_and(|hash| {
             hash.elements().iter().any(|element| {
                 element.as_assoc_node().is_some_and(|assoc| {
-                    matches!(symbol_value(&assoc.key()).as_deref(), Some("as" | "stored" | "type"))
+                    matches!(symbol_value(&assoc.key()).as_deref(), Some("as" | "stored"))
                 })
             })
         }) || node.as_hash_node().is_some_and(|hash| {
             hash.elements().iter().any(|element| {
                 element.as_assoc_node().is_some_and(|assoc| {
-                    matches!(symbol_value(&assoc.key()).as_deref(), Some("as" | "stored" | "type"))
+                    matches!(symbol_value(&assoc.key()).as_deref(), Some("as" | "stored"))
                 })
             })
         })

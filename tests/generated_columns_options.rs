@@ -2,7 +2,7 @@
 //! generated column cannot silently enter the schema as an ordinary column.
 
 use roundhouse::ingest::{ingest_migration, ingest_schema};
-use roundhouse::schema::Schema;
+use roundhouse::schema::{ColumnType, Schema};
 
 fn schema_error(source: &str) -> String {
     ingest_schema(source.as_bytes(), "db/schema.rb")
@@ -93,4 +93,102 @@ end
         "{error}"
     );
     assert!(error.contains("generated column options"), "{error}");
+}
+
+#[test]
+fn references_type_options_remain_ordinary_schema_and_migration_columns() {
+    for association in ["references", "belongs_to"] {
+        for options in ["type: :uuid", "{ type: :uuid }"] {
+            let schema_source = format!(
+                r#"ActiveRecord::Schema[8.1].define(version: 1) do
+  create_table "events", force: :cascade do |t|
+    t.{association} "account", {options}
+  end
+end
+"#
+            );
+            let schema = ingest_schema(schema_source.as_bytes(), "db/schema.rb")
+                .expect("ordinary reference type options must not look generated");
+            let column = schema.tables[&roundhouse::Symbol::from("events")]
+                .columns
+                .iter()
+                .find(|column| column.name.as_str() == "account")
+                .expect("reference column");
+            assert!(
+                matches!(&column.col_type, ColumnType::Reference { .. }),
+                "schema.rb `t.{association}` should keep the existing Reference type, got {:?}",
+                column.col_type
+            );
+            assert!(column.generated.is_none());
+
+            let migration_source = format!(
+                r#"class CreateEvents < ActiveRecord::Migration[8.1]
+  def change
+    create_table :events do |t|
+      t.{association} :account, {options}
+    end
+  end
+end
+"#
+            );
+            let mut migrated = Schema::default();
+            ingest_migration(
+                migration_source.as_bytes(),
+                "db/migrate/create_events.rb",
+                &mut migrated,
+            )
+            .expect("ordinary migration reference type options must not look generated");
+            let column = migrated.tables[&roundhouse::Symbol::from("events")]
+                .columns
+                .iter()
+                .find(|column| column.name.as_str() == "account")
+                .expect("migration reference column");
+            assert!(
+                matches!(&column.col_type, ColumnType::Reference { .. }),
+                "migration `t.{association}` should keep the existing Reference type, got {:?}",
+                column.col_type
+            );
+            assert!(column.generated.is_none());
+        }
+    }
+}
+
+#[test]
+fn keyword_as_and_stored_options_still_fail_on_ordinary_column_calls() {
+    for options in [
+        r#"as: "first_name""#,
+        r#"{ as: "first_name" }"#,
+        "stored: true",
+        "{ stored: true }",
+        r#"as: "first_name", stored: true"#,
+        r#"{ as: "first_name", stored: true }"#,
+    ] {
+        let schema_source = format!(
+            r#"ActiveRecord::Schema[8.1].define(version: 1) do
+  create_table "people", force: :cascade do |t|
+    t.string "first_name"
+    t.string "display_name", {options}
+  end
+end
+"#
+        );
+        let error = schema_error(&schema_source);
+        assert!(error.contains("people"), "{error}");
+        assert!(error.contains("generated column options"), "{error}");
+
+        let migration_source = format!(
+            r#"class CreatePeople < ActiveRecord::Migration[8.1]
+  def change
+    create_table :people do |t|
+      t.string :first_name
+      t.string :display_name, {options}
+    end
+  end
+end
+"#
+        );
+        let error = migration_error(&migration_source);
+        assert!(error.contains("people"), "{error}");
+        assert!(error.contains("generated column options"), "{error}");
+    }
 }
