@@ -7606,7 +7606,7 @@ pub(crate) fn extract_ivar_assignments_in(
                     Some(prev) => crate::analyze::body::union_of(prev, ty),
                     None => ty,
                 };
-                out.insert(name.clone(), merged);
+                out.insert(name.clone(), fixpoint_bound::bound(merged));
             }
         }
         // Short-circuit compound assignment to an ivar (`@x ||= y`,
@@ -7619,7 +7619,7 @@ pub(crate) fn extract_ivar_assignments_in(
                     Some(prev) => crate::analyze::body::union_of(prev, ty),
                     None => ty,
                 };
-                out.insert(name.clone(), merged);
+                out.insert(name.clone(), fixpoint_bound::bound(merged));
             }
         }
         // `@a, @b = expr` — destructuring assignment. Each ivar target
@@ -7638,7 +7638,7 @@ pub(crate) fn extract_ivar_assignments_in(
                             Some(prev) => crate::analyze::body::union_of(prev, ty),
                             None => ty,
                         };
-                        out.insert(name.clone(), merged);
+                        out.insert(name.clone(), fixpoint_bound::bound(merged));
                     }
                 }
             }
