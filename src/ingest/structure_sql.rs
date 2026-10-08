@@ -448,7 +448,8 @@ fn resolve_column_type(type_phrase: &str, enum_types: &HashSet<String>) -> Optio
         "numeric" | "decimal" => ColumnType::Decimal { precision: None, scale: None },
         "double precision" | "real" | "float4" | "float8" | "float" => ColumnType::Float,
         "bytea" => ColumnType::Binary,
-        "json" | "jsonb" => ColumnType::Json,
+        "json" => ColumnType::Json,
+        "jsonb" => ColumnType::Jsonb,
         "uuid" => ColumnType::Uuid,
         "inet" | "cidr" | "macaddr" | "macaddr8" => ColumnType::String { limit: None },
         "interval" => ColumnType::String { limit: None },
@@ -1560,7 +1561,8 @@ CREATE INDEX widgets_payload_idx ON widgets USING public.gin (payload);"#;
             Some(ColumnType::String { limit: Some(255) })
         ));
         assert!(matches!(resolve_column_type("bigint", &enums), Some(ColumnType::BigInt)));
-        assert!(matches!(resolve_column_type("jsonb", &enums), Some(ColumnType::Json)));
+        assert!(matches!(resolve_column_type("json", &enums), Some(ColumnType::Json)));
+        assert!(matches!(resolve_column_type("jsonb", &enums), Some(ColumnType::Jsonb)));
         assert!(matches!(resolve_column_type("uuid", &enums), Some(ColumnType::Uuid)));
         assert!(matches!(
             resolve_column_type("numeric(10,2)", &enums),

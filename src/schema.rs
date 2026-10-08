@@ -98,7 +98,12 @@ pub enum ColumnType {
     DateTime,
     Time,
     Binary,
+    /// `t.json` — retained separately from PostgreSQL `jsonb` for faithful
+    /// schema round-trips; shared model storage remains serialized text.
     Json,
+    /// `t.jsonb` — distinct from `t.json` for faithful PostgreSQL schema
+    /// round-trips. Both JSON variants share serialized-text model storage.
+    Jsonb,
     /// `t.uuid` — a Postgres `uuid` column. SQLite has no uuid type, so
     /// storage is TEXT (the 36-char canonical form); typing is a String.
     /// Not modeled as `String` at ingest so a schema round-trip and a
