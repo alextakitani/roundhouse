@@ -1246,6 +1246,12 @@ fn collect_untyped_lowered(
         | ExprNode::ForwardKeywords
         | ExprNode::Defined { .. }
         | ExprNode::SelfRef => {}
+        ExprNode::ForwardKeywordsWithPairs { entries } => {
+            for (key, value) in entries {
+                collect_untyped_lowered(key, path, out);
+                collect_untyped_lowered(value, path, out);
+            }
+        }
         ExprNode::If { cond, then_branch, else_branch } => {
             collect_untyped_lowered(cond, &format!("{path}/if.cond"), out);
             collect_untyped_lowered(then_branch, &format!("{path}/if.then"), out);

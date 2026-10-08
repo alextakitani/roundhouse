@@ -430,6 +430,38 @@ fn compact_and_extra_compare_share_commands_but_not_results() {
         Some("${{ fromJSON(needs.plan.outputs.compare) }}")
     );
     assert_eq!(jobs["compare"]["steps"], jobs["compare-extra"]["steps"]);
+    let compare_steps = jobs["compare"]["steps"].as_sequence().unwrap();
+    let controller_identity = compare_steps
+        .iter()
+        .find(|step| {
+            step["name"].as_str()
+                == Some("cargo test --test rust_toolchain controller identity values")
+        })
+        .expect("the selected Rust compare lane executes controller identity values");
+    assert_eq!(
+        controller_identity["if"].as_str(),
+        Some("${{ !cancelled() && matrix.target == 'rust' }}")
+    );
+    let identity_run = controller_identity["run"].as_str().unwrap();
+    let cargo_command = concat!(
+        "cargo test --locked --test rust_toolchain ",
+        "real_blog_controller_identity_values_match_rails -- --ignored --nocapture --exact"
+    );
+    assert!(
+        identity_run.contains(&format!("if output=$({cargo_command} 2>&1); then")),
+        "the required Rust toolchain command and exact filter must be preserved:\n{identity_run}"
+    );
+    let success_check =
+        "grep -Fxq 'test real_blog_controller_identity_values_match_rails ... ok' <<< \"$output\"";
+    assert!(
+        identity_run.contains(success_check),
+        "the selected outer test must produce its exact success line:\n{identity_run}"
+    );
+    assert!(
+        controller_identity["continue-on-error"].is_null()
+            || controller_identity["continue-on-error"].as_bool() == Some(false),
+        "the Rust controller identity regression must be required"
+    );
     assert_eq!(
         jobs["compare-extra"]["strategy"]["max-parallel"].as_u64(),
         Some(7)
@@ -560,6 +592,80 @@ fn compact_and_extra_compare_share_commands_but_not_results() {
     assert_eq!(ci["permissions"]["contents"].as_str(), Some("read"));
     assert!(ci["permissions"].get("pages").is_none());
     assert!(ci["permissions"].get("id-token").is_none());
+}
+
+/// Verifies the required Rust identity step needs execution and preserves Cargo failures.
+#[cfg(unix)]
+#[test]
+fn rust_identity_ci_guard_requires_execution_and_propagates_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let ci: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
+    let step = ci["jobs"]["compare"]["steps"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .find(|step| {
+            step["name"].as_str()
+                == Some("cargo test --test rust_toolchain controller identity values")
+        })
+        .unwrap();
+
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "rust-identity-ci-{}-{unique}",
+        std::process::id()
+    ));
+    fs::create_dir(&root).unwrap();
+    let cargo = root.join("cargo");
+    fs::write(
+        &cargo,
+        r#"#!/bin/sh
+printf '<%s>\n' "$@" >> "$CARGO_LOG"
+case "$CARGO_MODE" in
+  success) printf '%s\n' 'test real_blog_controller_identity_values_match_rails ... ok'; exit 0 ;;
+  zero_match) printf '%s\n' 'running 0 tests'; exit 0 ;;
+  forged_success_on_failure) printf '%s\n' 'test real_blog_controller_identity_values_match_rails ... ok'; exit 37 ;;
+  *) exit 64 ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let cargo_args = "<test>\n<--locked>\n<--test>\n<rust_toolchain>\n<real_blog_controller_identity_values_match_rails>\n<-->\n<--ignored>\n<--nocapture>\n<--exact>\n";
+    for (mode, expected_status) in [
+        ("success", 0),
+        ("zero_match", 1),
+        ("forged_success_on_failure", 37),
+    ] {
+        let log = root.join("cargo.log");
+        fs::write(&log, "").unwrap();
+        let result = Command::new("bash")
+            .args(["-e", "-o", "pipefail", "-c", step["run"].as_str().unwrap()])
+            .env("CARGO_LOG", &log)
+            .env("CARGO_MODE", mode)
+            .env("CARGO_TERM_COLOR", "always")
+            .env(
+                "PATH",
+                format!("{}:{}", root.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap();
+        assert_eq!(
+            result.status.code(),
+            Some(expected_status),
+            "{mode}: {result:?}"
+        );
+        assert_eq!(fs::read_to_string(log).unwrap(), cargo_args);
+    }
+
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -760,6 +866,50 @@ fn focused_framework_loop_runs_every_selection_and_preserves_failure() {
         assert_eq!(fs::read_to_string(log).unwrap(), expected_log);
     }
     fs::remove_dir_all(root).unwrap();
+}
+
+/// The PostgreSQL Db gate runs in the native framework loop: the job has
+/// a PostgreSQL service, checks spinel-pg out at a pinned commit only when
+/// the plan selects the gate, and hands both to the loop step.
+#[test]
+fn framework_loop_supplies_postgres_and_pinned_spinel_pg_to_the_pg_gate() {
+    let ci: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
+    let sha = ci["env"]["SPINEL_PG_SHA"].as_str().unwrap();
+    assert!(
+        sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()),
+        "SPINEL_PG_SHA must be a full commit sha: {sha}"
+    );
+    let job = &ci["jobs"]["spinel-framework"];
+    let service = &job["services"]["postgres"];
+    assert!(service["image"].as_str().unwrap().starts_with("postgres:"));
+    assert_eq!(service["ports"][0].as_str(), Some("5432:5432"));
+    assert!(service["options"].as_str().unwrap().contains("pg_isready"));
+    let steps = job["steps"].as_sequence().unwrap();
+    let checkout = steps
+        .iter()
+        .find(|step| step["with"]["repository"].as_str() == Some("rubys/spinel-pg"))
+        .expect("spinel-pg checkout");
+    assert_eq!(
+        checkout["with"]["ref"].as_str(),
+        Some("${{ env.SPINEL_PG_SHA }}")
+    );
+    assert_eq!(checkout["with"]["path"].as_str(), Some("spinel-pg"));
+    assert!(checkout["if"].as_str().unwrap().contains("'spinel_pg_db'"));
+    let run = steps
+        .iter()
+        .find(|step| step["name"].as_str() == Some("Run selected native framework checks"))
+        .unwrap();
+    assert_eq!(
+        run["env"]["SPINEL_PG_DIR"].as_str(),
+        Some("${{ github.workspace }}/spinel-pg")
+    );
+    assert!(
+        run["env"]["DATABASE_URL"]
+            .as_str()
+            .unwrap()
+            .contains("@127.0.0.1:5432/")
+    );
 }
 
 #[test]

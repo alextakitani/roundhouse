@@ -3603,6 +3603,12 @@ fn rewrite_defined_to_nil_check(expr: &mut Expr) {
         | ExprNode::ForwardKeywords
         | ExprNode::Defined { .. }
         | ExprNode::SelfRef => {}
+        ExprNode::ForwardKeywordsWithPairs { entries } => {
+            for (key, value) in entries {
+                rewrite_defined_to_nil_check(key);
+                rewrite_defined_to_nil_check(value);
+            }
+        }
         ExprNode::Hash { entries, .. } => {
             for (k, v) in entries {
                 rewrite_defined_to_nil_check(k);

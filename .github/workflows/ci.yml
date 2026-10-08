@@ -52,6 +52,10 @@ env:
   RUBY_BENCH_SHA: d771f81f1ce9db51376e03ca7b8e6a83160556d4
   CAMPFIRE_SHA: 90b330024dec3e757c79b6a7e6568f93da8e3148
   WRITEBOOK_SHA: f3fadd21907ad9b18cb23800d971c2cc25045e2a
+  # rubys/spinel-pg, the PostgreSQL driver the Spinel Db shim
+  # (runtime/spinel/db_pg.rb) is tested against in spinel-framework.
+  # Pinned like the apps above; bump deliberately.
+  SPINEL_PG_SHA: f48735c91aa8cde258299e1189957972667a0d1f
 
 jobs:
   plan:
@@ -590,7 +594,9 @@ jobs:
       # policy. CRuby binds through FFI, so the library is enough; headers
       # are the compiled Spinel job.
       - name: System libvips for the emitted ruby-vips processor
-        timeout-minutes: 8
+        # libvips42 pulls a large dep tree; slow Azure apt burned 8m on
+        # campfire-conformance in Full validation 37689396098 (libvips42+ffmpeg).
+        timeout-minutes: 20
         run: |
           "$GITHUB_WORKSPACE/scripts/ci-apt-install" libvips42
       # One gem process: three sequential `gem install` steps were paying
@@ -986,10 +992,27 @@ jobs:
     timeout-minutes: 25
 
     continue-on-error: ${{ needs.plan.outputs.spinel-advisory == 'true' }}
+    # spinel_pg_db runs the PostgreSQL Db shim against this server.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
     env:
       MAKEFLAGS: "-j4"
     steps:
       - uses: actions/checkout@v7
+      - name: Check out spinel-pg (pinned)
+        if: ${{ contains(fromJSON(needs.plan.outputs.spinel-tests), 'spinel_pg_db') }}
+        uses: actions/checkout@v7
+        with:
+          repository: rubys/spinel-pg
+          ref: ${{ env.SPINEL_PG_SHA }}
+          path: spinel-pg
       - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@v2
       - uses: actions/download-artifact@v8
@@ -1010,6 +1033,9 @@ jobs:
       - name: Run selected native framework checks
         env:
           TESTS: ${{ join(fromJSON(needs.plan.outputs.spinel-tests), ' ') }}
+          # Inputs of spinel_pg_db only; it fails without them.
+          SPINEL_PG_DIR: ${{ github.workspace }}/spinel-pg
+          DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
         run: |
           test -n "$TESTS"
           status=0
@@ -1067,7 +1093,8 @@ jobs:
     # upload cannot skip into a green compact gate (#317).
     if: ${{ contains(fromJSON(needs.plan.outputs.jobs), 'campfire-compare') && needs.build-roundhouse.outputs.roundhouse-bin-artifact-id != '' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    # 55m: leave room after a slow 20m libvips42 apt for oracle/emit.
+    timeout-minutes: 55
 
     services:
       redis:
@@ -1112,7 +1139,8 @@ jobs:
       # app's own hardening line.
       # CRuby binds libvips through FFI; only compiled Spinel needs headers.
       - name: System libvips
-        timeout-minutes: 8
+        # Same slow-mirror bound as libvips-dev (#590) / campfire-conformance.
+        timeout-minutes: 20
         run: |
           "$GITHUB_WORKSPACE/scripts/ci-apt-install" libvips42 sqlite3
       - name: Cache the prepared oracle
@@ -1198,9 +1226,13 @@ jobs:
       - name: System libvips + libsqlite3-dev + libjemalloc-dev
         # libvips-dev pulls ~150 packages; slow Azure apt has burned 8m
         # mid-download (Full validation 37683643149 campfire-smoke).
+        # Cache .deb archives (not dpkg); still run ci-apt-install. Shared
+        # package set with smoke/compare/db-diff so one cache key warms all.
+        # Keep the 20m step budget (#590): cache miss still hits the network.
         timeout-minutes: 20
-        run: |
-          "$GITHUB_WORKSPACE/scripts/ci-apt-install" libvips-dev libsqlite3-dev libjemalloc-dev
+        uses: ./.github/actions/ci-apt-install-cached
+        with:
+          packages: libvips-dev libsqlite3-dev libjemalloc-dev sqlite3
       - name: Fetch pinned once-campfire
         timeout-minutes: 5
         run: |
@@ -1354,9 +1386,11 @@ jobs:
         # the producer link set. libvips-dev is ~150 packages — keep the
         # step bound high enough for slow Azure apt (8m was exhausted on
         # Full validation 37683643149 campfire-smoke mid-download).
+        # .deb archive cache via ci-apt-install-cached; #590 timeouts stay.
         timeout-minutes: 20
-        run: |
-          "$GITHUB_WORKSPACE/scripts/ci-apt-install" libvips-dev libsqlite3-dev libjemalloc-dev sqlite3
+        uses: ./.github/actions/ci-apt-install-cached
+        with:
+          packages: libvips-dev libsqlite3-dev libjemalloc-dev sqlite3
       - name: Fetch pinned once-campfire
         timeout-minutes: 5
         run: |
@@ -1452,8 +1486,9 @@ jobs:
           echo "$PWD/spinel-dist" >> $GITHUB_PATH
       - name: System libvips + libsqlite3-dev + libjemalloc-dev
         timeout-minutes: 20
-        run: |
-          "$GITHUB_WORKSPACE/scripts/ci-apt-install" libvips-dev libsqlite3-dev libjemalloc-dev sqlite3
+        uses: ./.github/actions/ci-apt-install-cached
+        with:
+          packages: libvips-dev libsqlite3-dev libjemalloc-dev sqlite3
       - name: Fetch pinned once-campfire
         run: |
           curl -fsSL "https://codeload.github.com/basecamp/once-campfire/tar.gz/${CAMPFIRE_SHA}" -o /tmp/campfire.tar.gz
@@ -1477,7 +1512,8 @@ jobs:
     # upload cannot skip into a green compact gate (#317).
     if: ${{ contains(fromJSON(needs.plan.outputs.jobs), 'campfire-conformance') && needs.build-roundhouse.outputs.roundhouse-bin-artifact-id != '' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    # 55m: libvips42+ffmpeg apt alone can take ~20m on a slow Azure day.
+    timeout-minutes: 55
 
     steps:
       - uses: actions/checkout@v7
@@ -1590,7 +1626,9 @@ jobs:
       #             and `Message::AttachmentTest` posts a .mov and asserts
       #             the poster frame got attached.
       - name: Install libvips (ruby-vips binds it through FFI) and ffmpeg
-        timeout-minutes: 8
+        # Full validation 37689396098: timed out at 8m mid-Get: on Azure apt
+        # (~libvips42 + ffmpeg). Match the 20m libvips-dev budget from #590.
+        timeout-minutes: 20
         run: |
           "$GITHUB_WORKSPACE/scripts/ci-apt-install" libvips42 ffmpeg
       #   concurrent-ruby, net-http-persistent, web-push — also from the
@@ -2153,6 +2191,22 @@ jobs:
           bundler-cache: true
           working-directory: ./fixtures/real-blog
       # Not separate jobs: each target's framework-tests and toolchain suites ride the compare job that already installs its toolchain (#273).
+      - name: cargo test --test rust_toolchain controller identity values
+        if: ${{ !cancelled() && matrix.target == 'rust' }}
+        run: |
+          if output=$(cargo test --locked --test rust_toolchain real_blog_controller_identity_values_match_rails -- --ignored --nocapture --exact 2>&1); then
+            cargo_status=0
+          else
+            cargo_status=$?
+          fi
+          printf '%s\n' "$output"
+          if [ "$cargo_status" -ne 0 ]; then
+            exit "$cargo_status"
+          fi
+          if ! grep -Fxq 'test real_blog_controller_identity_values_match_rails ... ok' <<< "$output"; then
+            echo '::error::Rust controller identity test did not execute successfully'
+            exit 1
+          fi
       - name: cargo test --test framework_tests_rust (green subset)
         id: inflector
         if: ${{ !cancelled() && matrix.target == 'rust' }}
@@ -2957,8 +3011,11 @@ jobs:
         # declares image variants), and the package links -lvips.
         # ~150 packages / ~47MB — 8m step timeout failed mid-download on
         # Full validation 37683643149 (slow Azure apt Ign:/Get cycles).
-        run: |
-          "$GITHUB_WORKSPACE/scripts/ci-apt-install" libsqlite3-dev libjemalloc-dev libvips-dev
+        # Host .deb archive cache (Docker lane already has BuildKit apt
+        # layers). Same package set as campfire-spinel jobs; #590 timeouts.
+        uses: ./.github/actions/ci-apt-install-cached
+        with:
+          packages: libvips-dev libsqlite3-dev libjemalloc-dev sqlite3
       - uses: actions/setup-node@v7
         with:
           node-version: '24'
@@ -3093,8 +3150,13 @@ jobs:
         run: |
           if [ "$SITE" = true ]; then
             cargo run --release --bin roundhouse -- --site
-          else
+          elif [ -n "$TARGETS" ]; then
             cargo run --release --bin roundhouse -- --archives "$TARGETS"
+          else
+            # Focus/path plans can select build-site with an empty archive
+            # list; never pass '' to --archives (unknown target).
+            echo "No browse archives selected; skipping emit"
+            mkdir -p _site
           fi
 
       # Live SharedWorker blog demo → _site/blog/. Emits real-blog under

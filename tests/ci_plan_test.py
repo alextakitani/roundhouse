@@ -568,7 +568,19 @@ class Routing(unittest.TestCase):
             ],
             "runtime/spinel/active_support_time_parsing.rb": [
                 "spinel_db_lease", *ci.PARAM_BIND_TESTS, "spinel_stmt_cache_lru",
-                "db_sqlite_concurrency",
+                "db_sqlite_concurrency", "spinel_pg_db",
+            ],
+            # The PostgreSQL shim owns only its own gate, not the SQLite
+            # database suites its `db` name would otherwise select.
+            "runtime/spinel/db_pg.rb": ["spinel_pg_db"],
+            "runtime/spinel/db_pg.rbs": ["spinel_pg_db"],
+            "runtime/spinel/pg_errors.rb": ["spinel_pg_db"],
+            "runtime/spinel/pg_errors.rbs": ["spinel_pg_db"],
+            "tests/spinel_pg_db_cases.rb": ["spinel_pg_db"],
+            "runtime/ruby/db.rbs": [
+                "framework_tests_spinel",
+                "spinel_db_lease", *ci.PARAM_BIND_TESTS, "spinel_stmt_cache_lru",
+                "db_sqlite_concurrency", "spinel_pg_db",
             ],
             "runtime/spinel/date.rb": ["date_columns_spinel"],
             "runtime/spinel/date.rbs": ["date_columns_spinel"],

@@ -995,12 +995,12 @@ pub(crate) fn model_defines_writer(model: &Model, field: &crate::ident::Symbol) 
 }
 
 /// Survey the same untyped synthesis used by emission. Source lookup stays
-/// with the caller: inherited library contracts can also be forwarding
-/// destinations, even when neither they nor the model declare `...`.
+/// with the caller, which selects the model-owned and inherited declarations
+/// whose selectors receive source argument packets.
 pub(crate) fn unretained_model_contracts<'a>(
     app: &'a crate::App,
-    mut inherited: impl FnMut(&'a Model) -> Vec<&'a MethodDef>,
-) -> HashSet<Span> {
+    mut selected: impl FnMut(&'a Model) -> Vec<&'a MethodDef>,
+) -> HashSet<(Span, ClassId)> {
     // Synthesis can report incidental emit warnings. A survey must neither
     // publish those nor consume an enclosing transpile's diagnostic buffer.
     crate::emit::diagnostics::scope(|| {
@@ -1008,8 +1008,8 @@ pub(crate) fn unretained_model_contracts<'a>(
         specs.mark_file_fields(&app.models);
         let mut missing = HashSet::new();
         for model in &app.models {
-            let inherited = inherited(model);
-            if inherited.is_empty()
+            let selected = selected(model);
+            if selected.is_empty()
                 && !model.methods().any(|m| m.params.iter().any(|p| p.forwarding))
             {
                 continue;
@@ -1029,16 +1029,17 @@ pub(crate) fn unretained_model_contracts<'a>(
                 if effective.name_span != source.name_span
                     || retained.is_none_or(|m| !preserved(source, m))
                 {
-                    missing.insert(source.name_span);
+                    missing.insert((source.name_span, model.name.clone()));
                 }
             }
-            for source in inherited {
-                // No own method means normal inheritance survives. An own
-                // synthesized override must retain the source contract.
+            for source in selected {
+                // A declaration selected by a source packet can be own or
+                // inherited. If this model's synthesis creates a same-name
+                // override, it must retain the selected source contract.
                 if built.iter().rev().find(|m| {
                     m.name == source.name && m.receiver == source.receiver
                 }).is_some_and(|m| !preserved(source, m)) {
-                    missing.insert(source.name_span);
+                    missing.insert((source.name_span, model.name.clone()));
                 }
             }
         }

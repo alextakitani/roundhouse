@@ -81,8 +81,8 @@ a custom or suppressed one is not reproduced, and the model layer
 applies supported literal defaults. A virtual table has no Postgres
 DDL, so that dialect returns an error for it. Postgres renders what
 ingest kept, so it shares the current ingest and IR limits.
-`schema.rb` ingest drops `array: true`; an index's `using:`, `order:`
-and `opclass:`, and expression indexes; precision on `numeric`,
+`schema.rb` ingest drops `array: true`; an index's `order:` and
+`opclass:`, and expression indexes; precision on `numeric`,
 `datetime` and `time`; a `limit:` of 1 or 2 on an `integer` column
 (so no `smallint`; 5 to 8 is a `bigint`, as in Rails); and schema
 qualifiers. The key forms the
@@ -105,6 +105,15 @@ A Postgres dump's `::text` casts or `= ANY (ARRAY[…])` fall outside it;
 that index is unique over every row, and the transpile names it in a
 warning. The migration fold refuses to rename or remove a column a
 predicate names.
+An index's literal access method is kept from `schema.rb`'s `using:` or
+`structure.sql`'s `USING` clause and quoted in PostgreSQL DDL. Schema Ruby
+methods must be ASCII unquoted SQL identifiers and are folded to lowercase.
+The `structure.sql` parser likewise folds ASCII unquoted methods and retains
+the case of quoted methods. PostgreSQL DDL preserves these methods;
+SQLite DDL uses SQLite's default index method, so query plans and index
+performance can differ while row semantics stay the same. Custom PostgreSQL
+methods are preserved as identifiers, but their extension must already be
+installed by a PostgreSQL deployment.
 Postgres column types map to their SQLite storage at
 ingest (`uuid` → TEXT via `ColumnType::Uuid`, `jsonb` → json,
 `citext` → text, `timestamptz` → datetime, `inet`/`cidr`/`macaddr`/
@@ -144,8 +153,10 @@ four variants — `Explicit`, `Root`, `Resources`, and `Scope`
 carries (`Resources` knows about singular `resource` and `as:`
 renames; `Explicit` records its `member`/`collection` scope).
 
-**Ingest:** `src/ingest/routes.rs::ingest_routes`. Finds the outer
-`Rails.application.routes.draw do … end` and walks its statements.
+**Ingest:** `src/ingest/routes.rs::ingest_routes` finds the outer
+`Rails.application.routes.draw do … end` and walks its statements. Whole-app
+ingest also supplies source-backed engine metadata to
+`ingest_routes_with_engines` for the literal mount slice described below.
 The recognizer covers the verb shortcuts (`get`/`post`/…), `match`,
 `root`, `resources`/`resource` (with `only:`/`except:`/`as:`/
 `controller:`/`param:`/`path:`, symbol or string spellings alike, as Rails
@@ -161,19 +172,59 @@ pass the check, sequences whose final expression passes it, and selected
 method calls. It checks for at most two required block parameters, named
 `_`, `params`, `request`, or `req`. Other dynamic targets outside this
 recognizer remain a separate known gap: they are dropped and reported only
-in survey mode. The mount diagnostic change does not broaden that boundary;
-recognizing or diagnosing those targets needs its own regressions.
+in survey mode. The engine-mount support below does not change those
+non-mount target semantics.
 
-Engine/Rack `mount` entries are omitted with a located error diagnostic
-carried on `RouteTable`, so normal analysis can report them beside other
-errors. Strict emission refuses those errors; `--allow-unsupported` can
-write the incomplete project. Survey mode additionally records the gap
-without clearing the error. The fixed runtime's top-level
-`mount ActionCable.server => "/cable"` (or `at: "/cable"`) is preserved;
-custom helper names (`as:`), paths, and enclosing route wrappers remain
-unsupported because the fixed runtime does not model them.
-The existing CRuby/JRuby pruning policy still omits Cable from apps without
-a live broadcast surface; the mount exemption does not change that policy.
+One literal isolated-engine mount shape is composed into the shared route
+scope: a top-level `mount Catalog::Engine, at: "/catalog"` where the engine
+comes from a locked, in-tree `PATH` gem, declares one plain `Rails::Engine`
+subclass under `lib/` with a direct literal `isolate_namespace`, and has one
+source-backed `Catalog::Engine.routes.draw` block. The mount prefix must
+be a static, absolute, non-root path without a trailing slash. Its routes are
+flattened at the mount's source position with the engine controller
+namespace, so earlier host routes, engine routes, and later host routes retain
+their order. The prefix is matched as a path segment (`/catalogue` does not
+match `/catalog`); the mounted root accepts both `/catalog` and
+`/catalog/`.
+
+The engine's `lib/` source must have a plain load shape: literal `require` or
+`require_relative` calls may resolve only to another checked `.rb` file under
+that engine's `lib/`, with `require "rails/engine"` (optionally `.rb`) as the
+sole external bootstrap. Files may define namespace modules along the path
+to the engine owner and below it, plus classes without custom superclasses,
+instance methods, ordinary `self` methods, and scalar constants at the owner
+namespace and below; Ruby load-hook methods are excluded. At file level, only
+those declarations and the checked literal requires are accepted. The
+`Engine` declaration itself may only set its literal isolated namespace.
+Other load-time calls or computed declarations remain explicit mount errors,
+including initializer or middleware registration through a gem entrypoint.
+
+The engine route body is limited to bare, unconditional `root` and HTTP
+shortcut declarations whose paths, `to:` targets, controller/action options,
+and supported `as:`/`match via:` options are literal. Nonliteral targets
+and all `redirect(...)` route targets, `resources`/`resource`,
+`namespace`/`scope`, and other routing wrappers remain explicit errors; they
+are not flattened into public routes. The engine's route helpers and the
+host's named mount proxy helpers are not composed. Calls that could otherwise
+fall through to a same-named host helper receive a located `route mount`
+error. Rack applications and all other engine mount forms remain explicit
+errors, including dynamic or patterned prefixes, `as:` aliases,
+nested or repeated mounts, custom engine initializers and middleware, route
+constraints or conditional branches, route prepends, Devise visibility
+wrappers, and engine `direct` helpers. Strict emission refuses these errors;
+`--allow-unsupported` can write an incomplete project, and survey mode records
+the gap without clearing the diagnostic. Direct and literal reflective
+(`send`, `public_send`, or `__send__`) uses of engine route helpers or the
+mounted proxy are also located errors; engine helper proxies are not resolved
+to the host route table.
+The generic CRuby dispatch contract is exercised by
+`tests/emit_and_run.rs`; `tests/spinel_toolchain.rs` carries the ignored native
+Spinel HTTP witness.
+
+The fixed runtime's top-level `mount ActionCable.server => "/cable"` (or
+`at: "/cable"`) remains a separate exception. The existing CRuby/JRuby
+pruning policy still omits Cable from apps without a live broadcast surface;
+the literal engine support does not change that policy.
 
 
 **Downstream consumers (analyze/lower):**
