@@ -50,31 +50,42 @@ pub(super) fn definition<'pr>(node: &Node<'pr>) -> Option<ruby_prism::DefNode<'p
 }
 
 impl Visibility {
-    /// Resolve the lexical default applying to a declaration in registered
-    /// source. Synthesis passes use this when they turn DSL calls into
-    /// methods after the source walk has discarded the parser's visibility
-    /// table.
-    pub(super) fn declaration_default(source: &str, file: &str, offset: usize) -> MethodVisibility {
+    /// Recover lexical defaults for source declarations that a later pass
+    /// synthesizes into methods. Parse and walk each class body once per file.
+    pub(super) fn declaration_defaults(
+        source: &str,
+        file: &str,
+    ) -> HashMap<usize, MethodVisibility> {
         let parsed = ruby_prism::parse(source.as_bytes());
         let root = parsed.node();
-        let Some((_, class)) = super::util::find_all_classes_with_scope(&root)
+        let mut defaults = HashMap::new();
+        let bodies = super::util::find_all_classes_with_scope(&root)
             .into_iter()
-            .filter(|(_, class)| {
-                let location = class.location();
-                location.start_offset() <= offset && offset < location.end_offset()
-            })
-            .min_by_key(|(_, class)| {
-                let location = class.location();
-                location.end_offset() - location.start_offset()
-            })
-        else {
-            return MethodVisibility::Public;
-        };
-        let body = class.body();
-        Self::resolve(body.as_ref(), file, None)
-            .ok()
-            .and_then(|visibility| visibility.defaults.get(&offset).copied())
-            .unwrap_or_default()
+            .filter_map(|(_, class)| class.body())
+            .chain(
+                super::util::find_all_module_declarations_with_scope(&root)
+                    .into_iter()
+                    .filter_map(|(_, module)| module.body()),
+            );
+        for body in bodies {
+            if let Ok(visibility) = Self::resolve(Some(&body), file, None) {
+                defaults.extend(visibility.defaults);
+            }
+            for statement in flatten_statements(body) {
+                let Some(call) = statement.as_call_node() else { continue };
+                if call.receiver().is_some() || constant_id_str(&call.name()) != "included" {
+                    continue;
+                }
+                let block_body = call
+                    .block()
+                    .and_then(|block| block.as_block_node())
+                    .and_then(|block| block.body());
+                if let Ok(visibility) = Self::resolve(block_body.as_ref(), file, None) {
+                    defaults.extend(visibility.defaults);
+                }
+            }
+        }
+        defaults
     }
 
     pub(super) fn resolve(

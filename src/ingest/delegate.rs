@@ -36,6 +36,8 @@
 //! the arity coming from the TARGET's own signature rather than from
 //! call sites.
 
+use std::collections::HashMap;
+
 use crate::dialect::{LibraryClass, MethodDef, MethodReceiver, MethodVisibility};
 use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::Symbol;
@@ -52,6 +54,7 @@ struct Delegation {
     /// it can't; callers fall back to the pass's own `"<delegate>"`
     /// label for a synthesis-failure report rather than misattribute.
     file: String,
+    declaration_span: crate::span::Span,
     visibility: MethodVisibility,
 }
 
@@ -154,6 +157,7 @@ pub(super) fn expand_delegates(
     let called_with_args = names_called_with_arguments(methods, additional_method_bodies);
     let delegates = take_delegate_decls_from_calls(
         unknown_calls,
+        methods,
         &called_with_args,
         blocked_names,
         supported_target_methods,
@@ -182,6 +186,11 @@ pub(super) fn expand_delegates(
                     .find(|delegate| delegate.name == method.name.as_str())
                 {
                     method.visibility = delegate.visibility;
+                    method.name_span = crate::span::Span {
+                        file: delegate.declaration_span.file,
+                        start: delegate.declaration_span.start,
+                        end: delegate.declaration_span.start,
+                    };
                 }
                 method
             })
@@ -201,12 +210,15 @@ pub(super) fn expand_delegates(
 /// every other shape in `unknown_calls` rather than half-expanded.
 fn take_delegate_decls_from_calls(
     unknown_calls: &mut Vec<Expr>,
+    methods: &[MethodDef],
     called_with_args: &CallsWithArguments,
     blocked_names: &std::collections::HashSet<String>,
     supported_target_methods: Option<&std::collections::HashSet<(String, String, usize)>>,
     sources: &[crate::span::SourceFile],
 ) -> Vec<Delegation> {
     let mut out: Vec<Delegation> = Vec::new();
+    let mut visibility_cache: HashMap<crate::span::FileId, HashMap<usize, MethodVisibility>> =
+        HashMap::new();
     unknown_calls.retain(|call| {
         let ExprNode::Send {
             recv: None,
@@ -347,28 +359,32 @@ fn take_delegate_decls_from_calls(
         // not evidence this pass can't cover it — it's what every
         // setter call looks like, delegated or not.
         let file = super::sources::path_of(call.span.file).unwrap_or_default();
-        let visibility = super::sources::with_text(&file, |source| {
-            super::visibility::Visibility::declaration_default(
-                source,
-                &file,
-                call.span.start as usize,
-            )
-        })
-        .or_else(|| {
-            call.span
-                .file
-                .0
-                .checked_sub(1)
-                .and_then(|index| sources.get(index as usize))
-                .map(|source| {
-                    super::visibility::Visibility::declaration_default(
-                        &source.text,
-                        &source.path,
-                        call.span.start as usize,
-                    )
-                })
-        })
-        .unwrap_or_default();
+        let visibility_defaults = visibility_cache.entry(call.span.file).or_insert_with(|| {
+            super::sources::with_text(&file, |source| {
+                super::visibility::Visibility::declaration_defaults(source, &file)
+            })
+            .or_else(|| {
+                call.span
+                    .file
+                    .0
+                    .checked_sub(1)
+                    .and_then(|index| sources.get(index as usize))
+                    .map(|source| {
+                        super::visibility::Visibility::declaration_defaults(
+                            &source.text,
+                            &source.path,
+                        )
+                    })
+            })
+            .unwrap_or_default()
+        });
+        let Some(&visibility) = visibility_defaults.get(&(call.span.start as usize)) else {
+            super::survey::record(&crate::ingest::IngestError::Unsupported {
+                file,
+                message: "delegate visibility could not be resolved from its source".into(),
+            });
+            return true;
+        };
         let mut entries = Vec::new();
         for m in names {
             let prefix = prefix
@@ -378,7 +394,21 @@ fn take_delegate_decls_from_calls(
                 || m.as_str().to_string(),
                 |prefix| format!("{prefix}_{}", m.as_str()),
             );
-            if blocked_names.contains(&name) {
+            let earlier_local_definition = methods.iter().any(|method| {
+                method.receiver == MethodReceiver::Instance
+                    && method.name.as_str() == name
+                    && method.name_span.file == call.span.file
+                    && method.name_span.start < call.span.start
+            });
+            let later_local_definition = methods.iter().any(|method| {
+                method.receiver == MethodReceiver::Instance
+                    && method.name.as_str() == name
+                    && method.name_span.file == call.span.file
+                    && method.name_span.start > call.span.start
+            });
+            if blocked_names.contains(&name)
+                && (!earlier_local_definition || later_local_definition)
+            {
                 unknown_option = true;
                 break;
             }
@@ -408,6 +438,7 @@ fn take_delegate_decls_from_calls(
                 target: target.clone(),
                 name,
                 file: file.clone(),
+                declaration_span: call.span,
                 visibility,
             });
         }
@@ -601,15 +632,20 @@ fn synthesized_source(
     methods: &[MethodDef],
     delegates: &[Delegation],
 ) -> String {
-    let defines = |name: &str| {
-        methods
-            .iter()
-            .any(|m| m.receiver == MethodReceiver::Instance && m.name.as_str() == name)
+    let defined_after = |name: &str, declaration: crate::span::Span| {
+        methods.iter().any(|method| {
+            method.receiver == MethodReceiver::Instance
+                && method.name.as_str() == name
+                && method.name_span.file == declaration.file
+                && method.name_span.start > declaration.start
+        })
     };
     let mut body = String::new();
     let mut generated_names = std::collections::HashSet::new();
     for d in delegates.iter().rev() {
-        if defines(&d.name) {
+        // A later explicit definition wins, while a delegate declaration
+        // that follows an earlier definition replaces it just as Rails does.
+        if defined_after(&d.name, d.declaration_span) {
             continue;
         }
         if !generated_names.insert(d.name.as_str()) {
@@ -669,6 +705,7 @@ mod tests {
         let called_with_args = names_called_with_arguments(&lc.methods, &[]);
         take_delegate_decls_from_calls(
             &mut lc.unknown_calls,
+            &lc.methods,
             &called_with_args,
             &std::collections::HashSet::new(),
             None,
@@ -822,6 +859,7 @@ mod tests {
         let called_with_args = names_called_with_arguments(&model.methods, &concern_bodies);
         let delegates = take_delegate_decls_from_calls(
             &mut model.unknown_calls,
+            &model.methods,
             &called_with_args,
             &std::collections::HashSet::new(),
             None,
@@ -844,6 +882,7 @@ mod tests {
         let called_with_args = names_called_with_arguments(&model.methods, &[]);
         let delegates = take_delegate_decls_from_calls(
             &mut model.unknown_calls,
+            &model.methods,
             &called_with_args,
             &["title".to_string()].into_iter().collect(),
             None,

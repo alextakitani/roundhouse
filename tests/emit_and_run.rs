@@ -51,6 +51,33 @@ fn model_concern_delegate_through_belongs_to_runs() {
     assert!(run.stdout.contains("model concern delegate passed"));
 }
 
+#[test]
+fn later_delegate_replaces_an_earlier_handwritten_method() {
+    let run = delegate_association::overlay()
+        .write(
+            "app/models/comment.rb",
+            r#"class Comment < ApplicationRecord
+  belongs_to :article
+
+  def article_body
+    "handwritten"
+  end
+
+  delegate :body, to: :article, prefix: true
+end
+"#,
+        )
+        .run_ruby(
+            r#"article = Article.create!(title: "Association title", body: "article body")
+comment = Comment.create!(article: article, commenter: "Reader", body: "Comment body")
+raise "later delegate did not replace the earlier method" unless comment.article_body == "article body"
+puts "later delegate ordering passed"
+"#,
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("later delegate ordering passed"));
+}
+
 /// A class object and its instances that define the same names: each
 /// side's call types and runs as that side's method.
 #[test]
