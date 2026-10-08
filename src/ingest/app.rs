@@ -203,8 +203,9 @@ fn keep_initializer_defined(
                 && f.text.match_indices(name).any(|(i, _)| {
                     let before = f.text[..i].chars().next_back();
                     let after = f.text[i + name.len()..].chars().next();
+                    // Not only `X.` / `X::`: forem reads `ApplicationConfig["KEY"]`.
                     !before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == ':')
-                        && matches!(after, Some('.') | Some(':'))
+                        && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
                 })
         })
     };
