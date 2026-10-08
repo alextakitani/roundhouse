@@ -64,7 +64,20 @@ SPINEL_TESTS = [
     "db_sqlite_concurrency",
     "spinel_param_builder",
     "rails_compat_vectors_spinel",
+    "spinel_pg_db",
 ]
+# Inputs of the PostgreSQL Db gate (tests/spinel_pg_db.rs): the shim, its
+# RBS, the contract and time parsing it compiles with, and the cases.
+PG_DB_INPUTS = {
+    "runtime/spinel/db_pg.rb",
+    "runtime/spinel/db_pg.rbs",
+    "runtime/spinel/pg_errors.rb",
+    "runtime/spinel/pg_errors.rbs",
+    "runtime/ruby/db.rbs",
+    "runtime/spinel/active_support_time_parsing.rb",
+    "runtime/spinel/active_support_time_parsing.rbs",
+    "tests/spinel_pg_db_cases.rb",
+}
 SPINEL11 = [
     "spinel-build",
     "spinel-framework",
@@ -223,6 +236,8 @@ def native_coverage(path):
                 break
     if path == "runtime/spinel/test/statement_cache_cases.rb":
         suites.add("param_binds")
+    if path in PG_DB_INPUTS:
+        suites.add("spinel_pg_db")
     if path in {
         "tests/support/emit_and_run.rs",
         "src/lower/model_to_library/adapter_emit.rs",
@@ -247,7 +262,11 @@ def native_coverage(path):
             )
         ) or path.startswith("runtime/spinel/tep/url."):
             owned_tests.add("rails_compat_vectors_spinel")
-        if any(
+        if name in {"db_pg.rb", "db_pg.rbs", "pg_errors.rb", "pg_errors.rbs"}:
+            # PostgreSQL, not SQLite: the SQLite database suites below
+            # never load it.
+            owned_tests.add("spinel_pg_db")
+        elif any(
             word in path for word in ("/db", "sqlite", "active_support_time_parsing")
         ):
             # Shared database inputs own lease/ownership, binds, cache recency,

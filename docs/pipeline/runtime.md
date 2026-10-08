@@ -85,6 +85,24 @@ in `src/project.rs`. Shape notes worth knowing:
   `scaffold/` tree overlaid into
   every emitted Ruby/Spinel project, and a `test/` tree of
   target-specific test files.
+- `runtime/spinel/db_pg.rb` implements the same `Db` contract over
+  PostgreSQL, on the pure-Ruby spinel-pg driver (no libpq). No target
+  selects it yet. `tests/spinel_pg_db.rs` compiles it with Spinel and
+  runs it against a live server.
+  - `Db.exec_returning` answers the returned rows.
+  - `Db.last_insert_rowid` reads the inserted table's own sequence, so
+    it works for serial and identity keys only; any other key raises.
+  - Server errors whose SQLSTATE ActiveRecord names are raised as that
+    class through `runtime/spinel/pg_errors.rb`.
+  - A transaction keeps its connection, and a lease that ends inside
+    one rolls it back.
+  - The pool is sharded per thread, as `runtime/spinel/db.rb`'s is.
+    `Db.prepare` runs through a named statement cached per connection
+    (at most 128, closed on the server when evicted); finalizing a read
+    releases its handle and keeps the statement. There is no request
+    query cache yet.
+  - The SQLite-only boot hooks (read snapshot, checkpointer) do
+    nothing there, and `seed_from_file` raises.
 
 ## Framework runtime — `runtime/ruby/`
 
