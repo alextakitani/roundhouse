@@ -3742,6 +3742,155 @@ fn a_partial_reading_a_reserved_word_local_assign_runs() {
     run.assert_passes();
 }
 
+/// `Rails.application.routes.recognize_path` in a helper. `check` was
+/// clean, and the emitted app raised NameError on `#routes`. Each
+/// expected value is the output of Rails 7.2.4 for the same routes.
+/// Rails returns Symbol keys with String values, puts `:format` last,
+/// and raises `ActionController::RoutingError` when no route matches.
+/// Rails takes a full URL, and normalizes any other path: one leading
+/// slash, no doubled slashes and no trailing slash. The error message
+/// shows the normalized path.
+/// The `:method` of the second argument is the verb, a Symbol or a
+/// String in any case, and GET is the default. A verb that Rails does
+/// not accept raises `ActionController::UnknownHttpMethod`, which is not
+/// a `RoutingError`. The helper rescues it as a `StandardError`: app
+/// code that names the class gets a `check` error.
+/// The emitted view does not escape the result of a helper call, and
+/// Rails does. The `(&quot;|")` alternative in the message check only
+/// tolerates that gap, which exists before this test.
+#[test]
+fn a_helper_recognizes_a_path_with_the_application_routes() {
+    let run = on_the_index(
+        emit_and_run::real_blog().write(
+            "app/helpers/articles_helper.rb",
+            r##"module ArticlesHelper
+  def route_of(path, environment = {})
+    recognized = Rails.application.routes.recognize_path(path, environment)
+    recognized.map { |key, value| "#{key}=#{value}" }.join(" ")
+  rescue ActionController::RoutingError => e
+    "none: #{e.message}"
+  rescue StandardError => e
+    "#{e.class.name}: #{e.message}"
+  end
+end
+"##,
+        ),
+        r#"<i id="rp-index"><%= route_of("/articles") %></i>
+<i id="rp-show"><%= route_of("/articles/7?tab=comments") %></i>
+<i id="rp-fragment"><%= route_of("/articles/7#comments") %></i>
+<i id="rp-root"><%= route_of("/") %></i>
+<i id="rp-json"><%= route_of("/articles/7.json") %></i>
+<i id="rp-missing"><%= route_of("/nowhere") %></i>
+<i id="rp-get"><%= route_of("/articles", method: :get) %></i>
+<i id="rp-post"><%= route_of("/articles", method: :post) %></i>
+<i id="rp-string"><%= route_of("/articles/7/comments/3", method: "Delete") %></i>
+<i id="rp-no-verb"><%= route_of("/articles", method: :put) %></i>
+<i id="rp-direct"><%= Rails.application.routes.recognize_path("/articles", method: :post)[:action] %></i>
+<i id="rp-head"><%= route_of("/articles/7", method: :head) %></i>
+<i id="rp-any"><%= route_of("/articles", method: :any) %></i>
+<i id="rp-foo"><%= route_of("/articles", method: :foo) %></i>
+<i id="rp-url"><%= route_of("http://example.com/articles/7") %></i>
+<i id="rp-url-port"><%= route_of("https://example.com:3000/articles?x=1") %></i>
+<i id="rp-relative"><%= route_of("articles/7") %></i>
+<i id="rp-relative-miss"><%= route_of("nowhere") %></i>
+<i id="rp-relative-url-query"><%= route_of("articles/7?next=http://x") %></i>
+<i id="rp-doubled"><%= route_of("/articles//7") %></i>
+<i id="rp-trailing-miss"><%= route_of("/nowhere/") %></i>
+<i id="rp-bad-uri"><%= route_of("/articles/a b") %></i>
+<i id="rp-url-trailing"><%= route_of("http://example.com/articles/7/") %></i>
+<i id="rp-percent"><%= route_of("/nowhere/%7e") %></i>
+<i id="rp-bad-uri-first"><%= route_of("/a b", method: :foo) %></i>
+<i id="rp-same"><%= Rails.application.routes.recognize_path("/articles/7.json") == { controller: "articles", action: "show", id: "7", format: "json" } %></i>
+"#,
+        r#"    assert_match(/<i id="rp-index">controller=articles action=index<\/i>/, response.body)
+    assert_match(/<i id="rp-show">controller=articles action=show id=7<\/i>/, response.body)
+    assert_match(/<i id="rp-fragment">controller=articles action=show id=7<\/i>/, response.body)
+    assert_match(/<i id="rp-root">controller=articles action=index<\/i>/, response.body)
+    assert_match(/<i id="rp-json">controller=articles action=show id=7 format=json<\/i>/, response.body)
+    assert_match(/<i id="rp-missing">none: No route matches (&quot;|")\/nowhere(&quot;|")<\/i>/, response.body)
+    assert_match(/<i id="rp-get">controller=articles action=index<\/i>/, response.body)
+    assert_match(/<i id="rp-post">controller=articles action=create<\/i>/, response.body)
+    assert_match(/<i id="rp-string">controller=comments action=destroy article_id=7 id=3<\/i>/, response.body)
+    assert_match(/<i id="rp-no-verb">none: No route matches (&quot;|")\/articles(&quot;|")<\/i>/, response.body)
+    assert_match(/<i id="rp-direct">create<\/i>/, response.body)
+    assert_match(/<i id="rp-head">controller=articles action=show id=7<\/i>/, response.body)
+    assert_includes(response.body, '<i id="rp-any">ActionController::UnknownHttpMethod: ANY, accepted HTTP methods are OPTIONS, GET, HEAD, POST, PUT, DELETE, TRACE, CONNECT, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE, LOCK, UNLOCK, VERSION-CONTROL, REPORT, CHECKOUT, CHECKIN, UNCHECKOUT, MKWORKSPACE, UPDATE, LABEL, MERGE, BASELINE-CONTROL, MKACTIVITY, ORDERPATCH, ACL, SEARCH, MKCALENDAR, and PATCH</i>')
+    assert_match(/<i id="rp-foo">ActionController::UnknownHttpMethod: FOO, accepted HTTP methods are OPTIONS, GET, /, response.body)
+    assert_match(/<i id="rp-url">controller=articles action=show id=7<\/i>/, response.body)
+    assert_match(/<i id="rp-url-port">controller=articles action=index<\/i>/, response.body)
+    assert_match(/<i id="rp-relative">controller=articles action=show id=7<\/i>/, response.body)
+    assert_match(/<i id="rp-relative-miss">none: No route matches (&quot;|")\/nowhere(&quot;|")<\/i>/, response.body)
+    assert_match(/<i id="rp-relative-url-query">controller=articles action=show id=7<\/i>/, response.body)
+    assert_match(/<i id="rp-doubled">controller=articles action=show id=7<\/i>/, response.body)
+    assert_match(/<i id="rp-trailing-miss">none: No route matches (&quot;|")\/nowhere(&quot;|")<\/i>/, response.body)
+    assert_match(/<i id="rp-bad-uri">none: bad URI \(is not URI\?\): (&quot;|")\/articles\/a b(&quot;|")<\/i>/, response.body)
+    assert_match(/<i id="rp-url-trailing">none: No route matches (&quot;|")http:\/\/example.com\/articles\/7\/(&quot;|")<\/i>/, response.body)
+    assert_match(/<i id="rp-percent">none: No route matches (&quot;|")\/nowhere\/%7E(&quot;|")<\/i>/, response.body)
+    assert_match(/<i id="rp-bad-uri-first">none: bad URI \(is not URI\?\): (&quot;|")\/a b(&quot;|")<\/i>/, response.body)
+    assert_match(/<i id="rp-same">true<\/i>/, response.body)
+"#,
+    );
+    run.assert_passes();
+}
+
+/// `recognize_path` gives the Rails controller path, not the flat
+/// router name, for a namespaced controller, for the health controller
+/// and for the Active Storage controllers. It skips a redirect route and
+/// tries the later routes, as Rails does. The app has no root route, so
+/// `/` matches no route. Each expected value is the output of Rails
+/// 7.2.4 for the same routes.
+#[test]
+fn a_helper_recognizes_controller_paths_and_skips_redirect_routes() {
+    let run = on_the_index(
+        emit_and_run::real_blog()
+            .edit("config/routes.rb", "  root \"articles#index\"\n", "")
+            .edit(
+                "config/routes.rb",
+                "  resources :articles do",
+                "  namespace :admin do\n    resources :articles, only: [:index]\n  end\n  \
+                 get \"old\", to: redirect(\"/articles\")\n  \
+                 get \"moved\", to: redirect(\"/articles\")\n  \
+                 get \"moved\", to: \"articles#index\"\n  \
+                 get \"up\" => \"rails/health#show\"\n  \
+                 resources :articles do",
+            )
+            .write(
+                "app/controllers/admin/articles_controller.rb",
+                "class Admin::ArticlesController < ApplicationController\n  def index\n    @articles = Article.all\n  end\nend\n",
+            )
+            .write("app/views/admin/articles/index.html.erb", "<p>admin</p>\n")
+            .write(
+                "app/helpers/articles_helper.rb",
+                r##"module ArticlesHelper
+  def route_of(path)
+    recognized = Rails.application.routes.recognize_path(path)
+    recognized.map { |key, value| "#{key}=#{value}" }.join(" ")
+  rescue ActionController::RoutingError => e
+    "none: #{e.message}"
+  end
+end
+"##,
+            ),
+        r#"<i id="rp-namespaced"><%= route_of("/admin/articles") %></i>
+<i id="rp-redirect"><%= route_of("/old") %></i>
+<i id="rp-after-redirect"><%= route_of("/moved") %></i>
+<i id="rp-health"><%= route_of("/up") %></i>
+<i id="rp-disk"><%= route_of("/rails/active_storage/disk/k/x.png") %></i>
+<i id="rp-blob"><%= route_of("/rails/active_storage/blobs/redirect/abc/x.png") %></i>
+<i id="rp-no-root"><%= route_of("/") %></i>
+"#,
+        r#"    assert_match(/<i id="rp-namespaced">controller=admin\/articles action=index<\/i>/, response.body)
+    assert_match(/<i id="rp-redirect">none: No route matches (&quot;|")\/old(&quot;|")<\/i>/, response.body)
+    assert_match(/<i id="rp-after-redirect">controller=articles action=index<\/i>/, response.body)
+    assert_match(/<i id="rp-health">controller=rails\/health action=show<\/i>/, response.body)
+    assert_match(/<i id="rp-disk">controller=active_storage\/disk action=show encoded_key=k filename=x format=png<\/i>/, response.body)
+    assert_match(/<i id="rp-blob">controller=active_storage\/blobs\/redirect action=show signed_id=abc filename=x format=png<\/i>/, response.body)
+    assert_match(/<i id="rp-no-root">none: No route matches (&quot;|")\/(&quot;|")<\/i>/, response.body)
+"#,
+    );
+    run.assert_passes();
+}
+
 /// B4 in NEXUS_BUGS.md: a partial in `app/views/application/` that a
 /// view in another directory renders. Rails looks in the view's own
 /// directory first, so a same-name partial there wins.

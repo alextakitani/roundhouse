@@ -3924,6 +3924,9 @@ fn apply_controller_dispatch(files: &mut [(String, String)], app: &App, lazy_req
             writeln!(arms, "    when :{sym} then {class}.new").unwrap();
         }
     }
+    if lazy_requires {
+        apply_controller_paths(files, &flat);
+    }
     if arms.is_empty() {
         return;
     }
@@ -3995,6 +3998,33 @@ fn apply_controller_dispatch(files: &mut [(String, String)], app: &App, lazy_req
                 .collect::<Vec<_>>()
                 .join("\n");
             content.push('\n');
+        }
+    }
+}
+
+/// Add `RouteTable::CONTROLLER_PATHS` to the routes.rb of a lazy tree.
+/// It maps the router symbol of a namespaced controller to the Rails
+/// controller path (`admin_posts: "admin/posts"`). The ruby overlay's
+/// `recognize_path` reads it. A top-level controller has no row, and
+/// `recognize_path` gives its router symbol. The path comes from the
+/// class name, so it differs from Rails for an acronym inflection
+/// (`admin/apikeys`, not `admin/api_keys`) or a digit after an
+/// underscore. Two controllers with the same router symbol share a row.
+fn apply_controller_paths(files: &mut [(String, String)], flat: &[crate::lower::FlatRoute]) {
+    let mut rows = std::collections::BTreeMap::new();
+    for r in flat {
+        let class = r.controller.0.as_str();
+        if class.contains("::") {
+            let base = class.strip_suffix("Controller").unwrap_or(class);
+            let sym = crate::lower::routes_to_library::controller_symbol(class);
+            rows.insert(sym, crate::naming::underscore(base));
+        }
+    }
+    let rows: Vec<String> = rows.iter().map(|(sym, path)| format!("{sym}: {path:?}")).collect();
+    let header = format!("module RouteTable\n  CONTROLLER_PATHS = {{ {} }}.freeze\n\n", rows.join(", "));
+    for (path, content) in files.iter_mut() {
+        if path == "config/routes.rb" && !content.contains("CONTROLLER_PATHS") {
+            *content = content.replacen("module RouteTable\n", &header, 1);
         }
     }
 }
@@ -8041,6 +8071,33 @@ mod tests {
         for (path, content) in &files {
             assert!(content.contains("[RouteTable.root] + RouteTable.table"), "{path}");
         }
+    }
+
+    /// The emitted `sig/config/routes.rbs` has the same `module RouteTable`
+    /// line as routes.rb. A Ruby constant there is not RBS.
+    #[test]
+    fn controller_paths_land_only_in_the_routes_file() {
+        let mut app = App::new();
+        app.routes.entries.push(crate::dialect::RouteSpec::Explicit {
+            method: crate::dialect::HttpMethod::Get,
+            path: "/admin/posts".to_string(),
+            controller: crate::ident::ClassId(crate::ident::Symbol::from("Admin::PostsController")),
+            action: crate::ident::Symbol::from("index"),
+            as_name: None,
+            constraints: Default::default(),
+            scope: Default::default(),
+        });
+        let module = "module RouteTable\nend\n".to_string();
+        let mut files = vec![
+            ("config/routes.rb".to_string(), module.clone()),
+            ("sig/config/routes.rbs".to_string(), module.clone()),
+        ];
+        apply_controller_paths(&mut files, &crate::lower::flatten_routes(&app));
+        assert_eq!(
+            files[0].1,
+            "module RouteTable\n  CONTROLLER_PATHS = { admin_posts: \"admin/posts\" }.freeze\n\nend\n"
+        );
+        assert_eq!(files[1].1, module);
     }
 
     #[test]
