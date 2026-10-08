@@ -160,6 +160,12 @@ fn count_gradual_recurse(e: &Expr, total: &mut usize) {
         | N::ForwardKeywords
         | N::Defined { .. }
         | N::SelfRef => {}
+        N::ForwardKeywordsWithPairs { entries } => {
+            for (key, value) in entries {
+                count_gradual_recurse(key, total);
+                count_gradual_recurse(value, total);
+            }
+        }
         N::If { cond, then_branch, else_branch } => {
             count_gradual_recurse(cond, total);
             count_gradual_recurse(then_branch, total);
@@ -277,6 +283,12 @@ fn collect_untyped(e: &Expr, path: &str, out: &mut Vec<String>) {
         | ExprNode::ForwardKeywords
         | ExprNode::Defined { .. }
         | ExprNode::SelfRef => {}
+        ExprNode::ForwardKeywordsWithPairs { entries } => {
+            for (key, value) in entries {
+                collect_untyped(key, path, out);
+                collect_untyped(value, path, out);
+            }
+        }
         ExprNode::If { cond, then_branch, else_branch } => {
             collect_untyped(cond, &format!("{path}/if.cond"), out);
             collect_untyped(then_branch, &format!("{path}/if.then"), out);

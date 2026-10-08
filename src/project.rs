@@ -1285,7 +1285,10 @@ fn report_native_ruby_syntax(app: &App, target: BuildTarget) {
     fn visit(expr: &crate::expr::Expr, target: BuildTarget) {
         use crate::expr::{ExprNode, LValue};
         let construct = match &*expr.node {
+            ExprNode::ForwardKeywords if target == BuildTarget::Spinel => None,
             ExprNode::ForwardKeywords => Some("anonymous keyword forwarding"),
+            ExprNode::ForwardKeywordsWithPairs { .. } if target == BuildTarget::Spinel => None,
+            ExprNode::ForwardKeywordsWithPairs { .. } => Some("anonymous keyword forwarding"),
             ExprNode::Defined { .. } => Some("runtime defined? query"),
             ExprNode::Assign { target: LValue::Var { name, .. }, .. }
             | ExprNode::OpAssign { target: LValue::Var { name, .. }, .. }
@@ -1377,18 +1380,17 @@ pub fn target_files(
             crate::emit::diagnostics::report_unsupported(method.name_span, target.as_str(), "parameter declaration", formal.description());
         }
         if !matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby) {
-            let named_keyword_rest = method.params.iter().any(|p| {
-                p.keyword && p.rest && !p.name.as_str().is_empty() && !p.forwarding
-            });
-            let anonymous_or_full = method.params.iter().any(|p| {
-                p.forwarding || (p.keyword && p.rest && p.name.as_str().is_empty())
-            });
-            // Spinel carries keyword parameters. A named `**details` is
-            // that parameter. Nameless `**` and `...` stay refused.
-            if matches!(target, BuildTarget::Spinel) && named_keyword_rest && !anonymous_or_full {
+            let keyword_rest = method
+                .params
+                .iter()
+                .any(|p| p.keyword && p.rest && !p.forwarding);
+            let full_forwarding = method.params.iter().any(|p| p.forwarding);
+            // Spinel carries both named `**details` and anonymous `**`
+            // keyword-rest parameters. Full `...` forwarding stays refused.
+            if matches!(target, BuildTarget::Spinel) && keyword_rest && !full_forwarding {
                 continue;
             }
-            let construct = if method.params.iter().any(|p| p.forwarding) {
+            let construct = if full_forwarding {
                 "full argument forwarding"
             } else if method.params.iter().any(|p| p.keyword && p.rest) {
                 "keyword rest declaration"

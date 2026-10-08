@@ -20,6 +20,27 @@ mod runtime_block_signature;
 mod data_factory;
 #[path = "support/rails_root_join.rs"]
 mod rails_root_join;
+#[path = "support/anonymous_keywords.rs"]
+mod anonymous_keywords;
+
+/// The same anonymous keyword packet survives defaulting, local-name
+/// collisions, and a virtual override in emitted CRuby. Effectful input
+/// values also stay left-to-right and run once.
+#[test]
+fn anonymous_keyword_forwarding_runs_without_capturing_or_reordering_values() {
+    let run = emit_and_run::real_blog()
+        .write(
+            "app/services/keyword_forwarder.rb",
+            anonymous_keywords::SOURCE,
+        )
+        .run_ruby(anonymous_keywords::ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("anonymous keyword forwarding contract passed"));
+    let emitted = std::fs::read_to_string(run.emitted.join("app/models/keyword_forwarder.rb"))
+        .expect("emitted keyword forwarding class");
+    assert!(emitted.contains("class KeywordForwarder"), "{emitted}");
+    assert!(emitted.contains("request(kind: :get, path: path, **)"), "{emitted}");
+}
 
 #[test]
 fn critic_corrections_preserve_class_objects_reflection_and_operators() {

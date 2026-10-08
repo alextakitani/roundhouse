@@ -2190,6 +2190,13 @@ impl<'a> BodyTyper<'a> {
             }
 
             ExprNode::ForwardArgs | ExprNode::ForwardKeywords => Ty::Untyped,
+            ExprNode::ForwardKeywordsWithPairs { entries } => {
+                for (key, value) in entries.iter_mut() {
+                    self.analyze_expr(key, ctx);
+                    self.analyze_expr(value, ctx);
+                }
+                Ty::Untyped
+            }
 
             ExprNode::Splat { value } | ExprNode::KeywordSplat { value } => {
                 // Splat propagates the inner expression's type
