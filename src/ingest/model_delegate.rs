@@ -166,7 +166,14 @@ fn included_concern_method_bodies(
             continue;
         }
         if let Some((included_methods, includes)) = concern_methods.get(&concern) {
-            methods.extend(included_methods.iter().map(|method| method.body.clone()));
+            methods.extend(
+                included_methods
+                    .iter()
+                    .filter(|method| {
+                        method.receiver == crate::dialect::MethodReceiver::Instance
+                    })
+                    .map(|method| method.body.clone()),
+            );
             pending.extend(includes.iter().cloned());
         }
     }

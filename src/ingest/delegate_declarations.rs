@@ -322,7 +322,12 @@ pub(super) fn names_called_with_arguments(
     additional_method_bodies: &[Expr],
 ) -> CallsWithArguments {
     let mut out = CallsWithArguments::new();
-    for method in methods {
+    // Class-side bodies cannot call these instance delegates without an
+    // explicit receiver, so only instance methods constrain forwarding.
+    for method in methods
+        .iter()
+        .filter(|method| method.receiver == crate::dialect::MethodReceiver::Instance)
+    {
         collect_calls_with_args(&method.body, &mut out);
     }
     for expr in additional_method_bodies {

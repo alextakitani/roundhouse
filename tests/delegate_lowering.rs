@@ -382,6 +382,31 @@ fn a_later_model_delegate_replaces_an_earlier_method_with_the_same_name() {
 }
 
 #[test]
+fn class_method_calls_do_not_suppress_instance_delegates() {
+    let mut files = tree("");
+    files.insert(
+        PathBuf::from("app/models/account.rb"),
+        b"class Account < ApplicationRecord\n  def title\n    \"account title\"\n  end\nend\n"
+            .to_vec(),
+    );
+    files.insert(
+        PathBuf::from("app/models/concerns/title_calls.rb"),
+        b"module TitleCalls\n  def self.preview\n    title(\"from concern\")\n  end\nend\n".to_vec(),
+    );
+    files.insert(
+        PathBuf::from("app/models/page.rb"),
+        b"class Page < ApplicationRecord\n  include TitleCalls\n  belongs_to :account\n  def self.preview\n    title(\"from model\")\n  end\n  delegate :title, to: :account\nend\n".to_vec(),
+    );
+
+    let mut app = ingest_app_from_tree(files).expect("ingest");
+    let page = emit_model(&mut app, "page.rb");
+    assert!(
+        page.contains("def title\n    self.account.title\n  end"),
+        "class-side calls must not require instance delegate argument forwarding:\n{page}"
+    );
+}
+
+#[test]
 fn a_delegate_to_a_private_target_method_is_left_alone() {
     let mut files = tree("");
     files.insert(
