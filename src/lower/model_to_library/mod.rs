@@ -399,6 +399,7 @@ pub(crate) fn lower_models_inner_with_ruby_values(
             if !unfold {
                 crate::lower::arel::rewrite_arel_in_expr_with_ruby_values(
                     &mut method.body, schema, &classes, &[], ruby_read_values,
+                    &HashSet::new(),
                 );
             }
             type_method_body(method, &classes, table, Some(model));
@@ -576,20 +577,22 @@ fn model_class(model: &Model, methods: Vec<MethodDef>, table: Option<&Table>) ->
     }
 }
 
-/// `mattr_accessor` / `cattr_accessor` `default:` / block seeds → class
-/// ivar writes emitted once on the model class object.
+/// `mattr_*` / `cattr_*` seeds → `@@attr = <expr>` on the model class
+/// object (Rails class-variable storage, shared with subclasses).
+/// Nil / absent-default seeds are conditional so subclass redeclarations
+/// do not wipe an inherited value (same guard as `mattr_nil_seed`).
 fn collect_class_attr_initializers(model: &Model) -> Vec<Expr> {
+    use crate::ingest::library_class::{mattr_nil_seed, mattr_seed};
+
     model
         .class_attr_defaults
         .iter()
         .map(|(name, value)| {
-            Expr::new(
-                Span::synthetic(),
-                ExprNode::Assign {
-                    target: crate::expr::LValue::Ivar { name: name.clone() },
-                    value: value.clone(),
-                },
-            )
+            if matches!(&*value.node, ExprNode::Lit { value: Literal::Nil }) {
+                mattr_nil_seed(name)
+            } else {
+                mattr_seed(name, value.clone())
+            }
         })
         .collect()
 }
@@ -678,13 +681,12 @@ fn report_unclaimed_unknowns(model: &Model, schema: &Schema) {
         if matches!(name, "attr_accessor" | "attr_reader" | "attr_writer") {
             continue;
         }
-        // `has_one_attached :name` (with or without the variants
-        // block) — claimed by lower::attached on exactly that shape, a
-        // name and any block. Campfire's three (`avatar`, `attachment`,
+        // `has_one_attached` / `has_many_attached :name` (with or
+        // without a variants block) — claimed by lower::attached on
+        // exactly that shape. Campfire's three (`avatar`, `attachment`,
         // `logo`) were reported as not lowered on every emit while the
-        // attachment lowering ran on each. `has_many_attached` is not
-        // claimed by anything and keeps warning.
-        if name == "has_one_attached" {
+        // attachment lowering ran on each.
+        if name == "has_one_attached" || name == "has_many_attached" {
             if let ExprNode::Send { args, .. } = &*expr.node {
                 if !args.is_empty() {
                     continue;
@@ -977,6 +979,11 @@ pub fn writable_field_set(
     for (_span, attr) in crate::lower::attached::attached_attrs(model) {
         writable.insert(attr);
     }
+    // `has_many_attached` is claimed for the proxy reader / `.attach` /
+    // `.attachments` surface only. There is no `attr=` / after_save
+    // writer yet (Many appends via the proxy, not mass-assign), so the
+    // attrs stay OUT of the writable set — putting them in would make
+    // `update(uploads: …)` / permit emit a missing writer (inv. 6).
     writable
 }
 
@@ -988,12 +995,12 @@ pub(crate) fn model_defines_writer(model: &Model, field: &crate::ident::Symbol) 
 }
 
 /// Survey the same untyped synthesis used by emission. Source lookup stays
-/// with the caller: inherited library contracts can also be forwarding
-/// destinations, even when neither they nor the model declare `...`.
+/// with the caller, which selects the model-owned and inherited declarations
+/// whose selectors receive source argument packets.
 pub(crate) fn unretained_model_contracts<'a>(
     app: &'a crate::App,
-    mut inherited: impl FnMut(&'a Model) -> Vec<&'a MethodDef>,
-) -> HashSet<Span> {
+    mut selected: impl FnMut(&'a Model) -> Vec<&'a MethodDef>,
+) -> HashSet<(Span, ClassId)> {
     // Synthesis can report incidental emit warnings. A survey must neither
     // publish those nor consume an enclosing transpile's diagnostic buffer.
     crate::emit::diagnostics::scope(|| {
@@ -1001,8 +1008,8 @@ pub(crate) fn unretained_model_contracts<'a>(
         specs.mark_file_fields(&app.models);
         let mut missing = HashSet::new();
         for model in &app.models {
-            let inherited = inherited(model);
-            if inherited.is_empty()
+            let selected = selected(model);
+            if selected.is_empty()
                 && !model.methods().any(|m| m.params.iter().any(|p| p.forwarding))
             {
                 continue;
@@ -1022,16 +1029,17 @@ pub(crate) fn unretained_model_contracts<'a>(
                 if effective.name_span != source.name_span
                     || retained.is_none_or(|m| !preserved(source, m))
                 {
-                    missing.insert(source.name_span);
+                    missing.insert((source.name_span, model.name.clone()));
                 }
             }
-            for source in inherited {
-                // No own method means normal inheritance survives. An own
-                // synthesized override must retain the source contract.
+            for source in selected {
+                // A declaration selected by a source packet can be own or
+                // inherited. If this model's synthesis creates a same-name
+                // override, it must retain the selected source contract.
                 if built.iter().rev().find(|m| {
                     m.name == source.name && m.receiver == source.receiver
                 }).is_some_and(|m| !preserved(source, m)) {
-                    missing.insert(source.name_span);
+                    missing.insert((source.name_span, model.name.clone()));
                 }
             }
         }
@@ -1188,9 +1196,12 @@ fn build_methods_with_finder_inputs(
     // Named plain-text association (`has_markdown`) — same slot; the
     // record's `content` column needs no coder override.
     crate::lower::plain_text_attr::push_plain_text_methods(&mut methods, model, schema);
-    // `has_one_attached` — the attachment-EXISTENCE reader, over the
-    // synthesized `ActiveStorage::Attachment` row. Same ordering
-    // rationale as the macros above (a hand-written method wins).
+    // `has_one_attached` / `has_many_attached` — the attachment
+    // readers, over the synthesized `ActiveStorage::Attachment` row.
+    // Same ordering rationale as the macros above (a hand-written
+    // method wins). The Attachment MODEL itself gets its blob helpers
+    // here too (`url` / `filename` / `content_type`).
+    crate::lower::attachment_model::push_attachment_record_methods(&mut methods, model);
     crate::lower::attached::push_attached_methods(&mut methods, model);
     push_user_methods(&mut methods, model);
     push_dom_prefix_method(&mut methods, model);

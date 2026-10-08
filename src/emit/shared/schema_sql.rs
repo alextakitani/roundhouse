@@ -188,12 +188,16 @@ pub fn render_schema_statements_for(schema: &Schema, dialect: Dialect) -> Result
         for idx in &table.indexes {
             let cols: Vec<String> = idx.columns.iter().map(|c| dialect.ident(c.as_str())).collect();
             let unique = if idx.unique { "UNIQUE " } else { "" };
+            let using = match (dialect, idx.using.as_deref()) {
+                (Dialect::Postgres, Some(method)) => format!(" USING {}", dialect.ident(method)),
+                _ => String::new(),
+            };
             let predicate = dialect
                 .index_predicate(table, idx)
                 .map(|p| format!(" WHERE {p}"))
                 .unwrap_or_default();
             out.push(format!(
-                "CREATE {unique}INDEX IF NOT EXISTS {} ON {} ({}){predicate}",
+                "CREATE {unique}INDEX IF NOT EXISTS {} ON {}{using} ({}){predicate}",
                 dialect.ident(idx.name.as_str()),
                 dialect.ident(table.name.as_str()),
                 cols.join(", "),
@@ -456,6 +460,82 @@ end
         );
     }
 
+    #[test]
+    fn postgres_preserves_btree_gin_and_custom_index_methods() {
+        let schema_rb = r#"ActiveRecord::Schema[8.1].define(version: 1) do
+  create_table "documents", force: :cascade do |t|
+    t.jsonb "payload"
+    t.string "slug"
+    t.index ["payload"], name: "index_documents_on_payload_gin", using: :gin
+    t.index ["slug"], name: "index_documents_on_slug_btree", using: :btree
+    t.index ["slug"], name: "index_documents_on_slug_custom", using: "custom_method"
+  end
+end
+"#;
+        let schema = ingest_schema(schema_rb.as_bytes(), "db/schema.rb").expect("schema");
+        let indexes = &schema.tables[&Symbol::from("documents")].indexes;
+        assert_eq!(indexes[0].using.as_deref(), Some("gin"));
+        assert_eq!(indexes[1].using.as_deref(), Some("btree"));
+        assert_eq!(indexes[2].using.as_deref(), Some("custom_method"));
+
+        assert_eq!(
+            render_schema_statements_for(&schema, Dialect::Postgres).unwrap()[1..],
+            [
+                "CREATE INDEX IF NOT EXISTS \"index_documents_on_payload_gin\" ON \"documents\" USING \"gin\" (\"payload\")",
+                "CREATE INDEX IF NOT EXISTS \"index_documents_on_slug_btree\" ON \"documents\" USING \"btree\" (\"slug\")",
+                "CREATE INDEX IF NOT EXISTS \"index_documents_on_slug_custom\" ON \"documents\" USING \"custom_method\" (\"slug\")",
+            ]
+        );
+        // PostgreSQL method metadata is intentionally absent from SQLite DDL.
+        assert_eq!(
+            render_schema_statements_for(&schema, Dialect::Sqlite).unwrap()[1..],
+            [
+                "CREATE INDEX IF NOT EXISTS index_documents_on_payload_gin ON documents (payload)",
+                "CREATE INDEX IF NOT EXISTS index_documents_on_slug_btree ON documents (slug)",
+                "CREATE INDEX IF NOT EXISTS index_documents_on_slug_custom ON documents (slug)",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_dynamic_index_method_is_an_ingest_error() {
+        let source = br#"ActiveRecord::Schema[8.1].define(version: 1) do
+  create_table "documents", force: :cascade do |t|
+    t.string "body"
+    t.index ["body"], using: index_method
+  end
+end
+"#;
+        let error = ingest_schema(source, "db/schema.rb").unwrap_err();
+        assert!(error.to_string().contains("must be a literal symbol or string"), "{error}");
+    }
+
+    #[test]
+    fn schema_rb_folds_method_names_and_rejects_sql_quoting() {
+        let source = br#"ActiveRecord::Schema[8.1].define(version: 1) do
+  create_table "documents", force: :cascade do |t|
+    t.string "body"
+    t.index ["body"], using: "GIN"
+  end
+end
+"#;
+        let schema = ingest_schema(source, "db/schema.rb").expect("schema");
+        assert_eq!(
+            schema.tables[&Symbol::from("documents")].indexes[0].using.as_deref(),
+            Some("gin")
+        );
+
+        let invalid = br#"ActiveRecord::Schema[8.1].define(version: 1) do
+  create_table "documents", force: :cascade do |t|
+    t.string "body"
+    t.index ["body"], using: "odd\"method"
+  end
+end
+"#;
+        let error = ingest_schema(invalid, "db/schema.rb").unwrap_err();
+        assert!(error.to_string().contains("ASCII unquoted SQL identifier"), "{error}");
+    }
+
     /// An integer's `limit:` is a byte size: solid_cache's `key_hash`
     /// (`limit: 8`) is a `bigint` on Postgres, as Rails creates it. A
     /// 64-bit hash does not fit the `integer` it used to render.
@@ -666,6 +746,7 @@ end
                 name: Symbol::from("index_user_on_createdAt"),
                 columns: vec![Symbol::from("createdAt")],
                 unique: true,
+                using: None,
                 predicate: None,
             }],
         )]);

@@ -81,6 +81,11 @@ pub struct Index {
     pub name: Symbol,
     pub columns: Vec<Symbol>,
     pub unique: bool,
+    /// PostgreSQL's `USING <access_method>`, when present in the source.
+    /// `None` is the database default (btree). The method is retained
+    /// because substituting btree can fail or remove index support for queries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub using: Option<String>,
     /// A partial index's predicate, the SQL of `t.index …, where:` (or
     /// of `CREATE INDEX … WHERE` in `structure.sql`) as the source
     /// database's dumper wrote it. On a unique index it decides which

@@ -16,10 +16,33 @@ mod strong_params;
 
 #[path = "support/class_configuration.rs"]
 mod class_configuration;
+#[path = "support/runtime_block_signature.rs"]
+mod runtime_block_signature;
 #[path = "support/data_factory.rs"]
 mod data_factory;
 #[path = "support/rails_root_join.rs"]
 mod rails_root_join;
+#[path = "support/anonymous_keywords.rs"]
+mod anonymous_keywords;
+
+/// The same anonymous keyword packet survives defaulting, local-name
+/// collisions, and a virtual override in emitted CRuby. Effectful input
+/// values also stay left-to-right and run once.
+#[test]
+fn anonymous_keyword_forwarding_runs_without_capturing_or_reordering_values() {
+    let run = emit_and_run::real_blog()
+        .write(
+            "app/services/keyword_forwarder.rb",
+            anonymous_keywords::SOURCE,
+        )
+        .run_ruby(anonymous_keywords::ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("anonymous keyword forwarding contract passed"));
+    let emitted = std::fs::read_to_string(run.emitted.join("app/models/keyword_forwarder.rb"))
+        .expect("emitted keyword forwarding class");
+    assert!(emitted.contains("class KeywordForwarder"), "{emitted}");
+    assert!(emitted.contains("request(kind: :get, path: path, **)"), "{emitted}");
+}
 
 #[test]
 fn critic_corrections_preserve_class_objects_reflection_and_operators() {
@@ -5780,6 +5803,50 @@ fn a_template_only_action_is_fed_by_its_before_action() {
         .assert_passes();
 }
 
+#[test]
+fn array_and_hash_checks_preserve_members() {
+    emit_and_run::real_blog()
+        .write("app/lib/container_narrowing_probe.rb", r##"class ContainerNarrowingProbe
+  def self.array_members
+    value = ["alpha", "beta"]
+    if value.is_a?(Array)
+      value.map { |item| item.upcase }
+    else
+      raise("not an Array")
+    end
+  end
+  def self.hash_members
+    value = {"answer" => 41}
+    if value.is_a?(Hash)
+      value.map { |key, item| "#{key.upcase}=#{item + 1}" }
+    else
+      raise("not a Hash")
+    end
+  end
+  def self.nested_members
+    value = [{"name" => "alpha"}, {"name" => "beta"}]
+    if value.is_a?(Array)
+      value.map do |item|
+        if item.is_a?(Hash)
+          item.fetch("name").upcase
+        else
+          raise("not a Hash")
+        end
+      end
+    else
+      raise("not an Array")
+    end
+  end
+end
+"##)
+        .run_ruby(r#"
+raise "Array members changed" unless ContainerNarrowingProbe.array_members == ["ALPHA", "BETA"]
+raise "Hash members changed" unless ContainerNarrowingProbe.hash_members == ["ANSWER=42"]
+raise "nested members changed" unless ContainerNarrowingProbe.nested_members == ["ALPHA", "BETA"]
+"#)
+        .assert_passes();
+}
+
 const ARTICLES_CONTROLLER: &str = "app/controllers/articles_controller.rb";
 const TRACK_FILTER: &str = "  def track\n    \
                               @tracked = %w[index show].include?(action_name)\n    \
@@ -6824,6 +6891,8 @@ end
 mod relation_finders;
 #[path = "emit_and_run/attach_hash.rs"]
 mod attach_hash;
+#[path = "emit_and_run/many_attached.rs"]
+mod many_attached;
 
 /// A controller under `ActionController::API`, the base `rails new
 /// --api` writes, dispatches (#163). The runtime defined only `Base`,
@@ -7839,5 +7908,14 @@ end
 raise "vf vs vframes" unless ActiveStorage.video_preview_vf_filter == "scale=320:240"
 "#,
         )
+        .assert_passes();
+}
+
+#[test]
+fn an_rbs_array_block_runs_after_app_emission() {
+    emit_and_run::real_blog()
+        .write("app/lib/batch.rb", runtime_block_signature::RUBY)
+        .write("sig/batch.rbs", runtime_block_signature::RBS)
+        .run_ruby("raise 'wrong sum' unless Batch.new.consume == 3")
         .assert_passes();
 }

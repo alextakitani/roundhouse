@@ -254,6 +254,21 @@ pub struct ClassInfo {
     pub app_declared: bool,
 }
 
+impl ClassInfo {
+    /// Whether `name` is one of this model's real SCHEMA TABLE columns.
+    /// `attributes` is built once, straight off `Schema::tables` (see
+    /// `ingest::model::row_from_table`), never merged with method-only
+    /// surface like a `has_secure_password` reader or a plain `def` —
+    /// so this is a strictly narrower, more precise test than "does
+    /// `instance_methods` know this name," which also answers yes for
+    /// synthesized non-column readers (`password_reset_token`). Shared
+    /// by the body-typer's and the arel lowerer's dynamic-finder
+    /// handling (#558) so a per-column check can't drift between them.
+    pub fn has_schema_column(&self, name: &Symbol) -> bool {
+        self.attributes.fields.contains_key(name)
+    }
+}
+
 /// Resolve a single-segment Const ref (like `Const { path:
 /// ["HashWithIndifferentAccess"] }` from app source) to a fully-
 /// qualified ClassId by walking the class registry. Returns the
@@ -1256,8 +1271,17 @@ impl<'a> BodyTyper<'a> {
                         }
                     }
                 }
+                let class_object_receiver =
+                    recv.as_ref().map_or(ctx.class_side, |r| self.is_class_object(r, ctx));
                 let block_ret = if let Some(b) = block {
-                    let mut block_ctx = self.block_ctx_for(ctx, recv_ty.as_ref(), method, args, b);
+                    let mut block_ctx = self.block_ctx_for(
+                        ctx,
+                        recv_ty.as_ref(),
+                        method,
+                        args,
+                        class_object_receiver,
+                        b,
+                    );
                     if matches!(method.as_str(), "instance_eval" | "instance_exec" | "class_eval" | "class_exec" | "module_eval" | "module_exec") {
                         if let Some(receiver) = recv.as_ref() {
                             block_ctx.self_ty = recv_ty.clone();
@@ -1463,7 +1487,8 @@ impl<'a> BodyTyper<'a> {
                 }
                 // What every object and every module answers, when the
                 // receiver's own table did not. App analyzer only.
-                let class_object_receiver = recv.as_ref().map_or(ctx.class_side, |r| self.is_class_object(r, ctx));
+                // `class_object_receiver` was resolved above for block binding
+                // so it matches the same class/instance table preference.
                 if matches!(dispatched, Ty::Var { .. } | Ty::Untyped) && self.inquirers.is_some()
                     && (recv.is_some() || (ctx.self_ty.is_some() && send::is_module_protocol(method)))
                     && !self.owns_operator(recv_ty.as_ref(), method, class_object_receiver) {
@@ -2165,6 +2190,13 @@ impl<'a> BodyTyper<'a> {
             }
 
             ExprNode::ForwardArgs | ExprNode::ForwardKeywords => Ty::Untyped,
+            ExprNode::ForwardKeywordsWithPairs { entries } => {
+                for (key, value) in entries.iter_mut() {
+                    self.analyze_expr(key, ctx);
+                    self.analyze_expr(value, ctx);
+                }
+                Ty::Untyped
+            }
 
             ExprNode::Splat { value } | ExprNode::KeywordSplat { value } => {
                 // Splat propagates the inner expression's type

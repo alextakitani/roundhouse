@@ -6115,8 +6115,21 @@ fn emit_library_class_decl_inner(
     // bodies' constant refs into LOAD time with it — `Sound::BUILTIN`
     // calls `initialize`, which reads `Sound::Image`. Those refs would
     // otherwise be classified body-only and left to the aggregator.
-    let (eager, deferred) = partition_deferred_constants(lc);
-    let load_time_bodies = !deferred.is_empty();
+    // Source class state can call methods and read constants between writes.
+    // Keep those declarations in source order; synthesized framework classes
+    // and mattr/cattr `@@` seeds retain their existing initialization policy.
+    // Lowered controllers also have no origin, but Concern methods carry
+    // spans from another file. Their offsets cannot order the controller's
+    // macro calls: those initializers must run after all collected methods.
+    let ordered_body = lc.origin.is_none()
+        && lc.has_source_ivar_initializers()
+        && !app.controllers.iter().any(|controller| controller.name == lc.name);
+    let (mut eager, mut deferred, initializers_call_self) = partition_deferred_constants(lc);
+    let load_time_bodies = initializers_call_self || !deferred.is_empty();
+    if ordered_body {
+        eager = (0..lc.constants.len()).collect();
+        deferred.clear();
+    }
 
     // Parent + body-derived `require_relative` headers. Helpers return
     // project-root-anchored paths; we relpath each one against `out_dir`
@@ -6234,6 +6247,52 @@ fn emit_library_class_decl_inner(
         walk_const_paths(e, &mut paths);
         paths.iter().filter_map(|p| resolve(p, load_time)).collect()
     };
+    // Initializers and eager constants share the source's load-time order,
+    // including when a dependency requires closing and reopening the class.
+    enum BodyItem<'a> {
+        Constant(usize, &'a Expr),
+        Initializer(&'a Expr),
+        Method(&'a MethodDef),
+    }
+    let mut body: Vec<_> = eager.iter().map(|&i| {
+        (lc.constants[i].1.span.start, BodyItem::Constant(i, &lc.constants[i].1))
+    }).collect();
+    body.extend(lc.class_ivar_initializers.iter().filter(|init| {
+        // Source-ordered bodies interleave only real `@ivar` writes; keep
+        // synthetic mattr/cattr `@@` seeds on the partitioned path below.
+        !ordered_body || (!init.span.is_synthetic() && matches!(
+            &*init.node,
+            ExprNode::Assign { target: LValue::Ivar { .. }, .. }
+                | ExprNode::OpAssign { target: LValue::Ivar { .. }, .. }
+        ))
+    }).map(|init| {
+        (init.span.start, BodyItem::Initializer(init))
+    }));
+    // Concern-spliced and other foreign-file methods keep foreign
+    // `name_span` offsets; interleave only same-file declarations.
+    let body_file = lc.class_ivar_initializers.iter().find_map(|init| {
+        (!init.span.is_synthetic()
+            && matches!(
+                &*init.node,
+                ExprNode::Assign { target: LValue::Ivar { .. }, .. }
+                    | ExprNode::OpAssign { target: LValue::Ivar { .. }, .. }
+            ))
+        .then_some(init.span.file)
+    });
+    let method_in_ordered_body = |m: &MethodDef| {
+        ordered_body
+            && !m.name_span.is_synthetic()
+            && body_file.is_some_and(|file| m.name_span.file == file)
+    };
+    if ordered_body {
+        body.extend(
+            lc.methods
+                .iter()
+                .filter(|m| method_in_ordered_body(m))
+                .map(|m| (m.name_span.start, BodyItem::Method(m))),
+        );
+    }
+    body.sort_by_key(|(start, _)| *start);
     // Every require the file needs at its TOP: the class-body calls and
     // deferred constants (both run at load), and the method bodies.
     let mut body_requires: BTreeSet<String> = BTreeSet::new();
@@ -6246,7 +6305,7 @@ fn emit_library_class_decl_inner(
     for m in &lc.methods {
         body_requires.extend(resolve_all(&m.body, false));
     }
-    // …and each eager constant's own, in order, because WHERE those go
+    // …and each eager initializer's own, in order, because WHERE those go
     // matters. A class body runs top to bottom, and a required file can
     // read this one's earlier constants — campfire's `ContentFilters`
     // defines `EDITOR_FORMATTING_TAGS`, then builds
@@ -6255,9 +6314,9 @@ fn emit_library_class_decl_inner(
     // autoloads `SanitizeTags` at that reference, after the constant
     // exists; a require at the top of the file ran it first, and
     // `require_relative`'s mid-load short-circuit left the constant
-    // undefined. So the first constant (after at least one other) that
-    // needs a file nothing earlier needs SPLITS the body: the file
-    // closes, requires what the rest needs, and reopens. Spinel splices
+    // undefined. Each initializer needing a new file that reads an earlier
+    // constant SPLITS the body: the file closes, requires that dependency,
+    // and reopens. Later dependencies wait for their own use. Spinel splices
     // a `require_relative` where it stands, so both lanes read the
     // same order.
     //
@@ -6265,36 +6324,40 @@ fn emit_library_class_decl_inner(
     // looks at this class's constants is churn (lobsters' `Markdowner`
     // requiring `user`), so the trigger is a required file whose own
     // load-time code reads one of the constants above it.
-    let per_const: Vec<BTreeSet<String>> =
-        eager.iter().map(|&i| resolve_all(&lc.constants[i].1, true)).collect();
+    let per_body: Vec<BTreeSet<String>> =
+        body.iter().map(|(_, item)| match item {
+            BodyItem::Constant(_, expr) | BodyItem::Initializer(expr) => resolve_all(expr, true),
+            BodyItem::Method(_) => BTreeSet::new(),
+        }).collect();
     let readers = constant_readers(lc, app, &resolve);
-    let mut split: Option<(usize, BTreeSet<String>)> = None;
-    for p in 1..per_const.len() {
+    let mut splits = std::collections::BTreeMap::new();
+    for p in 1..per_body.len() {
         let mut before: BTreeSet<String> = body_requires.clone();
         before.extend(requires.iter().cloned());
-        for q in &per_const[..p] {
+        for q in &per_body[..p] {
             before.extend(q.iter().cloned());
         }
-        let earlier: BTreeSet<&String> = eager[..p]
+        let earlier: BTreeSet<&String> = body[..p]
             .iter()
-            .filter_map(|&i| readers.get(lc.constants[i].0.as_str()))
+            .filter_map(|(_, item)| match item {
+                BodyItem::Constant(i, _) => readers.get(lc.constants[*i].0.as_str()),
+                _ => None,
+            })
             .flatten()
             .collect();
-        if per_const[p].iter().any(|r| !before.contains(r) && earlier.contains(r)) {
-            let rest: BTreeSet<String> = per_const[p..]
+        if per_body[p].iter().any(|r| !before.contains(r) && earlier.contains(r)) {
+            let needed: BTreeSet<String> = per_body[p]
                 .iter()
-                .flatten()
                 .filter(|r| !before.contains(*r))
                 .cloned()
                 .collect();
-            split = Some((p, rest));
-            break;
+            splits.insert(p, needed);
         }
     }
-    for (p, reqs) in per_const.iter().enumerate() {
+    let deferred_requires: BTreeSet<&String> = splits.values().flatten().collect();
+    for reqs in &per_body {
         for r in reqs {
-            let deferred_here = split.as_ref().is_some_and(|(at, rest)| p >= *at && rest.contains(r));
-            if !deferred_here {
+            if !deferred_requires.contains(r) {
                 body_requires.insert(r.clone());
             }
         }
@@ -6425,56 +6488,7 @@ fn emit_library_class_decl_inner(
             }
         }
     };
-    match &split {
-        Some((at, reqs)) => {
-            render_constants(&mut s, &eager[..*at]);
-            for i in (0..depth).rev() {
-                writeln!(s, "{}end", "  ".repeat(i)).unwrap();
-            }
-            writeln!(s).unwrap();
-            for r in reqs {
-                writeln!(s, "require_relative {r:?}").unwrap();
-            }
-            writeln!(s).unwrap();
-            open_header(&mut s);
-            render_constants(&mut s, &eager[*at..]);
-        }
-        None => render_constants(&mut s, &eager),
-    }
-    if !eager.is_empty() && !lc.methods.is_empty() {
-        writeln!(s).unwrap();
-    }
-
-    // Class-body calls the ingest didn't model (`LibraryClass::
-    // unknown_calls`), replayed verbatim when — and only when — the
-    // class extends a base we don't model at all. See
-    // `replays_foreign_class_body`. After the constants (a captured
-    // call may reference one) and before the methods.
-    if replays_foreign_class_body(lc, app) {
-        for call in &lc.unknown_calls {
-            for line in super::emit_expr(call).lines() {
-                if line.is_empty() {
-                    writeln!(s).unwrap();
-                } else {
-                    writeln!(s, "{body_pad}{line}").unwrap();
-                }
-            }
-        }
-        if !lc.unknown_calls.is_empty() && !lc.methods.is_empty() {
-            writeln!(s).unwrap();
-        }
-    } else {
-        for call in &lc.unknown_calls {
-            report_dropped_class_body_call(lc, call);
-        }
-    }
-
-    let mut first = true;
-    for m in &lc.methods {
-        if !first {
-            writeln!(s).unwrap();
-        }
-        first = false;
+    let render_method = |s: &mut String, m: &MethodDef| {
         let body = super::emit_method(m);
         for line in body.lines() {
             if line.is_empty() {
@@ -6506,16 +6520,119 @@ fn emit_library_class_decl_inner(
         if let Some(directive) = directive {
             writeln!(s, "{body_pad}{directive} :{}", m.name).unwrap();
         }
+    };
+    let render_body = |s: &mut String, items: &[(u32, BodyItem<'_>)]| {
+        for (_, item) in items {
+            match item {
+                BodyItem::Constant(i, _) => render_constants(s, &[*i]),
+                BodyItem::Initializer(expr) if ordered_body => {
+                    for line in super::emit_expr(expr).lines() {
+                        writeln!(s, "{body_pad}{line}").unwrap();
+                    }
+                }
+                // Keep initialization in the require plan even when the
+                // lowered class renders it after its methods below.
+                BodyItem::Initializer(_) => {}
+                BodyItem::Method(method) => {
+                    writeln!(s).unwrap();
+                    render_method(s, method);
+                    writeln!(s).unwrap();
+                }
+            }
+        }
+    };
+    // Concern-spliced / synthetic-span methods cannot order against
+    // source `@ivar` writes; emit them before the interleaved body.
+    if ordered_body {
+        let mut first = true;
+        for m in lc.methods.iter().filter(|m| !method_in_ordered_body(m)) {
+            if !first {
+                writeln!(s).unwrap();
+            }
+            first = false;
+            render_method(&mut s, m);
+        }
+        if lc.methods.iter().any(|m| !method_in_ordered_body(m)) && !body.is_empty() {
+            writeln!(s).unwrap();
+        }
+    }
+
+    let mut start = 0;
+    for (at, reqs) in &splits {
+        render_body(&mut s, &body[start..*at]);
+        for i in (0..depth).rev() {
+            writeln!(s, "{}end", "  ".repeat(i)).unwrap();
+        }
+        writeln!(s).unwrap();
+        for r in reqs {
+            writeln!(s, "require_relative {r:?}").unwrap();
+        }
+        writeln!(s).unwrap();
+        open_header(&mut s);
+        start = *at;
+    }
+    render_body(&mut s, &body[start..]);
+    if !eager.is_empty() && !lc.methods.is_empty() {
+        writeln!(s).unwrap();
+    }
+
+    // Class-body calls the ingest didn't model (`LibraryClass::
+    // unknown_calls`), replayed verbatim when — and only when — the
+    // class extends a base we don't model at all. See
+    // `replays_foreign_class_body`. After the constants (a captured
+    // call may reference one) and before the methods.
+    if replays_foreign_class_body(lc, app) {
+        for call in &lc.unknown_calls {
+            for line in super::emit_expr(call).lines() {
+                if line.is_empty() {
+                    writeln!(s).unwrap();
+                } else {
+                    writeln!(s, "{body_pad}{line}").unwrap();
+                }
+            }
+        }
+        if !lc.unknown_calls.is_empty() && !lc.methods.is_empty() {
+            writeln!(s).unwrap();
+        }
+    } else {
+        for call in &lc.unknown_calls {
+            report_dropped_class_body_call(lc, call);
+        }
+    }
+
+    // Non-ordered classes keep the methods-then-initializers partition.
+    // Ordered bodies already emitted foreign methods above and same-file
+    // methods inside the interleaved body.
+    if !ordered_body {
+        let mut first = true;
+        for m in &lc.methods {
+            if !first {
+                writeln!(s).unwrap();
+            }
+            first = false;
+            render_method(&mut s, m);
+        }
     }
 
     // Finite class-side initialization is lowered IR, not replay of a
-    // framework DSL. Each statement runs once on this class object, after
-    // the class methods it may call (a Concern macro writing its
-    // `class_attribute`); unset subclasses keep their ivar absent.
-    if !lc.class_ivar_initializers.is_empty() && !lc.methods.is_empty() {
+    // framework DSL. Runs after class methods (a Concern macro may write
+    // its `class_attribute`). Per-class `@ivar` seeds leave unset
+    // subclasses absent; `mattr_*` / `cattr_*` seeds are `@@` and share
+    // across the hierarchy by Ruby class-variable rules. Source-ordered
+    // `@ivar` writes already interleaved above; remaining seeds still run.
+    let remaining_inits = |init: &Expr| {
+        !ordered_body
+            || init.span.is_synthetic()
+            || !matches!(
+                &*init.node,
+                ExprNode::Assign { target: LValue::Ivar { .. }, .. }
+                    | ExprNode::OpAssign { target: LValue::Ivar { .. }, .. }
+            )
+    };
+    if lc.class_ivar_initializers.iter().any(remaining_inits) && !lc.methods.is_empty() {
         writeln!(s).unwrap();
     }
-    for init in &lc.class_ivar_initializers {
+    for init in lc.class_ivar_initializers.iter().filter(|init| remaining_inits(init)) {
         for line in super::emit_expr(init).lines() {
             writeln!(s, "{body_pad}{line}").unwrap();
         }
@@ -6561,7 +6678,7 @@ fn constant_readers(
         for (_, v) in &other.constants {
             walk_const_paths(v, &mut paths);
         }
-        for call in &other.unknown_calls {
+        for call in other.unknown_calls.iter().chain(&other.class_ivar_initializers) {
             walk_const_paths(call, &mut paths);
         }
         for path in &paths {
@@ -6591,7 +6708,8 @@ fn constant_readers(
 /// SPELLED WITH THE CLASS NAME (`Sound.new(…)`) — or when it reads a
 /// constant that already deferred. A self-dispatch inside a STORED
 /// closure doesn't count: that body runs on call, not on load. Returns
-/// index lists so both groups keep source order.
+/// index lists so both groups keep source order, and whether class-ivar
+/// initializers also reach method bodies at load time.
 ///
 /// The class-name spelling is not hypothetical: `lower::class_body_new`
 /// gives a class body's bare `new` its receiver (a receiverless call is
@@ -6603,9 +6721,10 @@ fn constant_readers(
 /// suite's 52 files. The fact the rule is about is "does this
 /// initializer dispatch to this class", and both spellings are that
 /// fact.
-fn partition_deferred_constants(lc: &LibraryClass) -> (Vec<usize>, Vec<usize>) {
+fn partition_deferred_constants(lc: &LibraryClass) -> (Vec<usize>, Vec<usize>, bool) {
     fn is_own_class(recv: &Option<Expr>, class_name: &str) -> bool {
         let Some(r) = recv else { return false };
+        if matches!(&*r.node, ExprNode::SelfRef) { return true; }
         let ExprNode::Const { path } = &*r.node else { return false };
         path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::") == class_name
     }
@@ -6706,7 +6825,9 @@ fn partition_deferred_constants(lc: &LibraryClass) -> (Vec<usize>, Vec<usize>) {
             eager.push(i);
         }
     }
-    (eager, deferred)
+    let initializers_call_self = lc.class_ivar_initializers.iter()
+        .any(|init| calls_self(init, &own, &deferred_names, lc.name.0.as_str()));
+    (eager, deferred, initializers_call_self)
 }
 
 /// Project-root-anchored require target for a parent class, if one is needed.
@@ -7668,6 +7789,11 @@ enum PreloadKind {
     /// (`lower::attached::variations_ruby_source`), the proxy's fourth
     /// constructor argument.
     Attached { attr: String, owner: String, variations: String },
+    /// `has_many_attached :<attr>`: install an `AttachedMany` proxy per
+    /// record. Rows are still loaded on ask (`AttachedMany#attachments`);
+    /// the batch here is the memoized proxy, matching One's "one proxy
+    /// per record" contract.
+    AttachedMany { attr: String, owner: String },
     /// `has_rich_text :<attr>`: one `IN` over `action_text_rich_texts`,
     /// installed through the owner's load-once setter.
     RichText { attr: String, owner: String },
@@ -7797,6 +7923,17 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
                 attr: attr.as_str().to_string(),
                 owner: model.name.0.as_str().to_string(),
                 variations: crate::lower::attached::variations_ruby_source(model, &attr),
+            },
+        ));
+    }
+    for (_span, attr) in crate::lower::attached::many_attached_attrs(model) {
+        out.push((
+            crate::lower::attached::many_attachments_assoc_name(&attr)
+                .as_str()
+                .to_string(),
+            PreloadKind::AttachedMany {
+                attr: attr.as_str().to_string(),
+                owner: model.name.0.as_str().to_string(),
             },
         ));
     }
@@ -8010,6 +8147,19 @@ end
 "#
                 );
             }
+            PreloadKind::AttachedMany { attr, owner } => {
+                let _ = write!(
+                    src,
+                    r#"
+def self._preload_batch_{name}(records)
+  records.each do |r|
+    r._preload_{name}(ActiveStorage::AttachedMany.new("{owner}", r.id, "{attr}"))
+  end
+  []
+end
+"#
+                );
+            }
             // One IN over the rich-text table; a record with no row is
             // told so, which is the state the load-once reader must not
             // re-query.
@@ -8084,8 +8234,8 @@ end
                 PreloadKind::PlainText { .. } => Some("ActionText::Markdown"),
                 // `includes(logo_attachment: :blob)`: the blob is already
                 // in the row the loader fetched; there is no model to
-                // recurse into.
-                PreloadKind::Attached { .. } => None,
+                // recurse into. Many installs the proxy only.
+                PreloadKind::Attached { .. } | PreloadKind::AttachedMany { .. } => None,
             };
             match target {
                 Some(target) => {

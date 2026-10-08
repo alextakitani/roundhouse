@@ -40,12 +40,16 @@ mod registry;
 mod test_module;
 mod render;
 mod ivar_set;
+pub(crate) use ivar_set::controller_name_of;
 mod effects;
 mod diagnostics;
 pub(crate) mod forwarding;
 mod filter_targets;
 pub mod graphql;
 mod harvest_return;
+mod fixpoint_bound;
+mod fixpoint_rounds;
+pub use fixpoint_rounds::{FixpointRounds, LoopEnd};
 mod dirty_retype;
 mod typing_mode;
 mod inferred_types;
@@ -155,6 +159,8 @@ pub struct Analyzer {
     /// `analyze_expr` walks.
     controller_action_meta_cache:
         HashMap<ClassId, (HashMap<Symbol, HashMap<Symbol, Ty>>, HashMap<Symbol, Expr>)>,
+    /// How the last [`Self::analyze`]'s fixpoint loops ended.
+    fixpoint_rounds: FixpointRounds,
 }
 
 use dirty_retype::{DirtyHints, InferenceSig, dirty_classes_for_retype};
@@ -597,6 +603,42 @@ impl Analyzer {
                     args: vec![],
                 });
             }
+            for (_span, attr) in crate::lower::attached::many_attached_attrs(model) {
+                cls.instance_methods.entry(attr).or_insert(Ty::Class {
+                    id: ClassId(Symbol::from("ActiveStorage::AttachedMany")),
+                    args: vec![],
+                });
+            }
+            // `ActiveStorage::Attachment` helpers synthesized by
+            // `lower::attachment_model::push_attachment_record_methods`
+            // at the emit seam — register here so `attachment.url` /
+            // `.filename` resolve in check the same way the reader
+            // macros do.
+            if crate::lower::attachment_model::is_attachment_model(model) {
+                let blob = Ty::Class {
+                    id: ClassId(Symbol::from("ActiveStorage::Blob")),
+                    args: vec![],
+                };
+                let filename = Ty::Class {
+                    id: ClassId(Symbol::from("ActiveStorage::Filename")),
+                    args: vec![],
+                };
+                let nilable = |ty: Ty| Ty::Union {
+                    variants: vec![ty, Ty::Nil],
+                };
+                cls.instance_methods
+                    .entry(Symbol::from("blob"))
+                    .or_insert(nilable(blob));
+                cls.instance_methods
+                    .entry(Symbol::from("url"))
+                    .or_insert(Ty::Str);
+                cls.instance_methods
+                    .entry(Symbol::from("filename"))
+                    .or_insert(nilable(filename));
+                cls.instance_methods
+                    .entry(Symbol::from("content_type"))
+                    .or_insert(nilable(Ty::Str));
+            }
             // `attr_accessor :x` — and `attr_accessor *CONST`, which is
             // how campfire's `Opengraph::Metadata` names its four. The
             // reader/writer pair is synthesized by
@@ -986,6 +1028,7 @@ impl Analyzer {
             view_seeds: None,
             callers_by_target: HashMap::new(),
             controller_action_meta_cache: HashMap::new(),
+            fixpoint_rounds: FixpointRounds::default(),
         }
     }
 
@@ -1017,6 +1060,12 @@ impl Analyzer {
     /// footers' pre-filled RBS).
     pub fn inferred_param_types(&self, class: &ClassId, method: &Symbol) -> Option<&[Ty]> {
         self.inferred_params.get(&(class.clone(), method.clone())).map(|v| v.as_slice())
+    }
+
+    /// How the fixpoint loops of the last [`Self::analyze`] ended; all
+    /// [`LoopEnd::NotRun`] before it.
+    pub fn fixpoint_rounds(&self) -> FixpointRounds {
+        self.fixpoint_rounds
     }
 
     /// Walk the app, annotating every expression's `ty` field, then
@@ -1117,6 +1166,11 @@ impl Analyzer {
             )
         });
 
+        let mut rounds = FixpointRounds {
+            production: LoopEnd::RanToCap,
+            views_and_tests: LoopEnd::RanToCap,
+            absorb: LoopEnd::NotRun,
+        };
         // Whole-program fixpoint: harvest returns + unify params, re-type,
         // repeat until the registry signature stabilizes. Each round
         // carries a fact one link further, so the cap bounds the longest
@@ -1144,6 +1198,7 @@ impl Analyzer {
             if self.inference_matches(&prev_hints.sig)
                 && self.block_value_matches(&prev_hints)
             {
+                rounds.production = LoopEnd::Settled(round);
                 break;
             }
             // Re-type with the refined registry. Idempotent BodyTyper
@@ -1236,11 +1291,13 @@ impl Analyzer {
             if self.inference_matches(&prev_hints.sig)
                 && self.block_value_matches(&prev_hints)
             {
+                rounds.views_and_tests = LoopEnd::Settled(round);
                 break;
             }
             prev_hints = self.capture_dirty_hints();
         }
         if !self.inference_matches(&production_sig) {
+            rounds.absorb = LoopEnd::RanToCap;
             let mut absorb_hints = self.capture_dirty_hints();
             // The view/test rounds above moved signatures that
             // production bodies read, and the last production pass
@@ -1276,6 +1333,7 @@ impl Analyzer {
                 if self.inference_matches(&absorb_hints.sig)
                     && self.block_value_matches(&absorb_hints)
                 {
+                    rounds.absorb = LoopEnd::Settled(round);
                     break;
                 }
                 absorb_dirty = self.dirty_classes_for_retype(app, &absorb_hints);
@@ -1315,6 +1373,7 @@ impl Analyzer {
                 )
             });
         }
+        self.fixpoint_rounds = rounds;
         // Wave 12 types views once against production-only helper
         // returns, then unifies helper params from those sites. Helper
         // returns therefore settle only after the absorb/harvest above.
@@ -4042,6 +4101,7 @@ impl Analyzer {
                 method.name.as_str(),
                 "generates_token_for"
                     | "has_one_attached"
+                    | "has_many_attached"
                     | "has_rich_text"
                     | "has_markdown"
                     | "has_secure_token"
@@ -5132,7 +5192,7 @@ impl Analyzer {
                 entry.resize(arity, Ty::Var { var: crate::ident::TyVar(0) });
             }
             for (slot, observed) in entry.iter_mut().zip(arg_tys.into_iter()) {
-                *slot = unify_param_ty(slot.clone(), observed);
+                *slot = fixpoint_bound::bound(unify_param_ty(slot.clone(), observed));
             }
         }
     }
@@ -5298,6 +5358,12 @@ impl Analyzer {
             })
             .filter(|(_, includes)| !includes.is_empty())
             .collect();
+        // `self.classes` is a HashMap: without a fixed order the
+        // includers' observations reach the module's slot in a
+        // different order every run, and a union's variant order (or
+        // any order-sensitive join) leaks into the emitted signature.
+        let mut targets = targets;
+        targets.sort_by(|a, b| a.0.cmp(&b.0));
         let mut adds: Vec<((ClassId, Symbol), Vec<Ty>)> = Vec::new();
         for (id, includes) in targets {
             let mut queue = includes;
@@ -5340,7 +5406,7 @@ impl Analyzer {
                 entry.resize(tys.len(), Ty::Var { var: crate::ident::TyVar(0) });
             }
             for (slot, observed) in entry.iter_mut().zip(tys.into_iter()) {
-                *slot = unify_param_ty(slot.clone(), observed);
+                *slot = fixpoint_bound::bound(unify_param_ty(slot.clone(), observed));
             }
         }
     }
@@ -5458,7 +5524,7 @@ impl Analyzer {
         mut arg_tys: Vec<Ty>,
         kw: SiteKeywords,
     ) -> Vec<Ty> {
-        if let Some(shape) = shape.filter(|s| s.keywords_by_kind) {
+        if let Some(shape) = shape.filter(|s| s.keywords_by_kind || kw.anonymous_forward) {
             if kw.group {
                 if let Some(placed) =
                     Self::bind_keyword_group(shape, &arg_tys, &kw.keys, kw.splat.as_ref())
@@ -5630,7 +5696,7 @@ impl Analyzer {
                 // chases — the reverse call graph now decides retype,
                 // so Class-only receivers would leave callers of
                 // `records.first.foo` off the frontier.
-                let recv_classes: Vec<ClassId> = match recv {
+                let mut recv_classes: Vec<ClassId> = match recv {
                     Some(r) => r
                         .ty
                         .as_ref()
@@ -5645,6 +5711,25 @@ impl Analyzer {
                         .into_iter()
                         .collect(),
                 };
+                // The params table keys by (class, name) with no side, so
+                // `self.class.get(url, opts)` (HTTParty's class-side `get`)
+                // would feed an instance `def get` — and still would when
+                // the class also defines `def self.get`. Drop an `x.class`
+                // site for any receiver that has that name as an instance
+                // method. Constant receivers stay: `UserMailer.welcome(user)`
+                // and an `extend self` module's `GlobalPath.cdn_path(p)` are
+                // how their instance methods run.
+                let via_dot_class = recv.as_ref().is_some_and(|r| {
+                    matches!(&*r.node, ExprNode::Send { method: m, args, .. }
+                        if m.as_str() == "class" && args.is_empty())
+                });
+                if via_dot_class {
+                    recv_classes.retain(|c| {
+                        !self.classes.get(c).is_some_and(|k| {
+                            k.instance_methods.contains_key(method)
+                        })
+                    });
+                }
                 if !recv_classes.is_empty() {
                     let arg_tys: Vec<Ty> = args
                         .iter()
@@ -5699,6 +5784,10 @@ impl Analyzer {
                             }
                             if all_sym { pairs } else { Vec::new() }
                         }
+                        // The anonymous packet is merged after these
+                        // pairs, so it can overwrite every explicit key.
+                        // Keep the group as unknown keyword evidence below
+                        // instead of inferring the explicit values as final.
                         _ => Vec::new(),
                     };
                     // Whether the last argument is the call's keyword
@@ -5706,7 +5795,10 @@ impl Analyzer {
                     // `**splat`, never a positional `{…}` literal.
                     let group = matches!(
                         args.last().map(|a| &*a.node),
-                        Some(ExprNode::Hash { kwargs: true, .. } | ExprNode::KeywordSplat { .. })
+                        Some(ExprNode::Hash { kwargs: true, .. }
+                            | ExprNode::KeywordSplat { .. }
+                            | ExprNode::ForwardKeywords
+                            | ExprNode::ForwardKeywordsWithPairs { .. })
                     );
                     // The splat merges over the literal, so each literal
                     // key may take the splat's value too.
@@ -5719,9 +5811,20 @@ impl Analyzer {
                                     .collect();
                                 (joined, Some(v))
                             }),
+                        Some(ExprNode::ForwardKeywordsWithPairs { .. }) => {
+                            // The opaque forwarded packet merges after the
+                            // literal entries and can override each key.
+                            // Its values are unavailable, so the signature
+                            // binder leaves named parameters uninferred.
+                            (Vec::new(), None)
+                        }
                         _ => (keys, None),
                     };
-                    let kw_tys = SiteKeywords { group, keys, splat };
+                    let anonymous_forward = matches!(
+                        args.last().map(|a| &*a.node),
+                        Some(ExprNode::ForwardKeywords | ExprNode::ForwardKeywordsWithPairs { .. })
+                    );
+                    let kw_tys = SiteKeywords { group, keys, splat, anonymous_forward };
                     // `Klass.new(a, b)` hands its arguments to
                     // `initialize` — that is all `Class#new` does with
                     // them — so the site is evidence for the
@@ -5758,6 +5861,12 @@ impl Analyzer {
                 for (k, v) in entries {
                     self.collect_send_sites(k, self_class, helpers, out);
                     self.collect_send_sites(v, self_class, helpers, out);
+                }
+            }
+            ExprNode::ForwardKeywordsWithPairs { entries } => {
+                for (key, value) in entries {
+                    self.collect_send_sites(key, self_class, helpers, out);
+                    self.collect_send_sites(value, self_class, helpers, out);
                 }
             }
             ExprNode::If { cond, then_branch, else_branch } => {
@@ -6733,7 +6842,8 @@ fn block_filter_gates(call: &Expr) -> (Vec<Symbol>, Vec<Symbol>) {
 /// joinrules at a higher level — we operate on `Ty` directly, so the
 /// rules are:
 /// - same type → keep
-/// - one side is `Ty::Var` (no info yet) → take the other
+/// - one side is `Ty::Var` (no info yet) → take the other, including
+///   when the other is `Untyped` (`Var` is the bottom of the join)
 /// - one side is `Untyped` (an argument nobody could type) → take the
 ///   other: an untyped observation says nothing about the value, and
 ///   letting it into the union turns every concrete observation into
@@ -6748,10 +6858,23 @@ fn unify_param_ty(stored: Ty, observed: Ty) -> Ty {
     if stored == observed {
         return stored;
     }
-    if matches!(stored, Ty::Var { .. } | Ty::Untyped) {
+    // `Var` is checked on both sides before `Untyped` so the join is
+    // commutative: `Var` (no observation) is below `Untyped` (an
+    // observed argument nobody could type), and `Untyped` is below a
+    // concrete type. Testing `Var | Untyped` together on `stored`
+    // first made `unify(Untyped, Var) = Var` but `unify(Var, Untyped)
+    // = Untyped`, so the result depended on the order call sites
+    // arrived in (#209).
+    if matches!(stored, Ty::Var { .. }) {
         return observed;
     }
-    if matches!(observed, Ty::Var { .. } | Ty::Untyped) {
+    if matches!(observed, Ty::Var { .. }) {
+        return stored;
+    }
+    if matches!(stored, Ty::Untyped) {
+        return observed;
+    }
+    if matches!(observed, Ty::Untyped) {
         return stored;
     }
     // T + Nil → Union<T, Nil>; same for the symmetric case. Skip
@@ -7041,6 +7164,9 @@ struct SiteKeywords {
     /// keyword the literal does not name can receive. `keys` then holds
     /// the literal's pairs.
     splat: Option<Ty>,
+    /// The opaque final `**` can override the explicit pairs, so they are
+    /// not type evidence for the receiving named parameters.
+    anonymous_forward: bool,
 }
 
 /// A method's declared parameter slots, in declaration order, as

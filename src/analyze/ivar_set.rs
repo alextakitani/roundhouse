@@ -305,7 +305,10 @@ fn runtime_singularize(s: &str) -> String {
     s.to_string()
 }
 
-fn controller_name_of(class: &ClassId) -> String {
+/// `ArticlesController` → `"articles"`; `Admin::UsersController` →
+/// `"users"`. Shared with the controller lowerer's AOT string-literal
+/// overrides — one owner so acronym / strip rules cannot drift.
+pub(crate) fn controller_name_of(class: &ClassId) -> String {
     let leaf = naming::demodulize(class.0.as_str());
     let stripped = leaf.strip_suffix("Controller").unwrap_or(leaf);
     naming::snake_case(stripped)

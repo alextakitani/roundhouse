@@ -297,7 +297,7 @@ fn apply_migration_verb(
                 if !columns.is_empty() {
                     if let Some(table) = schema.tables.get_mut(&Symbol::from(t.clone())) {
                         if columns.iter().all(|c| table.columns.iter().any(|col| col.name == *c)) {
-                            table.indexes.push(build_index(&t, columns, args.iter().skip(2)));
+                            table.indexes.push(build_index(&t, columns, args.iter().skip(2), file)?);
                         }
                     }
                 }
@@ -515,9 +515,11 @@ fn build_index<'pr>(
     table_name: &str,
     columns: Vec<Symbol>,
     kwarg_nodes: impl Iterator<Item = &'pr Node<'pr>>,
-) -> Index {
+    file: &str,
+) -> IngestResult<Index> {
     let mut explicit_name: Option<String> = None;
     let mut unique = false;
+    let mut using: Option<String> = None;
     let mut predicate: Option<String> = None;
     for node in kwarg_nodes {
         let Some(kh) = node.as_keyword_hash_node() else { continue };
@@ -532,6 +534,7 @@ fn build_index<'pr>(
                 // a unique one, dropping it widened the constraint to
                 // every row.
                 "where" => predicate = string_value(value),
+                "using" => using = Some(index_access_method(value, file, table_name)?),
                 _ => {}
             }
         }
@@ -540,7 +543,33 @@ fn build_index<'pr>(
         let cols: Vec<&str> = columns.iter().map(|c| c.as_str()).collect();
         format!("index_{}_on_{}", table_name, cols.join("_and_"))
     });
-    Index { name: Symbol::from(name), columns, unique, predicate }
+    Ok(Index { name: Symbol::from(name), columns, unique, using, predicate })
+}
+
+/// Rails interpolates `using:` as an unquoted SQL identifier. Fold its
+/// spelling as PostgreSQL does, and reject values that would not safely
+/// round-trip through that schema DSL instead of silently using btree.
+fn index_access_method(value: &Node<'_>, file: &str, table: &str) -> IngestResult<String> {
+    let method = string_value(value).or_else(|| symbol_value(value)).ok_or_else(|| {
+        IngestError::Unsupported {
+            file: file.into(),
+            message: format!("index access method for `{table}` must be a literal symbol or string"),
+        }
+    })?;
+    let mut chars = method.chars();
+    let valid_identifier = chars
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$'));
+    if !valid_identifier || method.len() > 63 {
+        return Err(IngestError::Unsupported {
+            file: file.into(),
+            message: format!(
+                "index access method for `{table}` must be an ASCII unquoted SQL identifier"
+            ),
+        });
+    }
+    Ok(method.to_ascii_lowercase())
 }
 
 /// `create_table NAME[, opts] do |t| … end` → (table key, Table).
@@ -668,8 +697,10 @@ fn table_from_create_table(
                     if let Some(call) = stmt.as_call_node() {
                         let call_name = constant_id_str(&call.name()).to_string();
                         if call_name == "index" {
-                            if let Some(idx) = index_from_call(&call, &table_name) {
-                                indexes.push(idx);
+                            match index_from_call(&call, &table_name, file) {
+                                Ok(Some(idx)) => indexes.push(idx),
+                                Ok(None) => {}
+                                Err(gap) => gaps.push(gap),
                             }
                         } else if call_name == "timestamps" {
                             // Migration macro; schema.rb has these
@@ -1050,19 +1081,25 @@ fn column_from_call(
     column_with_type(&col_type_name, col_name, &opts, table, file).map(Some)
 }
 
-fn index_from_call(call: &ruby_prism::CallNode<'_>, table_name: &str) -> Option<Index> {
+fn index_from_call(
+    call: &ruby_prism::CallNode<'_>,
+    table_name: &str,
+    file: &str,
+) -> IngestResult<Option<Index>> {
     // Expected: t.index ["article_id"], name: "...", unique: true
     //       or: t.index :article_id  (migration single-column form)
-    let recv = call.receiver()?;
-    recv.as_local_variable_read_node()?;
-
-    let args_node = call.arguments()?;
-    let args: Vec<Node<'_>> = args_node.arguments().iter().collect();
-    let columns = args.first().map(column_name_list)?;
-    if columns.is_empty() {
-        return None;
+    let Some(recv) = call.receiver() else { return Ok(None) };
+    if recv.as_local_variable_read_node().is_none() {
+        return Ok(None);
     }
-    Some(build_index(table_name, columns, args.iter().skip(1)))
+
+    let Some(args_node) = call.arguments() else { return Ok(None) };
+    let args: Vec<Node<'_>> = args_node.arguments().iter().collect();
+    let Some(columns) = args.first().map(column_name_list) else { return Ok(None) };
+    if columns.is_empty() {
+        return Ok(None);
+    }
+    build_index(table_name, columns, args.iter().skip(1), file).map(Some)
 }
 
 #[cfg(test)]
@@ -1223,34 +1260,37 @@ mod tests {
         assert_eq!(col_names(&schema, "users"), ["id", "email"]);
     }
 
-    /// `where:` makes a partial index, in `t.index` and `add_index`
-    /// alike; the predicate is kept as written.
+    /// Index metadata from both table-block `t.index` and migration
+    /// `add_index` calls survives the same schema fold.
     #[test]
-    fn index_where_is_the_partial_predicate() {
+    fn migration_index_options_keep_predicate_and_access_method() {
         let schema = fold(&[r#"
             class CreateTokens < ActiveRecord::Migration[8.1]
               def change
                 create_table :tokens do |t|
                   t.bigint :user_id, null: false
                   t.datetime :revoked_at
+                  t.jsonb :payload
                   t.index :user_id, unique: true, where: "revoked_at IS NULL", name: "live"
                 end
                 add_index :tokens, :revoked_at, where: "revoked_at IS NOT NULL"
                 add_index :tokens, [:user_id, :revoked_at]
+                add_index :tokens, :payload, using: :gin, name: "payload_gin"
               end
             end
         "#]);
-        let indexes: Vec<(&str, bool, Option<&str>)> = schema.tables[&Symbol::from("tokens")]
+        let indexes: Vec<(&str, bool, Option<&str>, Option<&str>)> = schema.tables[&Symbol::from("tokens")]
             .indexes
             .iter()
-            .map(|i| (i.name.as_str(), i.unique, i.predicate.as_deref()))
+            .map(|i| (i.name.as_str(), i.unique, i.predicate.as_deref(), i.using.as_deref()))
             .collect();
         assert_eq!(
             indexes,
             [
-                ("live", true, Some("revoked_at IS NULL")),
-                ("index_tokens_on_revoked_at", false, Some("revoked_at IS NOT NULL")),
-                ("index_tokens_on_user_id_and_revoked_at", false, None),
+                ("live", true, Some("revoked_at IS NULL"), None),
+                ("index_tokens_on_revoked_at", false, Some("revoked_at IS NOT NULL"), None),
+                ("index_tokens_on_user_id_and_revoked_at", false, None, None),
+                ("payload_gin", false, None, Some("gin")),
             ]
         );
     }

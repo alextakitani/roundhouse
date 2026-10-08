@@ -119,7 +119,7 @@ fn dispatch_statement(
         return;
     }
     if starts_with_ci(stmt, "CREATE UNIQUE INDEX") || starts_with_ci(stmt, "CREATE INDEX") {
-        handle_create_index(stmt, schema);
+        handle_create_index(stmt, file, schema, gaps);
         return;
     }
     if starts_with_ci(stmt, "ALTER TABLE") {
@@ -457,7 +457,7 @@ fn maybe_register_enum(stmt: &str, enum_types: &mut HashSet<String>) {
 /// survey report with a purely-cosmetic gap (this dump alone has
 /// several thousand plain indexes and only a handful of expression
 /// ones).
-fn handle_create_index(stmt: &str, schema: &mut Schema) {
+fn handle_create_index(stmt: &str, file: &str, schema: &mut Schema, gaps: &mut Vec<IngestError>) {
     let Some(mut rest) = strip_prefix_ci(stmt, "CREATE") else { return };
     rest = rest.trim_start();
     let unique = if let Some(r2) = strip_prefix_ci(rest, "UNIQUE") {
@@ -483,6 +483,39 @@ fn handle_create_index(stmt: &str, schema: &mut Schema) {
     let after_table = &rest[consumed2..];
 
     let Some(open) = find_first_open_paren(after_table, 0) else { return };
+    let access_clause = &after_table[..open];
+    let access_start = skip_sql_trivia(access_clause, 0);
+    let using = if access_start == access_clause.len() {
+        None
+    } else {
+        let Some(method_start) = consume_sql_keyword_ci(access_clause, access_start, "USING")
+        else {
+            gaps.push(IngestError::Unsupported {
+                file: file.into(),
+                message: "CREATE INDEX clause before the column list is not modeled".into(),
+            });
+            return;
+        };
+        let method_start = skip_sql_trivia(access_clause, method_start);
+        let method = &access_clause[method_start..];
+        let quoted = method.starts_with('"');
+        match read_index_access_method(method) {
+            Some((name, consumed))
+                if !name.is_empty()
+                    && skip_sql_trivia(access_clause, method_start + consumed)
+                        == access_clause.len() =>
+            {
+                Some(if quoted { name } else { name.to_ascii_lowercase() })
+            }
+            _ => {
+                gaps.push(IngestError::Unsupported {
+                    file: file.into(),
+                    message: "CREATE INDEX access method is not a SQL identifier".into(),
+                });
+                return;
+            }
+        }
+    };
     let Some(close) = matching_close_paren(after_table, open) else { return };
     let body = &after_table[open + 1..close];
 
@@ -517,6 +550,7 @@ fn handle_create_index(stmt: &str, schema: &mut Schema) {
                 name: Symbol::from(index_name),
                 columns: cols,
                 unique,
+                using,
                 predicate,
             });
         }
@@ -1042,6 +1076,84 @@ fn read_ident(s: &str, start: usize) -> Option<(String, usize)> {
     }
 }
 
+/// Read exactly one PostgreSQL index access method identifier. Unlike
+/// [`read_ident`], schema qualifiers are not stripped: `USING public.gin`
+/// is not the same identifier as `USING gin` and must not be normalized.
+fn read_index_access_method(s: &str) -> Option<(String, usize)> {
+    let bytes = s.as_bytes();
+    if bytes.first() == Some(&b'"') {
+        let mut i = 1;
+        let mut name = String::new();
+        while i < bytes.len() {
+            if bytes[i] == b'\0' {
+                return None;
+            }
+            if bytes[i] == b'"' {
+                if bytes.get(i + 1) == Some(&b'"') {
+                    name.push('"');
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                return (!name.is_empty() && name.len() <= 63).then_some((name, i));
+            }
+            let char_len = utf8_char_len(bytes[i]).min(bytes.len() - i);
+            name.push_str(&s[i..i + char_len]);
+            i += char_len;
+        }
+        return None;
+    }
+
+    let first = *bytes.first()?;
+    if !first.is_ascii_alphabetic() && first != b'_' {
+        return None;
+    }
+    let mut end = 1;
+    while end < bytes.len()
+        && (bytes[end].is_ascii_alphanumeric() || matches!(bytes[end], b'_' | b'$'))
+    {
+        end += 1;
+    }
+    (end <= 63).then_some((s[..end].to_string(), end))
+}
+
+/// Skip SQL whitespace and comments but leave quoted identifiers and
+/// literals untouched. PostgreSQL accepts comments wherever whitespace
+/// can separate tokens, including around `USING` and its method name.
+fn skip_sql_trivia(s: &str, start: usize) -> usize {
+    let bytes = s.as_bytes();
+    let mut i = start;
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if bytes.get(i..i + 2) == Some(&b"--"[..])
+            || bytes.get(i..i + 2) == Some(&b"/*"[..])
+        {
+            i = skip_quoted_or_comment(bytes, i).unwrap_or(bytes.len());
+        } else {
+            return i;
+        }
+    }
+}
+
+/// Consume one case-insensitive keyword at a known token boundary and
+/// return the byte immediately after it. Identifier-continuation bytes
+/// (including non-ASCII UTF-8 bytes) keep the text in the same token, so
+/// malformed `USINGgin` cannot be mistaken for `USING gin`. Whitespace,
+/// SQL comments, and quoted identifiers are valid token separators.
+fn consume_sql_keyword_ci(s: &str, start: usize, keyword: &str) -> Option<usize> {
+    let end = start.checked_add(keyword.len())?;
+    if !s.get(start..end)?.eq_ignore_ascii_case(keyword) {
+        return None;
+    }
+    let next = *s.as_bytes().get(end)?;
+    if next.is_ascii_alphanumeric() || next == b'_' || next == b'$' || next >= 0x80 {
+        return None;
+    }
+    Some(end)
+}
+
 /// Tokenize `s` into its depth-0 (outside any parens), non-quoted
 /// words, each paired with its byte offset in `s`. Every keyword
 /// search in this module (`PRIMARY KEY`, `REFERENCES`, `ON DELETE`, a
@@ -1272,6 +1384,28 @@ mod tests {
     fn read_ident_keeps_dot_inside_single_quoted_segment() {
         let (name, _) = read_ident(r#""index_a.b_on_c" ON"#, 0).unwrap();
         assert_eq!(name, "index_a.b_on_c");
+    }
+
+    #[test]
+    fn structure_sql_index_methods_are_single_identifiers() {
+        let quoted = r#""Odd""Method""#;
+        let (name, consumed) = read_index_access_method(quoted).unwrap();
+        assert_eq!(name, "Odd\"Method");
+        assert_eq!(consumed, quoted.len());
+
+        let qualified = "public.gin";
+        let (_, consumed) = read_index_access_method(qualified).unwrap();
+        assert!(!qualified[consumed..].is_empty(), "qualifier must not be discarded");
+        assert!(read_index_access_method("\"gin").is_none(), "unterminated quote");
+        assert!(read_index_access_method("\"\"").is_none(), "empty quoted name");
+    }
+
+    #[test]
+    fn structure_sql_rejects_a_schema_qualified_index_method() {
+        let sql = br#"CREATE TABLE widgets (payload jsonb);
+CREATE INDEX widgets_payload_idx ON widgets USING public.gin (payload);"#;
+        let error = ingest_structure_sql(sql, "db/structure.sql").unwrap_err();
+        assert!(error.to_string().contains("CREATE INDEX access method is not a SQL identifier"), "{error}");
     }
 
     #[test]

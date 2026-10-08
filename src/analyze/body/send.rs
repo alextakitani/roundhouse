@@ -97,6 +97,40 @@ impl<'a> BodyTyper<'a> {
         })
     }
 
+    /// Rails' per-column dynamic finders (`find_by_<attr>`,
+    /// `find_by_<attr>!`) are generated at runtime for any real column —
+    /// the same shape `find_by`/`find_by!` already type, just spelled
+    /// with the attribute baked into the method name instead of passed
+    /// as a keyword. Column existence is checked against the model's
+    /// actual schema table (`ClassInfo::has_schema_column` — the same
+    /// check the arel lowerer's `normalize_dynamic_finder_send` makes,
+    /// #558): an attribute no known column backs isn't a dynamic
+    /// finder (and the pipeline has no runtime for inventing one), so
+    /// it falls through to "no known method" rather than guessing. This
+    /// runs only once the caller has already checked `class_methods`
+    /// for the name (see the call site), so a real class method of this
+    /// shape — a `has_secure_password` token finder, say — still wins.
+    fn dynamic_finder_ty(&self, model: &ClassId, method: &Symbol) -> Option<Ty> {
+        let (base, bang) = match method.as_str().strip_suffix('!') {
+            Some(base) => (base, true),
+            None => (method.as_str(), false),
+        };
+        let attr = base.strip_prefix("find_by_")?;
+        if attr.is_empty() {
+            return None;
+        }
+        let cls = self.classes().get(model)?;
+        if !cls.has_schema_column(&Symbol::from(attr)) {
+            return None;
+        }
+        let kind = if bang {
+            crate::catalog::ReturnKind::SelfType
+        } else {
+            crate::catalog::ReturnKind::SelfOrNil
+        };
+        Some(crate::analyze::instantiate_return_kind(kind, model))
+    }
+
     /// `rel.group(:col).count` — Rails' GROUPED count, a Hash of
     /// group-key => COUNT rather than the scalar Integer.
     ///
@@ -179,6 +213,7 @@ impl<'a> BodyTyper<'a> {
         recv_ty: Option<&Ty>,
         method: &Symbol,
         args: &[Expr],
+        class_object_receiver: bool,
         block: &Expr,
     ) -> Ctx {
         let mut new_ctx = outer.clone();
@@ -223,7 +258,7 @@ impl<'a> BodyTyper<'a> {
             }
             return new_ctx;
         }
-        let Some(param_tys) = self.block_params_for(recv_ty, method) else {
+        let Some(param_tys) = self.block_params_for(recv_ty, method, class_object_receiver) else {
             return new_ctx;
         };
         for (name, ty) in params.iter().zip(param_tys.iter()) {
@@ -287,10 +322,13 @@ impl<'a> BodyTyper<'a> {
 
 /// Per-param types a block yields, given the receiver type and method.
     /// `None` means "no binding info available" — params stay unknown.
+    /// `class_object_receiver` picks class-method block contracts before
+    /// instance ones, matching ordinary dispatch on a class/module object.
     pub(super) fn block_params_for(
         &self,
         recv_ty: Option<&Ty>,
         method: &Symbol,
+        class_object_receiver: bool,
     ) -> Option<Vec<Ty>> {
         let recv_ty = recv_ty?;
         if matches!(recv_ty, Ty::Class { id, .. } if id.0.as_str() == PARAM_VALUE) {
@@ -317,7 +355,7 @@ impl<'a> BodyTyper<'a> {
             let as_array = Ty::Array {
                 elem: Box::new(elems.iter().cloned().reduce(union_of).unwrap_or(Ty::Untyped)),
             };
-            return self.block_params_for(Some(&as_array), method);
+            return self.block_params_for(Some(&as_array), method, class_object_receiver);
         }
         match recv_ty {
             Ty::Str if method.as_str() == "bytes" => Some(vec![Ty::Int]),
@@ -344,7 +382,7 @@ impl<'a> BodyTyper<'a> {
                 let as_array = Ty::Array {
                     elem: Box::new(Ty::Class { id: of.clone(), args: vec![] }),
                 };
-                self.block_params_for(Some(&as_array), method)
+                self.block_params_for(Some(&as_array), method, class_object_receiver)
             }
             Ty::Hash { key, value } => match method.as_str() {
                 "each" | "each_pair" | "map" | "collect"
@@ -401,11 +439,33 @@ impl<'a> BodyTyper<'a> {
                     for c in std::iter::once(cls)
                         .chain(cls.includes.iter().filter_map(|m| self.classes().get(m)))
                     {
-                        if let Some(sig) = c
-                            .instance_methods
-                            .get(method)
-                            .or_else(|| c.class_methods.get(method))
-                        {
+                        // Prefer the receiver-side table. The fixpoint
+                        // often seeds that side with a bare return
+                        // (`Nil` / `Str` / …) while the RBS block
+                        // contract still lives on the other side —
+                        // take the other side's block-bearing Fn only
+                        // then. A real receiver-side `Fn` without a
+                        // block must not steal the opposite method's
+                        // block (dispatch still picks the receiver
+                        // side). Dual-name both-sides-with-block keeps
+                        // the receiver side.
+                        let (preferred, other) = if class_object_receiver {
+                            (&c.class_methods, &c.instance_methods)
+                        } else {
+                            (&c.instance_methods, &c.class_methods)
+                        };
+                        let return_seed = |ty: &Ty| !matches!(ty, Ty::Fn { .. });
+                        let sig = match (preferred.get(method), other.get(method)) {
+                            (Some(s @ Ty::Fn { block: Some(_), .. }), _) => Some(s),
+                            (pref, Some(s @ Ty::Fn { block: Some(_), .. }))
+                                if pref.map_or(true, return_seed) =>
+                            {
+                                Some(s)
+                            }
+                            (Some(s), _) => Some(s),
+                            (None, o) => o,
+                        };
+                        if let Some(sig) = sig {
                             // The block's yield may name the receiver
                             // (`{ (instance) -> void }`); substitute
                             // against the class the walk started from,
@@ -455,7 +515,9 @@ impl<'a> BodyTyper<'a> {
                     if matches!(v, Ty::Nil | Ty::Var { .. }) {
                         continue;
                     }
-                    if let Some(params) = self.block_params_for(Some(v), method) {
+                    if let Some(params) =
+                        self.block_params_for(Some(v), method, class_object_receiver)
+                    {
                         return Some(params);
                     }
                 }
@@ -993,6 +1055,24 @@ impl<'a> BodyTyper<'a> {
             // of Ruby's own guarantees about the answer.
             Some(Ty::Untyped) => conversion_fallback(method).unwrap_or(Ty::Untyped),
             Some(Ty::Class { id, args }) => {
+                // `GlobalID::Locator.locate(…, only: Model)` /
+                // `locate_signed(…, only: Model, for:)` — the literal
+                // `only:` IS the finder, so the answer is that model
+                // (nilable: a bad/mismatched gid is nil). Refined here
+                // rather than in the registry: the registry cannot see
+                // the call-site kwarg.
+                if id.0.as_str() == "GlobalID::Locator"
+                    && matches!(method.as_str(), "locate" | "locate_signed")
+                {
+                    if let Some(model) = locator_only_class(call_args) {
+                        return Ty::Union {
+                            variants: vec![
+                                Ty::Class { id: model, args: vec![] },
+                                Ty::Nil,
+                            ],
+                        };
+                    }
+                }
                 if id.0.as_str() == "Date" {
                     if let Some(ty) = date_constructor(method, call_args) {
                         return ty;
@@ -1737,6 +1817,13 @@ impl<'a> BodyTyper<'a> {
                         _ => {}
                     }
                 }
+                // No class-side entry claimed this name (including a
+                // hand-written `self.find_by_<attr>`, caught above) — a
+                // per-column dynamic finder is the last static reading
+                // before falling to the Enumerable surface (#558).
+                if let Some(t) = self.dynamic_finder_ty(of, method) {
+                    return t;
+                }
                 let elem = Ty::Class { id: of.clone(), args: vec![] };
                 array_method(method, &elem, block_ret)
             }
@@ -2085,6 +2172,29 @@ pub(super) fn time_method(method: &Symbol) -> Option<Ty> {
 
 /// Ruby's native date-only surface. Do not inherit the Time table:
 /// Date has neither epoch seconds nor a zone, and only Date supports >>.
+/// Literal `only: Model` class from a Locator kwargs hash, if present.
+fn locator_only_class(args: &[crate::expr::Expr]) -> Option<ClassId> {
+    for arg in args.iter().rev() {
+        let ExprNode::Hash { entries, .. } = &*arg.node else { continue };
+        for (key, value) in entries {
+            let ExprNode::Lit {
+                value: crate::expr::Literal::Sym { value: k },
+            } = &*key.node
+            else {
+                continue;
+            };
+            if k.as_str() != "only" {
+                continue;
+            }
+            let ExprNode::Const { path } = &*value.node else { return None };
+            return Some(ClassId(Symbol::from(
+                path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::"),
+            )));
+        }
+    }
+    None
+}
+
 fn date_constructor(method: &Symbol, args: &[crate::expr::Expr]) -> Option<Ty> {
     // Every core Date argument is optional. Reject known wrong types
     // and excess arguments rather than declaring a crashing call clean.

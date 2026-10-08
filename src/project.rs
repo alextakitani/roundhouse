@@ -1285,7 +1285,10 @@ fn report_native_ruby_syntax(app: &App, target: BuildTarget) {
     fn visit(expr: &crate::expr::Expr, target: BuildTarget) {
         use crate::expr::{ExprNode, LValue};
         let construct = match &*expr.node {
+            ExprNode::ForwardKeywords if target == BuildTarget::Spinel => None,
             ExprNode::ForwardKeywords => Some("anonymous keyword forwarding"),
+            ExprNode::ForwardKeywordsWithPairs { .. } if target == BuildTarget::Spinel => None,
+            ExprNode::ForwardKeywordsWithPairs { .. } => Some("anonymous keyword forwarding"),
             ExprNode::Defined { .. } => Some("runtime defined? query"),
             ExprNode::Assign { target: LValue::Var { name, .. }, .. }
             | ExprNode::OpAssign { target: LValue::Var { name, .. }, .. }
@@ -1377,18 +1380,17 @@ pub fn target_files(
             crate::emit::diagnostics::report_unsupported(method.name_span, target.as_str(), "parameter declaration", formal.description());
         }
         if !matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby) {
-            let named_keyword_rest = method.params.iter().any(|p| {
-                p.keyword && p.rest && !p.name.as_str().is_empty() && !p.forwarding
-            });
-            let anonymous_or_full = method.params.iter().any(|p| {
-                p.forwarding || (p.keyword && p.rest && p.name.as_str().is_empty())
-            });
-            // Spinel carries keyword parameters. A named `**details` is
-            // that parameter. Nameless `**` and `...` stay refused.
-            if matches!(target, BuildTarget::Spinel) && named_keyword_rest && !anonymous_or_full {
+            let keyword_rest = method
+                .params
+                .iter()
+                .any(|p| p.keyword && p.rest && !p.forwarding);
+            let full_forwarding = method.params.iter().any(|p| p.forwarding);
+            // Spinel carries both named `**details` and anonymous `**`
+            // keyword-rest parameters. Full `...` forwarding stays refused.
+            if matches!(target, BuildTarget::Spinel) && keyword_rest && !full_forwarding {
                 continue;
             }
-            let construct = if method.params.iter().any(|p| p.forwarding) {
+            let construct = if full_forwarding {
                 "full argument forwarding"
             } else if method.params.iter().any(|p| p.keyword && p.rest) {
                 "keyword rest declaration"
@@ -1427,6 +1429,33 @@ pub fn target_files(
         }
         if app.library_classes.iter().any(|lc| !lc.class_ivar_initializers.is_empty()) {
             return Err(format!("class-instance-variable initialization is not supported ({})", target.as_str()));
+        }
+    }
+    // Spinel binds a repeated method name to its final implementation even
+    // in an earlier class initializer. CRuby/JRuby execute each definition
+    // in order; refuse this shape before producing a silently different app.
+    if target == BuildTarget::Spinel {
+        // Ingest keeps reopened declarations separate, but they share the
+        // same class object and method table, including its initializers.
+        let mut classes = std::collections::BTreeMap::new();
+        for lc in &app.library_classes {
+            classes.entry(&lc.name).or_insert_with(Vec::new).push(lc);
+        }
+        for (name, declarations) in classes {
+            // Synthetic mattr/cattr `@@` seeds are not the Spinel ordering
+            // hazard — only direct source `@ivar` initialization is.
+            if declarations.iter().all(|lc| !lc.has_source_ivar_initializers()) {
+                continue;
+            }
+            let mut methods = std::collections::HashSet::new();
+            for m in declarations.iter().flat_map(|lc| &lc.methods) {
+                if !methods.insert((m.receiver == crate::dialect::MethodReceiver::Class, &m.name)) {
+                    return Err(format!(
+                        "class-instance-variable initialization with method redefinition is not supported (spinel): {}.{}",
+                        name.0, m.name,
+                    ));
+                }
+            }
         }
     }
     let files = crate::timings::phase(format_args!("emit {}: assemble", target.as_str()), || match target {
@@ -3229,6 +3258,18 @@ fn apply_global_id_locate(files: &mut [(String, String)], app: &App) {
              \x20   end\n",
         ));
     }
+    for model in &app.global_id_locate_signed_models {
+        let name = model.as_str();
+        let suffix = crate::lower::global_id_locate::entry_point_suffix(name);
+        generated.push_str(&format!(
+            "    def self.locate_signed_{suffix}(sgid, purpose)\n\
+             \x20     parts = parts_from_signed(sgid, purpose)\n\
+             \x20     return nil if parts.nil?\n\
+             \x20     return nil unless parts[1] == \"{name}\"\n\n\
+             \x20     {name}.find(cast_id(parts[2]))\n\
+             \x20   end\n",
+        ));
+    }
     generated.push_str(TAIL);
 
     for (path, content) in files.iter_mut() {
@@ -4006,6 +4047,15 @@ pub const RUBY_FAMILY_RUNTIME_CONSTANTS: &[&str] = &[
 /// Ruby/Spinel bundled library objects (`bundled_constant`), and
 /// ruby-family runtime exception stubs (`ruby_family_runtime_constant`).
 fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'static str> {
+    // Spinel supplies the other bundled and ruby-family class values,
+    // but recognizes GeneratorError only as a literal rescue name.
+    if target == "spinel" {
+        return if name == "JSON::GeneratorError" {
+            Some("bundled_constant")
+        } else {
+            None
+        };
+    }
     if RUBY_FAMILY_RUNTIME_CONSTANTS.iter().any(|n| *n == name) {
         // JRuby ships the same runtime files as CRuby.
         return if target == "jruby" {
@@ -4018,7 +4068,10 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
         "URI::HTTP" | "URI::InvalidURIError" | "Net::OpenTimeout" | "Net::ReadTimeout"
         | "Net::HTTPRedirection" | "Net::HTTPOK" | "StringIO" | "OpenSSL::OpenSSLError"
         | "Rails::HTML5::SafeListSanitizer" | "JSON" | "JSON::ParserError"
-        | "Struct" | "Mutex");
+        | "Struct" | "Mutex" | "Queue" | "SizedQueue"
+        | "Thread::Queue" | "Thread::SizedQueue" | "Thread::Mutex"
+        | "ThreadError" | "ClosedQueueError" | "Comparable" | "Enumerable"
+        | "JSON::GeneratorError");
     if !bundled {
         return None;
     }
@@ -4074,10 +4127,29 @@ fn report_unavailable_class_value(
 /// lowers-added exception Consts surveyed from a throwaway controller
 /// lower (emit still lowers controllers after this gate today).
 fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
-    if matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Spinel | BuildTarget::Roda) {
+    if matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Roda) {
         return;
     }
     fn visit(expr: &crate::expr::Expr, app: &App, target: &str) {
+        // Spinel matches this exception by its rescue name, but does not
+        // expose its class as a constant. Keep the value guard below while
+        // permitting the supported literal rescue clause, including ::JSON.
+        if target == "spinel" {
+            if let crate::expr::ExprNode::BeginRescue { rescues, .. } = &*expr.node {
+                expr.node.for_each_child(&mut |child| {
+                    let named_rescue = rescues.iter().any(|rescue| rescue.classes.iter().any(|class| {
+                        std::ptr::eq(child, class)
+                            && matches!(&*class.node, crate::expr::ExprNode::Const { path }
+                                if path.iter().map(|part| part.as_str()).filter(|part| !part.is_empty())
+                                    .eq(["JSON", "GeneratorError"]))
+                    }));
+                    if !named_rescue {
+                        visit(child, app, target);
+                    }
+                });
+                return;
+            }
+        }
         if matches!(&*expr.node, crate::expr::ExprNode::Const { .. }) {
             if let Some(crate::ty::Ty::Class { id, .. }) = &expr.ty {
                 report_unavailable_class_value(app, target, id.0.as_str(), expr.span);
@@ -4617,6 +4689,10 @@ fn spinel_files(app: &App, fixture: &Path) -> Result<(Vec<(String, String)>, Vec
         "inflector",
         "inflector_ext",
         "json_builder",
+        // Pure string ActiveSupport helpers for the Ruby/Spinel
+        // scaffold (strict targets literalize controller_name/path).
+        // Listed before active_support_ext so require_relative resolves.
+        "active_support_inflections",
         "active_support_ext",
         "security_utils",
         "params",
