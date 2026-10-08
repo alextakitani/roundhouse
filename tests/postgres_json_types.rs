@@ -31,10 +31,12 @@ ALTER TABLE ONLY public.documents
 const GENERATED_DDL_START: &str = "BEGIN_JSON_TYPES_POSTGRES_DDL";
 const GENERATED_DDL_END: &str = "END_JSON_TYPES_POSTGRES_DDL";
 
+/// Build the generic two-column source fixture through the public schema ingester.
 fn schema_from_rb() -> Schema {
     ingest_schema(SCHEMA_RB.as_bytes(), "db/schema.rb").expect("schema.rb should ingest")
 }
 
+/// Read the serialized column kind so this regression also compiles on the old enum.
 fn column_kind(schema: &Schema, column_name: &str) -> String {
     let table = schema.tables.get(&Symbol::from("documents")).expect("documents table");
     let column = table
@@ -50,11 +52,13 @@ fn column_kind(schema: &Schema, column_name: &str) -> String {
         .to_owned()
 }
 
+/// Check both source declarations retain their expected serialized type tags.
 fn assert_json_kinds(schema: &Schema, expected_json: &str, expected_jsonb: &str) {
     assert_eq!(column_kind(schema, "payload_json"), expected_json);
     assert_eq!(column_kind(schema, "payload_jsonb"), expected_jsonb);
 }
 
+/// Match one emitted column type without confusing json with the jsonb prefix.
 fn postgres_has_column_type(statement: &str, name: &str, expected_type: &str) -> bool {
     let prefix = format!("\"{name}\" ");
     statement.lines().any(|line| {
@@ -65,6 +69,7 @@ fn postgres_has_column_type(statement: &str, name: &str, expected_type: &str) ->
     })
 }
 
+/// Keep source type fidelity across schema.rb ingestion and schema serialization.
 #[test]
 fn schema_rb_and_serde_preserve_json_and_jsonb_as_distinct_types() {
     let schema = schema_from_rb();
@@ -76,6 +81,7 @@ fn schema_rb_and_serde_preserve_json_and_jsonb_as_distinct_types() {
     assert_json_kinds(&round_tripped, "json", "jsonb");
 }
 
+/// Preserve the two PostgreSQL types when ingesting a structure dump.
 #[test]
 fn structure_sql_preserves_json_and_jsonb_source_types() {
     let schema = ingest_structure_sql(STRUCTURE_SQL.as_bytes(), "db/structure.sql")
@@ -83,6 +89,7 @@ fn structure_sql_preserves_json_and_jsonb_source_types() {
     assert_json_kinds(&schema, "json", "jsonb");
 }
 
+/// Retain each declared JSON type while folding add-column and change-column migrations.
 #[test]
 fn migration_add_and_change_column_keep_json_and_jsonb_distinct() {
     let mut schema = schema_from_rb();
@@ -104,6 +111,7 @@ end
     assert_eq!(column_kind(&schema, "added_jsonb"), "jsonb");
 }
 
+/// Emit distinct PostgreSQL types while preserving the shared SQLite storage contract.
 #[test]
 fn postgres_ddl_distinguishes_json_and_jsonb_while_sqlite_keeps_text_storage() {
     let schema = schema_from_rb();
@@ -142,6 +150,7 @@ fn postgres_ddl_distinguishes_json_and_jsonb_while_sqlite_keeps_text_storage() {
     );
 }
 
+/// Execute emitted CRuby create, read and update flows through both JSON accessors.
 #[test]
 fn json_and_jsonb_runtime_accessors_still_use_the_shared_text_json_boundary() {
     let run = emit_and_run::real_blog()

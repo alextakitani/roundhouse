@@ -6,6 +6,7 @@
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
+/// Construct a minimal app with both JSON source types for native execution.
 fn app() -> emit_and_run::Overlay {
     emit_and_run::empty_app()
         .write(
@@ -29,6 +30,7 @@ end
         .write("app/models/document.rb", "class Document < ApplicationRecord\nend\n")
 }
 
+/// Compile and run create, read, update and reload through the shared Spinel JSON boundary.
 #[test]
 #[ignore = "requires the Spinel toolchain"]
 fn native_spinel_json_and_jsonb_columns_round_trip_on_sqlite() {
