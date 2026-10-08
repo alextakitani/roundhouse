@@ -92,7 +92,7 @@ is an `integer` key, and a hash-valued `id: { type: :string, limit:
 apply (`timestamptz` renders `timestamp`). The IR preserves `json` and
 `jsonb` separately so PostgreSQL DDL keeps the source type. SQLite stores both
 as text, and both use the same Ruby `JsonColumn` encoding/decoding path; this
-does not add PostgreSQL runtime support or generated JSON-expression support.
+does not add PostgreSQL runtime support.
 Roda's current Sequel schema mapping remains text-backed and records the
 original type in a comment rather than claiming native JSONB support.
 A partial index's predicate (`t.index … where:`,
@@ -175,14 +175,26 @@ checking and cannot reach current SQLite project emission. Use
 source-expression mode is not a database selector and does not enable
 PostgreSQL model persistence or a PostgreSQL application target.
 
-JSON operators, casts to non-text types, other functions, generated-column
-references, defaults, generated keys/timestamps, length-limited casts or
-operand types remain explicit errors. A table must contain an ordinary
-column. Source types normalized to text for ordinary model typing (such as
-network types, enums, `citext`, and fixed-width characters) remain unsupported
-here. Column names that are SQL keywords must be double-quoted in the
-expression. Unresolved keyword splats in column options are rejected because
-they can hide generated-column metadata.
+That explicit PostgreSQL DDL mode also accepts `->` and `->>` when the left
+operand is an exact `json` or `jsonb` column and the selector is a SQL string
+literal (including Rails' `'key'::text` form) or a decimal array index
+with an optional leading minus, within the full signed int4 range.
+The operators can be chained; `->` may produce an intermediate JSON value,
+but the final expression must use `->>` to produce the supported text result.
+Expressions remain verbatim, so PostgreSQL preserves the source JSON type's
+behavior. The default application ingest remains portable, and SQLite DDL
+validation rejects a schema imported in PostgreSQL mode. This adds no
+PostgreSQL model persistence and leaves the shared serialized-text
+`JsonColumn` model path unchanged.
+
+Other PostgreSQL operators, casts to non-text types, other functions,
+generated-column references, defaults, generated keys/timestamps,
+length-limited casts or operand types remain explicit errors. A table must
+contain an ordinary column. Source types normalized to text for ordinary model
+typing (such as network types, enums, `citext`, and fixed-width characters)
+remain unsupported here. Column names that are SQL keywords must be
+double-quoted in the expression. Unresolved keyword splats in column options
+are rejected because they can hide generated-column metadata.
 Migration folding permits renaming or dropping an unindexed generated output
 when the resulting table still validates. `change_column` on an existing
 generated output and replacement of a generated output by an ordinary column
@@ -199,8 +211,8 @@ or `VIRTUAL` clause in `structure.sql`; unsupported clauses cannot silently
 become writable columns. Roda emission rejects generated columns. SQLite DDL
 supports both modes; the separate PostgreSQL DDL renderer currently accepts
 stored columns only, even though PostgreSQL 18 also supports virtual columns.
-PostgreSQL text casts require the explicit DDL-only ingest mode described
-above; this does not enable a PostgreSQL runtime backend.
+PostgreSQL text casts and JSON extraction require the explicit DDL-only ingest
+mode described above; this does not enable a PostgreSQL runtime backend.
 
 Normal model inserts and updates omit generated columns, while SELECT and
 reload retain them. Generated attributes start nil, including a database

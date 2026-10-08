@@ -233,7 +233,7 @@ fn explicit_postgres_mode_rejects_nonportable_and_bounded_text_sources() {
         (
             "bounded varchar",
             "CREATE TABLE public.people (source_text varchar(12), label text GENERATED ALWAYS AS (source_text::text) STORED);",
-            "only text/string operands are supported",
+            "String { limit: Some(12) }",
         ),
         (
             "text typmod",
@@ -463,4 +463,134 @@ end
         structure_column(&schema, "display").generated.is_some(),
         "the original generated column must survive the rejected candidate"
     );
+}
+
+/// Keeps ordinary JSON and JSONB column mapping while rejecting custom-qualified domains as extraction sources.
+#[test]
+fn structure_sql_guards_qualified_json_sources_but_keeps_ordinary_json_typing() {
+    let ordinary = r#"CREATE TABLE public.people (
+  bare_json json,
+  bare_jsonb jsonb,
+  catalog_json pg_catalog.json,
+  catalog_jsonb pg_catalog.jsonb,
+  custom_json public.json,
+  custom_jsonb public.jsonb
+);"#;
+    let schema = ingest_structure_sql(ordinary.as_bytes(), "db/structure.sql")
+        .expect("qualified JSON columns remain available for ordinary app typing");
+    for name in ["bare_json", "catalog_json", "custom_json"] {
+        assert!(
+            matches!(
+                &structure_column(&schema, name).col_type,
+                roundhouse::schema::ColumnType::Json
+            ),
+            "{name} should remain ordinarily typed as JSON"
+        );
+    }
+    for name in ["bare_jsonb", "catalog_jsonb", "custom_jsonb"] {
+        assert!(
+            matches!(
+                &structure_column(&schema, name).col_type,
+                roundhouse::schema::ColumnType::Jsonb
+            ),
+            "{name} should remain ordinarily typed as JSONB"
+        );
+    }
+
+    for source_type in ["public.json", "public.jsonb"] {
+        let dump = format!(
+            "CREATE TABLE public.people (id integer, source_document {source_type}, label text GENERATED ALWAYS AS (source_document ->> 'name') STORED);"
+        );
+        let error = ingest_structure_sql_with_generated_expression_dialect(
+            dump.as_bytes(),
+            "db/structure.sql",
+            GeneratedExpressionDialect::Postgres,
+        )
+        .expect_err("JSON extraction must reject a custom qualified JSON domain")
+        .to_string();
+        assert!(
+            error.contains("non-portable text semantics"),
+            "{source_type}: {error}"
+        );
+    }
+
+    for source_type in ["pg_catalog.json", "pg_catalog.jsonb"] {
+        let dump = format!(
+            "CREATE TABLE public.people (id integer, source_document {source_type}, label text GENERATED ALWAYS AS (source_document ->> 'name') STORED);"
+        );
+        ingest_structure_sql_with_generated_expression_dialect(
+            dump.as_bytes(),
+            "db/structure.sql",
+            GeneratedExpressionDialect::Postgres,
+        )
+        .expect("exact pg_catalog JSON source types remain eligible");
+    }
+}
+
+/// Checks that JSON array columns retain ordinary JSON typing but fail scalar extraction; false and nil remain scalar controls.
+#[test]
+fn schema_rb_json_arrays_are_not_scalar_json_extraction_sources() {
+    let ordinary = r#"ActiveRecord::Schema[8.1].define(version: 1) do
+  create_table "people", force: :cascade do |t|
+    t.json "payload_json", array: true
+    t.jsonb "payload_jsonb", array: true
+  end
+end
+"#;
+    let schema = ingest_schema(ordinary.as_bytes(), "db/schema.rb")
+        .expect("JSON array columns retain their existing ordinary application types");
+    for (name, expected) in [
+        ("payload_json", roundhouse::schema::ColumnType::Json),
+        ("payload_jsonb", roundhouse::schema::ColumnType::Jsonb),
+    ] {
+        assert_eq!(
+            &structure_column(&schema, name).col_type,
+            &expected,
+            "{name} ordinary typing should remain unchanged"
+        );
+        assert_eq!(
+            structure_column(&schema, name).generated_text_compatible,
+            Some(false),
+            "{name} must retain negative scalar provenance"
+        );
+    }
+
+    for json_type in ["json", "jsonb"] {
+        let source = format!(
+            r#"ActiveRecord::Schema[8.1].define(version: 1) do
+  create_table "people", force: :cascade do |t|
+    t.{json_type} "payload", array: true
+    t.virtual "name", type: :string, as: "payload ->> 'name'", stored: true
+  end
+end
+"#
+        );
+        let error = roundhouse::ingest::ingest_schema_with_generated_expression_dialect(
+            source.as_bytes(),
+            "db/schema.rb",
+            GeneratedExpressionDialect::Postgres,
+        )
+        .expect_err("JSON extraction must reject an array operand")
+        .to_string();
+        assert!(
+            error.contains("non-portable text semantics"),
+            "{json_type}: {error}"
+        );
+    }
+
+    let scalar_controls = r#"ActiveRecord::Schema[8.1].define(version: 1) do
+  create_table "people", force: :cascade do |t|
+    t.json "payload_json", array: false
+    t.jsonb "payload_jsonb", array: nil
+    t.virtual "json_name", type: :string, as: "payload_json ->> 'name'", stored: true
+    t.virtual "jsonb_name", type: :string, as: "payload_jsonb ->> 'name'", stored: true
+  end
+end
+"#;
+    roundhouse::ingest::ingest_schema_with_generated_expression_dialect(
+        scalar_controls.as_bytes(),
+        "db/schema.rb",
+        GeneratedExpressionDialect::Postgres,
+    )
+    .expect("literal false and nil JSON options remain scalar controls");
 }
