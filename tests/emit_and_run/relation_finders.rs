@@ -225,3 +225,128 @@ fn relation_chain_app_scope_and_dynamic_finder_run_on_spinel() {
     );
     scope_and_dynamic_finder_app().run_spinel(&script).assert_passes();
 }
+
+/// #569 follow-up. App scope names are collected across every model and
+/// matched by name, so `@widget.gadget` (a belongs_to reader) matched an
+/// unrelated `Gizmo.gadget` scope and marked `@widget` relation-refined.
+/// `@widget = Widget.all.find { … }` then stayed on the runtime Relation,
+/// whose `find` takes an id (ArgumentError). The `show` action is the
+/// older half, which the collision happened to mask: without `Gizmo`,
+/// `Widget.includes(:gadget).find(id)` hydrated its receiver into an
+/// Array, and `Array#find(ifnone)` answered an Enumerator.
+fn scope_name_collision_app(with_gizmo: bool) -> emit_and_run::Overlay {
+    let app = emit_and_run::empty_app()
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
+        .write("db/schema.rb", r#"ActiveRecord::Schema.define do
+  create_table "gadgets", force: :cascade do |t|
+    t.string "label", null: false
+  end
+  create_table "widgets", force: :cascade do |t|
+    t.string "name", null: false
+    t.integer "gadget_id", null: false
+  end
+  create_table "gizmos", force: :cascade do |t|
+    t.string "kind"
+  end
+end
+"#)
+        .write("app/models/gadget.rb", "class Gadget < ApplicationRecord\n  has_many :widgets\nend\n")
+        .write("app/models/widget.rb", "class Widget < ApplicationRecord\n  belongs_to :gadget\nend\n")
+        .write("config/routes.rb", r#"Rails.application.routes.draw do
+  get "/widgets/pick", to: "widgets#pick"
+  get "/widgets/:id", to: "widgets#show"
+end
+"#)
+        .write("app/controllers/widgets_controller.rb", r#"class WidgetsController < ApplicationController
+  def pick
+    @widget = Widget.all.find { |w| w.name == params[:name] }
+    render plain: @widget.gadget.label
+  end
+
+  def show
+    widget = Widget.includes(:gadget).find(params[:id])
+    render plain: widget.name + "/" + widget.gadget.label
+  end
+end
+"#);
+    if !with_gizmo {
+        return app;
+    }
+    // `mix` assigns `@thing` from two models. Only the Gizmo assignment
+    // is refined by `.gadget`; the Widget one keeps Enumerable `find`.
+    app.write("app/models/gizmo.rb", "class Gizmo < ApplicationRecord\n  scope :gadget, -> { where(kind: \"gadget\") }\nend\n")
+        .write("config/routes.rb", r#"Rails.application.routes.draw do
+  get "/widgets/pick", to: "widgets#pick"
+  get "/widgets/:id", to: "widgets#show"
+  get "/gizmos/mix", to: "gizmos#mix"
+end
+"#)
+        .write("app/controllers/gizmos_controller.rb", r#"class GizmosController < ApplicationController
+  def mix
+    if params[:kind] == "gizmo"
+      @thing = Gizmo.all
+      render plain: @thing.gadget.size.to_s
+    else
+      @thing = Widget.all.find { |w| w.name == params[:name] }
+      render plain: @thing.gadget.label
+    end
+  end
+end
+"#)
+}
+
+#[test]
+fn scope_name_on_another_model_keeps_block_find_enumerable() {
+    scope_name_collision_app(true)
+        .run_ruby(r#"
+require_relative "app/controllers/widgets_controller"
+Widget.create!(name: "a", gadget: Gadget.create!(label: "g1"))
+Widget.create!(name: "b", gadget: Gadget.create!(label: "g2"))
+
+controller = WidgetsController.new
+controller.params = {"name" => "b"}
+controller.process_action(:pick)
+raise "pick: #{controller.body}" unless controller.body == "g2"
+"#)
+        .assert_passes();
+}
+
+#[test]
+fn scope_refines_only_the_assignment_from_its_own_model() {
+    scope_name_collision_app(true)
+        .run_ruby(r#"
+require_relative "app/controllers/gizmos_controller"
+Gizmo.create!(kind: "gadget")
+Gizmo.create!(kind: "other")
+Widget.create!(name: "a", gadget: Gadget.create!(label: "g1"))
+Widget.create!(name: "b", gadget: Gadget.create!(label: "g2"))
+
+controller = GizmosController.new
+controller.params = {"kind" => "gizmo"}
+controller.process_action(:mix)
+raise "mix gizmo: #{controller.body}" unless controller.body == "1"
+
+controller = GizmosController.new
+controller.params = {"kind" => "widget", "name" => "b"}
+controller.process_action(:mix)
+raise "mix widget: #{controller.body}" unless controller.body == "g2"
+"#)
+        .assert_passes();
+}
+
+#[test]
+fn includes_find_with_id_preserves_its_relation_receiver() {
+    scope_name_collision_app(false)
+        .run_ruby(r#"
+require_relative "app/controllers/widgets_controller"
+Widget.create!(name: "a", gadget: Gadget.create!(label: "g1"))
+widget = Widget.create!(name: "b", gadget: Gadget.create!(label: "g2"))
+
+controller = WidgetsController.new
+controller.params = {"id" => widget.id.to_s}
+controller.process_action(:show)
+raise "show: #{controller.body}" unless controller.body == "b/g2"
+"#)
+        .assert_passes();
+}

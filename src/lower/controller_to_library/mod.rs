@@ -229,16 +229,6 @@ pub fn lower_controllers_with_arel_views_and_assocs(
 /// value instead of being clobbered by a synthesized `render`. `None`
 /// preserves the legacy "every public method is an action" behavior for
 /// callers that haven't wired routes yet.
-/// A type that answers a Relation — directly, or as the return of a
-/// parameterized scope.
-fn returns_relation(ty: &Ty) -> bool {
-    match ty {
-        Ty::Relation { .. } => true,
-        Ty::Fn { ret, .. } => returns_relation(ret),
-        _ => false,
-    }
-}
-
 /// The optional, feature-gated inputs to
 /// [`lower_controllers_with_arel_views_assocs_and_routes`]. Each field
 /// defaults to "feature off" (empty slice / `None` / `false`), matching
@@ -489,7 +479,7 @@ pub fn lower_controllers_with_arel_views_assocs_and_routes(
     let relation_scope_names: std::collections::HashSet<Symbol> = classes
         .values()
         .flat_map(|ci| ci.class_methods.iter())
-        .filter(|(_, ty)| returns_relation(ty))
+        .filter(|(_, ty)| crate::lower::arel::returns_relation(ty))
         .map(|(n, _)| n.clone())
         .collect();
 
