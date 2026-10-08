@@ -1058,6 +1058,21 @@ pub(crate) fn build_methods(
     build_methods_with_finder_inputs(model, models, schema, params_specs, FinderInputs::Scalar)
 }
 
+/// Return the instance method surface synthesized for a model, for ingest
+/// passes that need collision checks without depending on `MethodDef` details.
+pub(crate) fn method_names(
+    model: &Model,
+    models: &[Model],
+    schema: &Schema,
+    params_specs: &crate::lower::controller_to_library::params::ParamsSpecs,
+) -> HashSet<String> {
+    build_methods(model, models, schema, params_specs)
+        .into_iter()
+        .filter(|method| method.receiver == MethodReceiver::Instance)
+        .map(|method| method.name.as_str().to_string())
+        .collect()
+}
+
 /// Add the schema dispatch only when its shared Ruby-family owner is shipped.
 fn build_methods_with_finder_inputs(
     model: &Model,

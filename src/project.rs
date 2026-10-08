@@ -4064,8 +4064,9 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
             Some("ruby_family_runtime_constant")
         };
     }
-    let bundled = matches!(name,
-        "URI::HTTP" | "URI::InvalidURIError" | "Net::OpenTimeout" | "Net::ReadTimeout"
+    let bundled = matches!(
+        name,
+        "URI::HTTP" | "URI::HTTPS" | "URI::InvalidURIError" | "Net::OpenTimeout" | "Net::ReadTimeout"
         | "Net::HTTPRedirection" | "Net::HTTPOK" | "StringIO" | "OpenSSL::OpenSSLError"
         | "Rails::HTML5::SafeListSanitizer" | "JSON" | "JSON::ParserError"
         | "Struct" | "Mutex" | "Queue" | "SizedQueue"

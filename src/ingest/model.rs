@@ -412,6 +412,7 @@ pub(super) fn ingest_model_with_enum_constants(
                     visibility.apply(&statement, method);
                 } else if let ModelBodyItem::Unknown { .. } = &item {
                     visibility.check_model_item(&statement, file)?;
+                    visibility.check_delegate_declaration(&statement, file)?;
                 }
                 item.set_leading_blank_line(leading_blank && i == 0);
                 body.push(item);

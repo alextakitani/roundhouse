@@ -1994,6 +1994,9 @@ fn walk_decl_body_with_visibility<'pr>(
                             && !SORBET_ANNOTATIONS.contains(&kw)
                             && !is_sorbet_annotation_mixin(&call)
                         {
+                            if kw == "delegate" {
+                                visibility.check_delegate_declaration(&statement, file)?;
+                            }
                             if let Ok(e) = ingest_expr(&stmt, file) {
                                 out.unknown_calls.push(e);
                             }
@@ -3399,6 +3402,7 @@ const CONCERN_MODEL_MACROS: &[&str] = &[
     "has_json",
     "typed_store",
     "broadcasts_to",
+    "delegate",
     // `included do include Other end` runs on the includer: spliced
     // after the includer's own `include` line, `Other` sits ahead of
     // this concern in the lookup order, as in Ruby.

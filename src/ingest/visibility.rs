@@ -23,6 +23,7 @@ pub(super) struct Visibility {
     known: HashMap<(bool, String), Vec<usize>>,
     changed: HashSet<(bool, String)>,
     accessors: HashSet<(bool, String)>,
+    defaults: HashMap<usize, MethodVisibility>,
 }
 
 pub(super) fn marker(call: &CallNode<'_>) -> bool {
@@ -97,6 +98,35 @@ impl Visibility {
             return Err(Self::unsupported(
                 file,
                 "visibility of model accessors or aliases requires a local MethodDef",
+            ));
+        }
+        Ok(())
+    }
+
+    /// ActiveSupport `delegate` defines a method at the declaration site,
+    /// so a bare `private`/`protected` marker applies to that generated
+    /// method. The current expander emits public methods only; refuse that
+    /// declaration rather than changing Ruby visibility.
+    pub(super) fn check_delegate_declaration(
+        &self,
+        statement: &Node<'_>,
+        file: &str,
+    ) -> IngestResult<()> {
+        let Some(call) = statement.as_call_node() else {
+            return Ok(());
+        };
+        if call.receiver().is_some() || constant_id_str(&call.name()) != "delegate" {
+            return Ok(());
+        }
+        let visibility = self
+            .defaults
+            .get(&statement.location().start_offset())
+            .copied()
+            .unwrap_or_default();
+        if visibility != MethodVisibility::Public {
+            return Err(Self::unsupported(
+                file,
+                "delegate under non-public visibility is not modeled",
             ));
         }
         Ok(())
@@ -296,6 +326,7 @@ impl Visibility {
         let mut module_function = false;
         for statement in flatten_statements(body) {
             let offset = statement.location().start_offset();
+            self.defaults.insert(offset, default);
             let def = definition(&statement);
             let node = &statement;
             let mut inline = None;
