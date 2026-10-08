@@ -349,10 +349,10 @@ fn inherits_unmodeled_constructor_lookup(
         return false;
     }
     contracts.unmodeled_constructor_lookup.contains(owner)
-        || contracts
-            .includes(owner)
-            .iter()
-            .any(|included| inherits_unmodeled_constructor_lookup(contracts, included, seen))
+        || contracts.includes(owner).iter().any(|included| {
+            !contracts.modules.contains(included)
+                || inherits_unmodeled_constructor_lookup(contracts, included, seen)
+        })
         || contracts
             .parent(owner)
             .is_some_and(|parent| inherits_unmodeled_constructor_lookup(contracts, parent, seen))

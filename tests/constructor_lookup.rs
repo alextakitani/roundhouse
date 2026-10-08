@@ -100,6 +100,47 @@ end
 }
 
 #[test]
+fn directly_included_unmodeled_modules_make_constructor_lookup_unknown() {
+    let source = r#"
+class IncludedLookupTarget
+  include ExternalConstructorHooks
+
+  def initialize(label: "default")
+    @label = label
+  end
+end
+
+class IncludedLookupCaller
+  def self.build
+    IncludedLookupTarget.new(label: "value")
+  end
+end
+"#;
+    let classes = ingest_library_classes(source.as_bytes(), "unknown_include.rb").expect("ingest");
+    let mut app = App::new();
+    app.library_classes.extend(classes);
+    let diagnostics = roundhouse::session::analyze_and_lower(&mut app);
+    let call_start = source
+        .find("IncludedLookupTarget.new(label: \"value\")")
+        .expect("constructor call") as u32;
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.span.start == call_start
+                && matches!(
+                    &diagnostic.kind,
+                    roundhouse::diagnostic::DiagnosticKind::Unsupported {
+                        construct,
+                        detail,
+                        ..
+                    } if construct.as_str() == "constructor keyword arguments"
+                        && detail.contains("unmodeled constructor lookup")
+                )
+        }),
+        "a directly included, unmodeled module may override class-side `new` or `initialize`: {diagnostics:#?}"
+    );
+}
+
+#[test]
 fn nested_keyword_splats_are_preserved_for_constructor_refusal() {
     let source = r#"
 module Outer

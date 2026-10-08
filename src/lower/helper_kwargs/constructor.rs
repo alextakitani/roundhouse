@@ -139,7 +139,7 @@ pub(super) fn lexical_refinement_calls(app: &App) -> HashSet<crate::span::Span> 
         }
     }
     for (index, source) in app.sources.iter().enumerate() {
-        if !source.path.ends_with(".rb") {
+        if !source.path.ends_with(".rb") || !source.text.contains("using") {
             continue;
         }
         let parsed = ruby_prism::parse(source.text.as_bytes());
@@ -296,61 +296,11 @@ pub(super) fn refuse_keyword_splats(
         .unqualified_class_ids
         .get(id.0.as_str())
         .map_or(id.0.as_str(), String::as_str);
-    if params.ambiguous_names.contains(id.0.as_str())
-        && !params.model_names.contains(class_name)
-        && has_keyword_arguments(args)
+    if let Some(reason) =
+        constructor_refusal_reason(params, expr.span, id.0.as_str(), class_name, args)
     {
-        refuse_constructor(
-            expr.span,
-            &mut expr.diagnostic,
-            "cannot verify constructor lookup because this unqualified class name is ambiguous",
-            diagnostics,
-        );
-        return;
+        refuse_constructor(expr.span, &mut expr.diagnostic, reason, diagnostics);
     }
-    if params.lexical_refinement_calls.contains(&expr.span) && has_keyword_arguments(args) {
-        refuse_constructor(
-            expr.span,
-            &mut expr.diagnostic,
-            "a lexical refinement may replace this class's `new` method",
-            diagnostics,
-        );
-        return;
-    }
-    let has_keyword_splat = args
-        .iter()
-        .any(|arg| matches!(&*arg.node, ExprNode::KeywordSplat { .. }));
-    if has_keyword_splat && params.custom_new.contains(class_name) {
-        if params
-            .custom_new_slots
-            .contains_key(&(class_name.to_string(), Symbol::from("new")))
-        {
-            refuse_constructor(
-                expr.span,
-                &mut expr.diagnostic,
-                "cannot safely rebind keyword splats to custom `new` positional slots",
-                diagnostics,
-            );
-        }
-        // Native keyword parameters and keyword-rest on a custom `new` keep
-        // Ruby's call ABI. `lower::forwarding` preserves their splat wrapper.
-        return;
-    }
-    if params.custom_new.contains(class_name)
-        || (!params.unknown_new.contains(class_name)
-            && !params
-                .slots
-                .contains_key(&(class_name.to_string(), Symbol::from("initialize"))))
-        || !has_keyword_splat
-    {
-        return;
-    }
-    refuse_constructor(
-        expr.span,
-        &mut expr.diagnostic,
-        "cannot safely rebind keyword splats to initialize's positional slots",
-        diagnostics,
-    );
 }
 
 pub(super) fn rewrite_instance_call_node(
@@ -402,43 +352,14 @@ fn rewrite_instance_call(
         id.0.as_str()
     };
     if is_constructor
-        && params.ambiguous_names.contains(id.0.as_str())
-        && !params.model_names.contains(class_id)
-        && has_keyword_arguments(args)
+        && let Some(reason) =
+            constructor_refusal_reason(params, expr.span, id.0.as_str(), class_id, args)
     {
-        refuse_constructor(
-            expr.span,
-            &mut expr.diagnostic,
-            "cannot verify constructor lookup because this unqualified class name is ambiguous",
-            diagnostics,
-        );
-        return;
-    }
-    if is_constructor
-        && params.lexical_refinement_calls.contains(&expr.span)
-        && has_keyword_arguments(args)
-    {
-        refuse_constructor(
-            expr.span,
-            &mut expr.diagnostic,
-            "a lexical refinement may replace this class's `new` method",
-            diagnostics,
-        );
+        refuse_constructor(expr.span, &mut expr.diagnostic, reason, diagnostics);
         return;
     }
     if is_constructor {
         if params.custom_new.contains(class_id) {
-            return;
-        }
-        if params.unknown_new.contains(class_id) {
-            if has_keyword_arguments(args) {
-                refuse_constructor(
-                    expr.span,
-                    &mut expr.diagnostic,
-                    "cannot verify the effective `new` method because this class has unmodeled constructor lookup",
-                    diagnostics,
-                );
-            }
             return;
         }
     }
@@ -514,6 +435,57 @@ fn has_keyword_arguments(args: &[Expr]) -> bool {
         } => !entries.is_empty(),
         _ => false,
     })
+}
+
+fn constructor_refusal_reason(
+    params: &InstanceCallParams,
+    span: crate::span::Span,
+    unqualified_name: &str,
+    class_name: &str,
+    args: &[Expr],
+) -> Option<&'static str> {
+    if !has_keyword_arguments(args) {
+        return None;
+    }
+    if params.ambiguous_names.contains(unqualified_name) && !params.model_names.contains(class_name)
+    {
+        return Some(
+            "cannot verify constructor lookup because this unqualified class name is ambiguous",
+        );
+    }
+    if params.lexical_refinement_calls.contains(&span) {
+        return Some("a lexical refinement may replace this class's `new` method");
+    }
+    if params.model_names.contains(class_name)
+        && !params
+            .slots
+            .contains_key(&(class_name.to_string(), Symbol::from("initialize")))
+    {
+        return None;
+    }
+    let has_keyword_splat = args
+        .iter()
+        .any(|arg| matches!(&*arg.node, ExprNode::KeywordSplat { .. }));
+    if params.custom_new.contains(class_name) {
+        return (has_keyword_splat
+            && params
+                .custom_new_slots
+                .contains_key(&(class_name.to_string(), Symbol::from("new"))))
+        .then_some("cannot safely rebind keyword splats to custom `new` positional slots");
+    }
+    if params.unknown_new.contains(class_name) {
+        return Some(
+            "cannot verify the effective `new` method because this class has unmodeled constructor lookup",
+        );
+    }
+    if has_keyword_splat
+        && params
+            .slots
+            .contains_key(&(class_name.to_string(), Symbol::from("initialize")))
+    {
+        return Some("cannot safely rebind keyword splats to initialize's positional slots");
+    }
+    None
 }
 
 fn refuse_constructor(

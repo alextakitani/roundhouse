@@ -943,3 +943,50 @@ fn model_new_calls_keep_the_active_record_attribute_hash_contract() {
         "a model's Active Record constructor must keep its attributes Hash:\n{source}"
     );
 }
+
+#[test]
+fn models_without_flattened_initializers_keep_keyword_hashes_under_unknown_lookup() {
+    let model_source = "class LegacyProject < ApplicationRecord\n  include ExternalConstructorHooks\n\n  def self.build(attributes)\n    [LegacyProject.new(name: attributes[:name]), LegacyProject.new(**attributes)]\n  end\nend\n";
+    let files = [
+        (
+            "db/schema.rb",
+            "ActiveRecord::Schema.define do\n  create_table :legacy_projects do |t|\n    t.string :name\n  end\nend\n",
+        ),
+        (
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\nend\n",
+        ),
+        ("app/models/legacy_project.rb", model_source),
+    ];
+    let tree: HashMap<PathBuf, Vec<u8>> = files
+        .into_iter()
+        .map(|(path, source)| (PathBuf::from(path), source.as_bytes().to_vec()))
+        .collect();
+    let mut app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest model");
+    let diagnostics = roundhouse::session::analyze_and_lower(&mut app);
+    let call_start = model_source
+        .find("new(name: attributes[:name])")
+        .expect("keyword constructor") as u32;
+    assert!(
+        diagnostics.iter().all(|diagnostic| {
+            diagnostic.span.start != call_start
+                || !matches!(
+                    &diagnostic.kind,
+                    roundhouse::diagnostic::DiagnosticKind::Unsupported { construct, .. }
+                        if construct.as_str() == "constructor keyword arguments"
+                )
+        }),
+        "a model without a flattened initialize slot must keep its Active Record attribute-hash contract: {diagnostics:#?}"
+    );
+    let emitted = roundhouse::emit::ruby::emit_spinel(&app)
+        .into_iter()
+        .filter(|file| file.path.to_string_lossy().ends_with("legacy_project.rb"))
+        .map(|file| file.content)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        emitted.contains("LegacyProject.new({ name: attributes[:name] })")
+            && emitted.contains("LegacyProject.new(**attributes)"),
+        "model keyword hashes and splats must remain intact when constructor lookup is external:\n{emitted}"
+    );
+}
