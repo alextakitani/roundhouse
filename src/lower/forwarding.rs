@@ -4,18 +4,26 @@
 
 use crate::App;
 use crate::analyze::forwarding::{
-    KeywordPolicy, keyword_calls_and_constructor_contracts, keyword_refusal,
+    ConstructorContract, KeywordPolicy, keyword_calls_and_constructor_contracts, keyword_refusal,
 };
 use crate::diagnostic::Diagnostic;
 use crate::expr::{Expr, ExprNode};
-use std::collections::HashSet;
+use crate::ident::ClassId;
+use std::collections::{HashMap, HashSet};
 
 pub(super) fn apply(app: &mut App) -> Vec<Diagnostic> {
     let (plans, constructors) = keyword_calls_and_constructor_contracts(app);
-    let constructor_splat_classes: HashSet<String> = constructors
-        .into_iter()
+    let constructor_splat_classes = constructor_splat_classes(&constructors);
+    apply_with_plans(app, &plans, &constructor_splat_classes)
+}
+
+pub(super) fn constructor_splat_classes(
+    constructors: &HashMap<ClassId, ConstructorContract<'_>>,
+) -> HashSet<String> {
+    constructors
+        .iter()
         .filter_map(|(class, contract)| match contract {
-            crate::analyze::forwarding::ConstructorContract::Initialize(method)
+            ConstructorContract::Initialize(method)
                 if !method
                     .params
                     .iter()
@@ -24,15 +32,21 @@ pub(super) fn apply(app: &mut App) -> Vec<Diagnostic> {
             {
                 Some(class.0.as_str().to_string())
             }
-            crate::analyze::forwarding::ConstructorContract::CustomNew(Some(_))
-            | crate::analyze::forwarding::ConstructorContract::UnknownLookup => {
+            ConstructorContract::CustomNew(Some(_)) | ConstructorContract::UnknownLookup => {
                 Some(class.0.as_str().to_string())
             }
             _ => None,
         })
-        .collect();
+        .collect()
+}
+
+pub(super) fn apply_with_plans(
+    app: &mut App,
+    plans: &HashMap<crate::span::Span, KeywordPolicy>,
+    constructor_splat_classes: &HashSet<String>,
+) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
-    for (span, policy) in &plans {
+    for (span, policy) in plans {
         if matches!(
             policy,
             KeywordPolicy::Refuse | KeywordPolicy::RefuseOrdinarySuper
@@ -82,6 +96,6 @@ pub(super) fn apply(app: &mut App) -> Vec<Diagnostic> {
         e.node
             .for_each_child_mut(&mut |c| project(c, plans, constructor_splat_classes));
     }
-    super::for_each_forwarding_body(app, &mut |e| project(e, &plans, &constructor_splat_classes));
+    super::for_each_forwarding_body(app, &mut |e| project(e, plans, constructor_splat_classes));
     diagnostics
 }

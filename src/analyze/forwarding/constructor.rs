@@ -19,11 +19,6 @@ pub(crate) enum ConstructorContract<'a> {
     Initialize(&'a MethodDef),
 }
 
-pub(crate) fn constructor_contracts(app: &App) -> HashMap<ClassId, ConstructorContract<'_>> {
-    let contracts = SourceContractIndex::new(app);
-    constructor_contracts_with_index(app, &contracts)
-}
-
 pub(super) fn constructor_contracts_with_index<'a>(
     app: &'a App,
     contracts: &SourceContractIndex<'a>,

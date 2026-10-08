@@ -21,7 +21,13 @@ pub(super) struct InstanceCallParams {
 }
 
 impl InstanceCallParams {
-    pub(super) fn new(app: &App) -> Self {
+    pub(super) fn new(
+        app: &App,
+        constructors: HashMap<
+            crate::ident::ClassId,
+            crate::analyze::forwarding::ConstructorContract<'_>,
+        >,
+    ) -> Self {
         let mut slots: HashMap<(String, Symbol), Vec<Slot>> = HashMap::new();
         for class in &app.library_classes {
             for method in &class.methods {
@@ -44,7 +50,6 @@ impl InstanceCallParams {
             }
         }
 
-        let constructors = crate::analyze::forwarding::constructor_contracts(app);
         let mut custom_new = HashSet::new();
         let mut custom_new_slots = HashMap::new();
         let mut unknown_new = HashSet::new();

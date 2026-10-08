@@ -64,15 +64,18 @@ pub fn apply_helper_kwarg_positional_lowering(app: &mut App) -> Vec<crate::diagn
     // producers rejoin this pass's established positional normalization.
     apply_to_test_modules(app);
     let mut diagnostics = Vec::new();
-    let instance_params = InstanceCallParams::new(app);
+    let (plans, constructors) =
+        crate::analyze::forwarding::keyword_calls_and_constructor_contracts(app);
+    let constructor_splat_classes = super::forwarding::constructor_splat_classes(&constructors);
+    let instance_params = InstanceCallParams::new(app, constructors);
     let class_params = library_class_call_params(app);
+    let _ = super::forwarding::apply_with_plans(app, &plans, &constructor_splat_classes);
     super::for_each_hook_body(app, &mut |expr| {
         constructor::refuse_keyword_splats(expr, &instance_params, &mut diagnostics);
     });
     for view in &mut app.views {
         constructor::refuse_keyword_splats(&mut view.body, &instance_params, &mut diagnostics);
     }
-    let _ = super::forwarding::apply(app);
     if !class_params.is_empty()
         || !instance_params.slots.is_empty()
         || !instance_params.unknown_new.is_empty()

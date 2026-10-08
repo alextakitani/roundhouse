@@ -14,7 +14,7 @@ use crate::span::Span;
 use crate::ty::Ty;
 
 mod constructor;
-pub(crate) use constructor::{ConstructorContract, constructor_contracts};
+pub(crate) use constructor::ConstructorContract;
 
 pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
     let mut out = Vec::new();
