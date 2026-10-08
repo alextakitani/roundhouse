@@ -24,6 +24,15 @@ use crate::ty::{Row, Ty};
 
 /// A break in a bytes block can replace the method's String result. Nested
 /// lambdas/iterators and while/until loops own their breaks independently.
+// `Class[C]` is a class object that dispatch unwraps to `C`.
+fn instance_shaped(ty: &Ty) -> bool {
+    match ty {
+        Ty::Class { id, .. } => id.0.as_str() != "Class",
+        Ty::Union { variants } => variants.iter().all(|v| matches!(v, Ty::Nil) || instance_shaped(v)),
+        _ => false,
+    }
+}
+
 fn bytes_block_has_escaping_break(e: &Expr) -> bool {
     match &*e.node {
         ExprNode::Break { .. } => true,
@@ -140,6 +149,8 @@ pub struct Ctx {
     /// `ActiveRecord::Base … lacks a shared runtime` on the template
     /// itself is noise that hides the real ledger.
     pub claimed_macro_template: bool,
+    // `!class_side` cannot stand in: scope bodies type with it false, and their bare `active` is the scope.
+    pub instance_body: bool,
 }
 
 /// User-class dispatch data: table name (if any), instance shape,
@@ -586,6 +597,12 @@ impl<'a> BodyTyper<'a> {
             }
             _ => false,
         }
+    }
+
+    // `x.class` is not a class reference to `is_class_object`, yet types as the same flat `Ty::Class` as an instance.
+    fn is_instance(&self, expr: &Expr, ctx: &Ctx) -> bool {
+        !self.is_class_object(expr, ctx)
+            && !matches!(&*expr.node, ExprNode::Send { method, args, .. } if method.as_str() == "class" && args.is_empty())
     }
 
     fn is_module_callback(&self, recv_ty: Option<&Ty>, method: &Symbol) -> bool {
@@ -1286,6 +1303,8 @@ impl<'a> BodyTyper<'a> {
                         if let Some(receiver) = recv.as_ref() {
                             block_ctx.self_ty = recv_ty.clone();
                             block_ctx.class_side = self.is_class_object(receiver, ctx);
+                            block_ctx.instance_body = matches!(method.as_str(), "instance_eval" | "instance_exec")
+                                && self.is_instance(receiver, ctx);
                         }
                     }
                     let method_ref_ty = self.analyze_expr(b, &block_ctx);
@@ -1462,7 +1481,10 @@ impl<'a> BodyTyper<'a> {
                 {
                     return t;
                 }
-                let dispatched = self.dispatch(recv_ty.as_ref(), method, block_ret.as_ref(), args);
+                let instance_receiver = recv.as_ref().map_or(ctx.instance_body, |r| self.is_instance(r, ctx))
+                    && recv_ty.as_ref().is_some_and(instance_shaped);
+                let dispatched =
+                    self.dispatch_on(recv_ty.as_ref(), method, block_ret.as_ref(), args, instance_receiver);
                 if let Some(receiver) = recv.as_mut() {
                     receiver.decisions &= !crate::expr::RESOLVED_OPERATOR_RECEIVER;
                     if matches!(method.as_str(), "+" | "-" | "*" | "/" | "**" | "%" | "<" | "<=" | ">" | ">=")
