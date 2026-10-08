@@ -279,6 +279,76 @@ fn to_attrs_follows_attribute_hash_demand() {
     );
 }
 
+/// Foreign `new(attributes)` must not count as Hash-only: the ctor list
+/// is method-name based, so a non-self receiver (e.g. envelope) keeps
+/// the dynamic path even when a helper site also calls the method.
+#[test]
+fn foreign_new_receiver_does_not_force_attrs() {
+    let mut app = ingest_app_from_tree(tree(&[
+        ("db/schema.rb", SCHEMA),
+        (
+            "app/models/note.rb",
+            r#"class Note < ApplicationRecord
+  def self.wrap!(attributes)
+    RequestEnvelope.new(attributes)
+  end
+end
+"#,
+        ),
+        (
+            "app/models/request_envelope.rb",
+            r#"class RequestEnvelope
+  def self.new(attributes)
+    attributes
+  end
+end
+"#,
+        ),
+        (
+            "app/models/webhook.rb",
+            r#"class Webhook
+  def self.deliver(note)
+    bag = { text: "x" }
+    note.class.wrap!(bag)
+  end
+end
+"#,
+        ),
+        (
+            "app/controllers/messages_controller.rb",
+            r#"class MessagesController < ApplicationController
+  def create
+    @room = Room.find(params[:room_id])
+    Note.wrap!(note_params)
+  end
+
+  private
+    def note_params
+      params.require(:note).permit(:text)
+    end
+end
+"#,
+        ),
+        (
+            "app/models/room.rb",
+            r#"class Room < ApplicationRecord
+  has_many :notes
+end
+"#,
+        ),
+    ]))
+    .expect("ingest");
+    roundhouse::session::analyze_and_lower(&mut app);
+    let ctrl = emitted(
+        &ruby::emit_lowered_controllers(&app),
+        "app/controllers/messages_controller.rb",
+    );
+    assert!(
+        !ctrl.contains("note_params.to_attrs"),
+        "foreign new(attributes) must not force Attrs:\n{ctrl}"
+    );
+}
+
 /// Body-wins is not census-wins-always: an opaque local still collapses
 /// the binding when the body does not need a Hash.
 #[test]

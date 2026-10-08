@@ -411,11 +411,12 @@ fn scan_bindings(app: &App, specs: &ParamsSpecs) -> HashMap<BindKey, Binding> {
 /// witness.
 ///
 /// Hash-only body uses: receiver `delete`/`[]=`/`[]=`-assign, or the
-/// parameter passed to AR ctors/mutators (`create!`, `new`, `update!`,
-/// `assign_attributes`, … — see [`HASH_CTOR_METHODS`]). `merge` is
-/// deliberately absent: `convert_attributes_in` already rewrites a
-/// params receiver's `merge` to `to_attrs.merge` at the site, so a body
-/// calling it proves nothing.
+/// parameter passed to **self** AR ctors/mutators (`create!`, `new`,
+/// `update!`, `assign_attributes`, … — see [`HASH_CTOR_METHODS`];
+/// receiver must be implicit/explicit `self`, not a foreign Const).
+/// `merge` is deliberately absent: `convert_attributes_in` already
+/// rewrites a params receiver's `merge` to `to_attrs.merge` at the
+/// site, so a body calling it proves nothing.
 fn hash_only_params(app: &App) -> std::collections::HashSet<BindKey> {
     let mut out = std::collections::HashSet::new();
     let unqualified = |id: &ClassId| Symbol::from(id.0.as_str().rsplit("::").next().unwrap_or(id.0.as_str()));
@@ -456,6 +457,17 @@ const HASH_CTOR_METHODS: &[&str] = &[
     "attributes=",
 ];
 
+/// Receiver is the method's own self (implicit or explicit). Foreign
+/// receivers like `RequestEnvelope.new(attributes)` must not count as
+/// Hash-only — that would force Attrs + `to_attrs` at helper sites even
+/// when the callee expects the params object.
+fn hash_ctor_recv_is_self(recv: &Option<Expr>) -> bool {
+    match recv {
+        None => true,
+        Some(r) => matches!(&*r.node, ExprNode::SelfRef),
+    }
+}
+
 /// Is `name` used in a way only a Hash answers anywhere in `body`?
 fn uses_as_hash(body: &Expr, name: &Symbol) -> bool {
     let mut found = false;
@@ -467,15 +479,18 @@ fn uses_as_hash(body: &Expr, name: &Symbol) -> bool {
             matches!(&*x.node, ExprNode::Var { name: n, .. } if n == name)
         };
         match &*e.node {
-            // `create!(attributes)` / `new(attributes)` — the runtime
-            // constructors take a Symbol-keyed attribute hash. Without
+            // `create!(attributes)` / `self.new(attributes)` — AR/self
+            // ctors take a Symbol-keyed attribute hash. Receiver must be
+            // self (implicit or explicit); ignoring that would treat
+            // `RequestEnvelope.new(attributes)` as Hash-only. Without
             // this arm, campfire's `create_with_attachment!` body never
             // counted as `body_needs_hash` (it has no `delete`/`[]=`),
             // and test sites passing a local `attributes` poisoned Attrs.
-            ExprNode::Send { method, args, .. }
+            ExprNode::Send { recv, method, args, .. }
                 if args.len() == 1
                     && reads_name(&args[0])
-                    && HASH_CTOR_METHODS.contains(&method.as_str()) =>
+                    && HASH_CTOR_METHODS.contains(&method.as_str())
+                    && hash_ctor_recv_is_self(recv) =>
             {
                 found = true;
             }
