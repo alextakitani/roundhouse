@@ -2635,7 +2635,9 @@ pub(super) fn array_method(method: &Symbol, elem: &Ty, block_ret: Option<&Ty>) -
         // tuple; result is Hash<k, v>. We approximate as Hash<elem, elem>
         // when the block's tuple types aren't tracked at this layer;
         // refine when fixture demands richer tuple-element typing.
-        "to_h" => match block_ret {
+        // Not keyed by `elem` without a block: each element is the [key, value]
+        // pair, and `h = h.sort_by { … }.to_h` nested the pair one level per round.
+        "to_h" => match block_ret.or(Some(elem)) {
             Some(Ty::Tuple { elems }) if elems.len() == 2 => Ty::Hash {
                 key: Box::new(elems[0].clone()),
                 value: Box::new(elems[1].clone()),
