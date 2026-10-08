@@ -438,7 +438,113 @@ end
             "raise 'base dispatch changed' unless Probe.base(value: 11) == :inherited; raise 'sibling dispatch changed' unless Probe.sibling(value: 12) == :inherited; puts 'base and sibling keyword calls still dispatch'",
         );
     run.assert_passes();
+    assert!(run.errors.is_empty(), "errors={:?}", run.errors);
     assert_eq!(run.stdout, "base and sibling keyword calls still dispatch\n");
+}
+
+#[test]
+fn keyword_super_packet_to_plain_parent_emits_and_executes() {
+    let classes = r#"
+class PacketParent
+  def self.route(**)
+    :parent_contract
+  end
+end
+
+class PacketChild < PacketParent
+  def self.route(**)
+    super(**)
+  end
+end
+"#;
+    let run = emit_and_run::real_blog()
+        .write("app/lib/keyword_super_packets.rb", classes)
+        .run_ruby(
+            "raise 'super keyword packet changed' unless PacketChild.route(value: 17) == :parent_contract; puts 'plain parent keyword contract preserved'",
+        );
+
+    run.assert_passes();
+    assert!(run.errors.is_empty(), "errors={:?}", run.errors);
+    assert_eq!(run.stdout, "plain parent keyword contract preserved\n");
+}
+
+#[test]
+fn keyword_packet_through_super_checks_replaced_model_ancestor() {
+    let parent = r#"
+class ForwardingRecord < ApplicationRecord
+  self.abstract_class = true
+  def self._conflict_predicate(**); :source; end
+end
+"#;
+    let child = r#"
+class ChildArticle < Article
+  def self._conflict_predicate(**)
+    super(**)
+  end
+end
+"#;
+    // The source keyword-rest contract accepts this call. Article's partial
+    // index instead synthesizes a positional columns method; `super(**)`
+    // reaches that replacement from the child's inherited lookup chain.
+    let native_source = r#"
+class ForwardingRecord
+  def self._conflict_predicate(**); :source; end
+end
+class Article < ForwardingRecord
+  def self._conflict_predicate(columns); columns.join(","); end
+end
+class ChildArticle < Article
+  def self._conflict_predicate(**); super(**); end
+end
+begin
+  ChildArticle._conflict_predicate(columns: [:id])
+  raise "super packet unexpectedly matched the source keyword-rest contract"
+rescue NoMethodError => error
+  raise unless error.name == :join
+end
+puts "super packet reaches the synthesized positional contract"
+"#;
+    let native = Command::new("ruby")
+        .args(["-e", native_source])
+        .output()
+        .unwrap();
+    assert!(
+        native.status.success(),
+        "native stderr: {}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        "super packet reaches the synthesized positional contract\n"
+    );
+
+    let run = emit_and_run::real_blog()
+        .write("app/models/forwarding_record.rb", parent)
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord",
+            "class Article < ForwardingRecord",
+        )
+        .write("app/lib/keyword_forwarding_child.rb", child)
+        .edit(
+            "db/schema.rb",
+            "    t.string \"title\"",
+            "    t.string \"title\"\n    t.index [\"title\"], name: \"index_articles_live_title\", unique: true, where: \"(id > 0)\"",
+        )
+        .run_ruby("puts 'super packet into a replaced model ancestor is diagnosed'");
+    assert!(run.success, "actual={}; stderr={}", run.stdout, run.stderr);
+    assert_eq!(
+        run.stdout,
+        "super packet into a replaced model ancestor is diagnosed\n"
+    );
+    assert_eq!(run.errors.len(), 1, "errors={:?}", run.errors);
+    assert!(
+        run.errors[0].contains("model method synthesis"),
+        "errors={:?}; actual={}; stderr={}",
+        run.errors,
+        run.stdout,
+        run.stderr
+    );
 }
 
 #[test]

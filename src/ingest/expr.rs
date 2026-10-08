@@ -2577,9 +2577,14 @@ fn detect_leading_guard<'a>(node: &Node<'a>) -> Option<Node<'a>> {
     Some(if_node.predicate())
 }
 
-/// The argument-list walk is adapted from Tim Tischler's F7 commit
-/// 013588ec. Preserve the marker instead of erasing keyword identity
-/// into a positional hash and synthesizing three user-visible bindings.
+/// Preserve packet identity for a lone anonymous `**`, or for static symbol
+/// key/value pairs followed by one trailing anonymous `**`. The latter keeps
+/// pair order and lets the packet override duplicate explicit keys. Earlier
+/// or repeated anonymous splats, named/dynamic splats in the same group, and
+/// non-static keys remain unsupported because the IR has no ordered dynamic
+/// merge form. The argument-list walk is adapted from Tim Tischler's F7 commit
+/// 013588ec; retaining the marker avoids a positional hash and synthetic
+/// user-visible bindings.
 fn ingest_forwardable_arguments(
     a: &ruby_prism::ArgumentsNode<'_>,
     file: &str,

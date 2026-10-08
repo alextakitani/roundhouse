@@ -193,6 +193,10 @@ fn accepts_keywords(method: &MethodDef) -> bool {
     method.params.iter().any(|p| p.forwarding || p.keyword)
 }
 
+/// Fail closed unless a source packet reaches a declaration with preserved
+/// keyword ABI and every reachable model/virtual override retains it. Ordinary
+/// sends use indexed lookup; `super` retains the conservative global source-span
+/// synthesis guard because its runtime ancestor path is not fully represented.
 fn keyword_contract_error(
     context: Option<(&ClassId, &MethodDef)>,
     call: &Expr,
@@ -210,9 +214,6 @@ fn keyword_contract_error(
         return Some("forwarding destination has flattened keyword parameters");
     }
     let unretained = if matches!(&*call.node, ExprNode::Super { .. }) {
-        // `super` starts after the lexical owner and can dispatch through an
-        // inherited method body. Keep its existing conservative source-span
-        // guard until that runtime receiver path is represented explicitly.
         contracts.unretained.contains(&method.name_span)
     } else {
         contracts.unretained_in_lookup(
@@ -250,6 +251,9 @@ fn keyword_contract_error(
     None
 }
 
+/// A source-resolved call target plus the receiver's original lookup start.
+/// Keeping the owner is necessary to distinguish an affected model lookup
+/// from an unrelated sibling that happens to share the declaration span.
 struct ResolvedDestination<'a> {
     method: &'a MethodDef,
     model: bool,
@@ -259,6 +263,10 @@ struct ResolvedDestination<'a> {
     lookup_owner: ClassId,
 }
 
+/// Resolve only destinations whose source receiver and dispatch path are
+/// represented well enough to check an argument contract. Unknown receiver
+/// provenance, association methods, and unresolved `super` ancestors return
+/// `None` instead of borrowing an inferred ABI.
 fn destination<'a>(
     app: &'a App,
     contracts: &SourceContractIndex<'a>,
@@ -409,6 +417,8 @@ fn contract_error(
     None
 }
 
+/// Enumerate source-visible self-dispatch overrides. An incomplete or reopened
+/// lookup hierarchy is an error rather than evidence that no override exists.
 fn virtual_destinations<'a>(
     contracts: &SourceContractIndex<'a>,
     context: Option<(&ClassId, &MethodDef)>,
@@ -744,6 +754,10 @@ struct SourceContractIndex<'a> {
 }
 
 impl<'a> SourceContractIndex<'a> {
+    /// Build source lookup and collect only selectors that need preservation
+    /// checks: full forwarders and declarations reached by source argument
+    /// packets. This bounds the model-synthesis survey without omitting
+    /// inherited contracts selected through sends or explicit packet `super`.
     fn new(app: &'a App) -> Self {
         let mut index = Self {
             parents: HashMap::new(),
@@ -798,13 +812,16 @@ impl<'a> SourceContractIndex<'a> {
                 .map(|(_, method)| method.name.clone()),
         );
         // Full forwarders need inherited-contract checks too; ordinary
-        // methods matter only when a source packet is sent to them. Include
-        // matching model-owned declarations as well, since synthesis can
-        // replace those before emission. Looking up every unrelated selector
-        // for every model makes large-app transpilation quadratic in the
-        // source inventory.
+        // methods matter only when a source packet is sent to them or
+        // forwarded through `super`. Include matching model-owned
+        // declarations as well, since synthesis can replace those before
+        // emission. Looking up every unrelated selector for every model
+        // makes large-app transpilation quadratic in the source inventory.
         let mut names = index.full_selectors.clone();
-        fn collect(e: &Expr, names: &mut HashSet<Symbol>) {
+        // Add selectors whose source packets can reach model-built methods;
+        // `super` inherits the enclosing method's selector rather than
+        // carrying one on its own node.
+        fn collect(e: &Expr, enclosing: &Symbol, names: &mut HashSet<Symbol>) {
             if let ExprNode::Send { method, args, .. } = &*e.node
                 && has_source_packet(args)
             {
@@ -813,12 +830,18 @@ impl<'a> SourceContractIndex<'a> {
                     names.insert(Symbol::from("initialize"));
                 }
             }
-            e.node.for_each_child(&mut |child| collect(child, names));
+            if let ExprNode::Super { args: Some(args) } = &*e.node
+                && has_source_packet(args)
+            {
+                names.insert(enclosing.clone());
+            }
+            e.node
+                .for_each_child(&mut |child| collect(child, enclosing, names));
         }
         for (_, method) in methods(app) {
-            collect(&method.body, &mut names);
+            collect(&method.body, &method.name, &mut names);
             for default in method.params.iter().filter_map(|p| p.default.as_ref()) {
-                collect(default, &mut names);
+                collect(default, &method.name, &mut names);
             }
         }
         if !names.is_empty() {
