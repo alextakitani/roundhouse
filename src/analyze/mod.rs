@@ -3778,6 +3778,12 @@ impl Analyzer {
             extract_partial_render_sites(&view.body, &view.name, &mut throwaway, &mut targets);
             record_render_edges(&mut render_edges, &view.name, targets);
         }
+        // A jbuilder template renders its partials through
+        // `json.partial!` / `json.array!` and the `partial:` option, not
+        // `render`, and its partials read its ivars all the same.
+        for (renderer, targets) in crate::lower::jbuilder_to_library::jbuilder_render_edges(app) {
+            record_render_edges(&mut render_edges, &renderer, targets);
+        }
 
         // Propagate each renderer's ivar context onto the partials it
         // renders, to a fixpoint so nested partials (a partial rendering a

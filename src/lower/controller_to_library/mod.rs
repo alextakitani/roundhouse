@@ -320,7 +320,7 @@ pub fn lower_controllers_with_arel_views_assocs_and_routes(
     // The view↔controller ivar contract: each action view's read-ivars,
     // so the render rewrite passes `@<name>` for each (matching the view's
     // generated parameter list). See view_to_library::action_view_ivar_map.
-    let view_ivars = crate::lower::view_to_library::action_view_ivar_map(views, controllers);
+    let view_ivars = crate::lower::view_to_library::action_view_ivar_map(views, controllers, models);
     // Controller-side partial renders (`render partial: "commentbox",
     // locals: {…}`) bind against the partial's def-site parameter order.
     let partials: PartialMap =

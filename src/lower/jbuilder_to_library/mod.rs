@@ -223,8 +223,26 @@ fn build_library_class(
         jbuilder_method_parts(view, app, dir, stem, is_partial, partials);
 
     // Rewrite `@ivar` → bare `ivar` so the inferred arg / extras
-    // read as plain locals. Mirrors the ERB lowerer.
+    // read as plain locals. Mirrors the ERB lowerer. A partial's ivar
+    // whose name one of its locals takes reads its own parameter
+    // (`PartialParams`), so the two stay apart.
+    let partial_key = is_partial.then(|| {
+        let (mod_path, method) = partial_target(&format!("{dir}/{stem}"), dir);
+        partial_key(&mod_path, &method)
+    });
     let mut rewritten = rewrite_ivars_to_locals(&view.body);
+    if let Some(ivars) = partial_key.as_ref().and_then(|k| partials.ivars.get(k)) {
+        let renames: std::collections::HashMap<Symbol, Symbol> = ivars
+            .iter()
+            .filter(|(iv, p)| crate::naming::safe_local(iv.as_str()) != p.as_str())
+            .cloned()
+            .collect();
+        if !renames.is_empty() {
+            let mut body = view.body.clone();
+            rename_ivars(&mut body, &renames);
+            rewritten = rewrite_ivars_to_locals(&body);
+        }
+    }
     // A partial's `local_assigns[:x]` is its parameter `x`, nil when
     // the caller did not pass it — the ERB lowering's reading.
     if is_partial {
@@ -266,6 +284,7 @@ fn build_library_class(
         models: known_models.iter().cloned().collect(),
         temps: Default::default(),
         partials: partials.clone(),
+        partial_key,
     };
 
     let mut body_stmts: Vec<Expr> = Vec::new();
@@ -349,21 +368,25 @@ fn jbuilder_method_parts(
     //
     // Same call the render call site's contract uses
     // (`action_view_ivar_map`, which now carries json), so def site and
-    // call site cannot disagree about arity or order. A PARTIAL takes
-    // the locals its callers pass instead (`local_params` below), and
-    // reads no ivar at all.
+    // call site cannot disagree about arity or order. The ivars are
+    // the template's CLOSURE (`PartialParams::closures`): its own reads
+    // and those of every partial it renders, which it passes on.
     let ivar_params: Vec<Symbol> = if is_partial {
         Vec::new()
     } else {
-        crate::lower::view_to_library::view_read_ivars(&view.body)
+        partials.closures.get(&view.name).cloned().unwrap_or_else(|| {
+            crate::lower::view_to_library::view_read_ivars(&view.body)
+        })
     };
 
     // A PARTIAL's parameters are the locals its callers render it
-    // with (`PartialParams`): Rails binds a partial's locals by the
-    // names the call passes, never by the partial's own file name.
+    // with, then the ivars of its closure (`PartialParams`): Rails
+    // binds a partial's locals by the names the call passes, never by
+    // the partial's own file name, and a partial reads its renderer's
+    // ivars.
     let local_params: Option<&Vec<Symbol>> = if is_partial {
         let (mod_path, method) = partial_target(&format!("{dir}/{stem}"), dir);
-        partials.get(&partial_key(&mod_path, &method))
+        partials.params.get(&partial_key(&mod_path, &method))
     } else {
         None
     };
@@ -403,11 +426,21 @@ fn jbuilder_method_parts(
         // A local named as the convention would have named it keeps
         // the convention's type (the model of the partial's
         // directory); any other takes the model its own name gives.
+        let key = {
+            let (mod_path, method) = partial_target(&format!("{dir}/{stem}"), dir);
+            partial_key(&mod_path, &method)
+        };
+        let ivar_of = |p: &Symbol| {
+            partials.ivars.get(&key).and_then(|ivs| ivs.iter().find(|(_, q)| q == p)).map(|(iv, _)| iv.clone())
+        };
         let typed: Vec<(String, crate::ty::Ty)> = locals
             .iter()
             .map(|l| {
                 let n = l.as_str().to_string();
-                let t = if n == arg_name {
+                let t = if let Some(iv) = ivar_of(l).filter(|iv| iv.as_str() != n) {
+                    // A renamed ivar parameter is typed as its ivar.
+                    crate::lower::view_to_library::ivar_ty(iv.as_str(), &known_models)
+                } else if n == arg_name {
                     crate::lower::view_to_library::record_arg_ty(dir, false, &known_models)
                 } else {
                     crate::lower::view_to_library::ivar_ty(&n, &known_models)
@@ -514,6 +547,9 @@ struct Ctx {
     /// Every jbuilder partial's parameters, for the calls this template
     /// makes to them.
     partials: std::rc::Rc<PartialParams>,
+    /// This template's own `partial_key` when it is a partial: the
+    /// key its ivar parameters are under (`PartialParams::ivar_param`).
+    partial_key: Option<(String, String)>,
 }
 
 /// Classification of a single top-level statement in a jbuilder
@@ -1624,20 +1660,30 @@ fn emit_partial_call(partial_path: &str, locals: Vec<(Symbol, Expr)>, ctx: &Ctx)
 /// local its callers bind (`PartialParams`), so the call passes each
 /// parameter the value this call binds under that name, and `nil` for
 /// a local only other callers pass: Rails would leave it unset, which
-/// the partial reads through `local_assigns[:x]` as nil. A partial this
-/// app has no jbuilder template for takes the values in call order.
+/// the partial reads through `local_assigns[:x]` as nil. An ivar the
+/// partial reads is passed on from the caller, whose own closure made
+/// it a parameter there too. A partial this app has no jbuilder
+/// template for takes the values in call order.
 fn partial_call(partial_path: &str, locals: Vec<(Symbol, Expr)>, ctx: &Ctx) -> Expr {
     let (mod_path, method) = partial_target(partial_path, &ctx.resource_dir);
     let key = partial_key(&mod_path, &method);
-    let args: Vec<Expr> = match ctx.partials.get(&key) {
+    let args: Vec<Expr> = match ctx.partials.params.get(&key) {
         Some(params) => {
+            let ivars = ctx.partials.ivars.get(&key);
             let mut locals = locals;
             let binds = |k: &Symbol, p: &Symbol| crate::naming::safe_local(k.as_str()) == p.as_str();
             params
                 .iter()
-                .map(|p| match locals.iter().position(|(k, _)| binds(k, p)) {
-                    Some(i) => locals.remove(i).1,
-                    None => nil_lit(),
+                .map(|p| {
+                    // An ivar the partial reads: the caller's own
+                    // parameter for it, which its closure gave it.
+                    if let Some((iv, _)) = ivars.and_then(|ivs| ivs.iter().find(|(_, q)| q == p)) {
+                        return var_ref(ctx.partials.ivar_param(ctx.partial_key.as_ref(), iv));
+                    }
+                    match locals.iter().position(|(k, _)| binds(k, p)) {
+                        Some(i) => locals.remove(i).1,
+                        None => nil_lit(),
+                    }
                 })
                 .collect()
         }
@@ -1646,30 +1692,64 @@ fn partial_call(partial_path: &str, locals: Vec<(Symbol, Expr)>, ctx: &Ctx) -> E
     send(Some(const_path(&mod_path)), &format!("{method}_json"), args, None, true)
 }
 
-/// Each jbuilder partial's parameters, keyed by `partial_key`: the
+/// The contract between the app's jbuilder templates and the partials
+/// they render, computed once from every template.
+///
+/// A partial's parameters (`params`, keyed by `partial_key`) are the
 /// locals the app's jbuilder templates render it with, in first-seen
 /// order — a `json.partial!` locals key, the `as:` of a collection or
 /// one-record render, the record's own name for `json.partial!
 /// @record` — then the `local_assigns[:x]` keys the partial reads that
-/// no call passes. Rails binds a partial's locals by those names, never
-/// by the partial's file name, so two callers that pass different keys
-/// give the partial one parameter per key, each caller passing nil for
-/// the keys it does not. A partial no template renders by a recognized
-/// call keeps the name convention (`infer_view_arg`).
-pub(crate) type PartialParams = std::collections::HashMap<(String, String), Vec<Symbol>>;
+/// no call passes, then the ivars of its closure. Rails binds a partial's locals by those names, never by the
+/// partial's file name, so two callers that pass different keys give
+/// the partial one parameter per key, each caller passing nil for the
+/// keys it does not. A partial no template renders by a recognized call
+/// keeps the name convention (`infer_view_arg`) for its locals.
+///
+/// A partial reads its renderer's ivars, as every Rails view in the
+/// request does. `closures` (keyed by view name) is each template's
+/// own ivar reads and, transitively, those of every partial it
+/// renders: an action template takes them all as parameters, which
+/// the controller passes (`action_view_ivar_map` reads the same map),
+/// and passes each partial the ones it reads (`ivars`).
+///
+/// A local and an ivar of one name are two values in Rails — `note`
+/// is what the caller passed, `@note` the controller's — so they are
+/// two parameters here. The ivar's is named after it (`note`) unless a
+/// local of the partial already takes that name; then it is the
+/// generated `__rh_ivar_note` (`_2`, `_3`, … past any name the partial
+/// uses), its `@note` reads are rewritten to it, and every render
+/// passes it on under the caller's own parameter for `@note`.
+#[derive(Default)]
+pub(crate) struct PartialParams {
+    params: std::collections::HashMap<(String, String), Vec<Symbol>>,
+    /// Each partial's ivar parameters: the ivar, then its parameter.
+    ivars: std::collections::HashMap<(String, String), Vec<(Symbol, Symbol)>>,
+    closures: std::collections::HashMap<Symbol, Vec<Symbol>>,
+}
+
+impl PartialParams {
+    /// The parameter a template reads `@ivar` through: a partial's
+    /// own, else the ivar's name, as an action template takes it.
+    fn ivar_param(&self, key: Option<&(String, String)>, ivar: &Symbol) -> Symbol {
+        key.and_then(|k| self.ivars.get(k))
+            .and_then(|ivs| ivs.iter().find(|(iv, _)| iv == ivar))
+            .map(|(_, p)| p.clone())
+            .unwrap_or_else(|| Symbol::from(crate::naming::safe_local(ivar.as_str())))
+    }
+}
 
 fn partial_params(app: &App) -> PartialParams {
     let known_models: Vec<String> =
         app.models.iter().map(|m| m.name.0.as_str().to_string()).collect();
-    let models: std::collections::HashSet<String> = known_models.iter().cloned().collect();
     let views: Vec<&View> = app.views.iter().filter(|v| v.jbuilder && !v.analysis_only).collect();
-    let mut bound: PartialParams = PartialParams::new();
-    for v in &views {
-        let (dir, _) = split_view_name(v.name.as_str());
-        let mut sites = Vec::new();
-        collect_partial_sites(&v.body, dir, &models, &mut sites);
-        for (key, names) in sites {
-            let entry = bound.entry(key).or_default();
+    let edges = render_edges(&views, &known_models);
+    let closures = ivar_closures(&views, &edges);
+    let mut bound: std::collections::HashMap<(String, String), Vec<Symbol>> =
+        std::collections::HashMap::new();
+    for (_, sites) in &edges {
+        for (key, _, names) in sites {
+            let entry = bound.entry(key.clone()).or_default();
             for n in names {
                 let n = Symbol::from(crate::naming::safe_local(n.as_str()));
                 if !entry.contains(&n) {
@@ -1678,7 +1758,7 @@ fn partial_params(app: &App) -> PartialParams {
             }
         }
     }
-    let mut out = PartialParams::new();
+    let mut out = PartialParams { closures, ..Default::default() };
     for v in &views {
         let (dir, base) = split_view_name(v.name.as_str());
         let Some(stem) = base.strip_prefix('_') else { continue };
@@ -1699,9 +1779,164 @@ fn partial_params(app: &App) -> PartialParams {
                 names.push(Symbol::from(arg_name));
             }
         }
-        out.insert(key, names);
+        let locals = names.len();
+        let mut used = std::collections::HashSet::new();
+        collect_local_names(&v.body, &mut used);
+        used.extend(names.iter().cloned());
+        let mut ivars = Vec::new();
+        for iv in out.closures.get(&v.name).into_iter().flatten() {
+            let own = Symbol::from(crate::naming::safe_local(iv.as_str()));
+            let param = if names[..locals].contains(&own) {
+                let base = format!("__rh_ivar_{own}");
+                let fresh = std::iter::once(base.clone())
+                    .chain((2u32..).map(|i| format!("{base}_{i}")))
+                    .map(Symbol::from)
+                    .find(|n| !used.contains(n))
+                    .expect("an unused name");
+                used.insert(fresh.clone());
+                fresh
+            } else {
+                own
+            };
+            if !names.contains(&param) {
+                names.push(param.clone());
+            }
+            ivars.push((iv.clone(), param));
+        }
+        out.params.insert(key.clone(), names);
+        out.ivars.insert(key, ivars);
     }
     out
+}
+
+/// Each jbuilder template's partial renders: the partial's key, its
+/// view name when the app has a jbuilder template for it, and the
+/// local names the render binds.
+type RenderSites = Vec<((String, String), Option<Symbol>, Vec<Symbol>)>;
+
+fn render_edges(views: &[&View], known_models: &[String]) -> Vec<(Symbol, RenderSites)> {
+    let models: std::collections::HashSet<String> = known_models.iter().cloned().collect();
+    let mut partial_views: std::collections::HashMap<(String, String), Symbol> =
+        std::collections::HashMap::new();
+    for v in views {
+        let (dir, base) = split_view_name(v.name.as_str());
+        if let Some(stem) = base.strip_prefix('_') {
+            let (mod_path, method) = partial_target(&format!("{dir}/{stem}"), dir);
+            partial_views.insert(partial_key(&mod_path, &method), v.name.clone());
+        }
+    }
+    views
+        .iter()
+        .map(|v| {
+            let (dir, _) = split_view_name(v.name.as_str());
+            let mut sites = Vec::new();
+            collect_partial_sites(&v.body, dir, &models, &mut sites);
+            let sites = sites
+                .into_iter()
+                .map(|(key, names)| {
+                    let target = partial_views.get(&key).cloned();
+                    (key, target, names)
+                })
+                .collect();
+            (v.name.clone(), sites)
+        })
+        .collect()
+}
+
+/// The ivar closure of every template: its own reads, in first-seen
+/// order, then each rendered partial's closure, depth first. A render
+/// cycle contributes what was found before it closed.
+fn ivar_closures(
+    views: &[&View],
+    edges: &[(Symbol, RenderSites)],
+) -> std::collections::HashMap<Symbol, Vec<Symbol>> {
+    use std::collections::{HashMap, HashSet};
+    fn visit(
+        name: &Symbol,
+        bodies: &HashMap<Symbol, &Expr>,
+        children: &HashMap<Symbol, Vec<Symbol>>,
+        done: &mut HashMap<Symbol, Vec<Symbol>>,
+        open: &mut HashSet<Symbol>,
+    ) -> Vec<Symbol> {
+        if let Some(c) = done.get(name) {
+            return c.clone();
+        }
+        if !open.insert(name.clone()) {
+            return Vec::new();
+        }
+        let mut out = bodies
+            .get(name)
+            .map(|b| crate::lower::view_to_library::view_read_ivars(b))
+            .unwrap_or_default();
+        for child in children.get(name).into_iter().flatten() {
+            for iv in visit(child, bodies, children, done, open) {
+                if !out.contains(&iv) {
+                    out.push(iv);
+                }
+            }
+        }
+        open.remove(name);
+        done.insert(name.clone(), out.clone());
+        out
+    }
+    let bodies: HashMap<Symbol, &Expr> = views.iter().map(|v| (v.name.clone(), &v.body)).collect();
+    let children: HashMap<Symbol, Vec<Symbol>> = edges
+        .iter()
+        .map(|(name, sites)| (name.clone(), sites.iter().filter_map(|(_, t, _)| t.clone()).collect()))
+        .collect();
+    let mut done = HashMap::new();
+    for v in views {
+        visit(&v.name, &bodies, &children, &mut done, &mut HashSet::new());
+    }
+    done
+}
+
+/// The jbuilder side of the view render graph, for the analyzer:
+/// each jbuilder template's name with the names of the jbuilder
+/// partials it renders, so a partial is typed with its renderers'
+/// ivars as an ERB partial is.
+pub(crate) fn jbuilder_render_edges(app: &App) -> Vec<(Symbol, Vec<Symbol>)> {
+    let known_models: Vec<String> =
+        app.models.iter().map(|m| m.name.0.as_str().to_string()).collect();
+    let views: Vec<&View> = app.views.iter().filter(|v| v.jbuilder && !v.analysis_only).collect();
+    render_edges(&views, &known_models)
+        .into_iter()
+        .map(|(name, sites)| (name, sites.into_iter().filter_map(|(_, t, _)| t).collect()))
+        .collect()
+}
+
+/// Each jbuilder template's ivar closure, keyed by view name — the
+/// parameters an action template takes and the controller passes.
+pub(crate) fn jbuilder_ivar_closures(
+    views: &[View],
+    models: &[crate::dialect::Model],
+) -> std::collections::HashMap<Symbol, Vec<Symbol>> {
+    let known_models: Vec<String> = models.iter().map(|m| m.name.0.as_str().to_string()).collect();
+    let views: Vec<&View> = views.iter().filter(|v| v.jbuilder && !v.analysis_only).collect();
+    let edges = render_edges(&views, &known_models);
+    ivar_closures(&views, &edges)
+}
+
+/// Every name a template binds or reads as a local — variables, block
+/// parameters, and the receiverless reads a partial's locals are — so a
+/// generated parameter name takes none of them.
+fn collect_local_names(e: &Expr, out: &mut std::collections::HashSet<Symbol>) {
+    match &*e.node {
+        ExprNode::Var { name, .. }
+        | ExprNode::Assign { target: LValue::Var { name, .. }, .. } => {
+            out.insert(name.clone());
+        }
+        ExprNode::Send { recv: None, method, args, .. } if args.is_empty() => {
+            out.insert(method.clone());
+        }
+        ExprNode::Lambda { params, rest_param, block_param, .. } => {
+            out.extend(params.iter().cloned());
+            out.extend(rest_param.iter().cloned());
+            out.extend(block_param.iter().cloned());
+        }
+        _ => {}
+    }
+    e.node.for_each_child(&mut |c| collect_local_names(c, out));
 }
 
 /// Every partial render in a jbuilder template, with the local names
@@ -2199,6 +2434,20 @@ fn seq(exprs: Vec<Expr>) -> Expr {
 }
 
 // ── ivar → local rewrite (shared shape with view_to_library) ────────
+
+/// `@x` → `@<renames[x]>`, reads and writes, before the rewrite to
+/// locals: a partial's ivar parameter whose name a local takes.
+fn rename_ivars(e: &mut Expr, renames: &std::collections::HashMap<Symbol, Symbol>) {
+    match &mut *e.node {
+        ExprNode::Ivar { name } | ExprNode::Assign { target: LValue::Ivar { name }, .. } => {
+            if let Some(to) = renames.get(name) {
+                *name = to.clone();
+            }
+        }
+        _ => {}
+    }
+    e.node.for_each_child_mut(&mut |c| rename_ivars(c, renames));
+}
 
 fn rewrite_ivars_to_locals(expr: &Expr) -> Expr {
     let new_node = match &*expr.node {
