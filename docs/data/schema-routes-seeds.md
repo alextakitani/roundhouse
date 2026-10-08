@@ -81,8 +81,8 @@ a custom or suppressed one is not reproduced, and the model layer
 applies supported literal defaults. A virtual table has no Postgres
 DDL, so that dialect returns an error for it. Postgres renders what
 ingest kept, so it shares the current ingest and IR limits.
-`schema.rb` ingest drops `array: true`; an index's `using:`, `order:`
-and `opclass:`, and expression indexes; precision on `numeric`,
+`schema.rb` ingest drops `array: true`; an index's `order:` and
+`opclass:`, and expression indexes; precision on `numeric`,
 `datetime` and `time`; a `limit:` of 1 or 2 on an `integer` column
 (so no `smallint`; 5 to 8 is a `bigint`, as in Rails); and schema
 qualifiers. The key forms the
@@ -105,6 +105,15 @@ A Postgres dump's `::text` casts or `= ANY (ARRAY[…])` fall outside it;
 that index is unique over every row, and the transpile names it in a
 warning. The migration fold refuses to rename or remove a column a
 predicate names.
+An index's literal access method is kept from `schema.rb`'s `using:` or
+`structure.sql`'s `USING` clause and quoted in PostgreSQL DDL. Schema Ruby
+methods must be ASCII unquoted SQL identifiers and are folded to lowercase.
+The `structure.sql` parser likewise folds ASCII unquoted methods and retains
+the case of quoted methods. PostgreSQL DDL preserves these methods;
+SQLite DDL uses SQLite's default index method, so query plans and index
+performance can differ while row semantics stay the same. Custom PostgreSQL
+methods are preserved as identifiers, but their extension must already be
+installed by a PostgreSQL deployment.
 Postgres column types map to their SQLite storage at
 ingest (`uuid` → TEXT via `ColumnType::Uuid`, `jsonb` → json,
 `citext` → text, `timestamptz` → datetime, `inet`/`cidr`/`macaddr`/
