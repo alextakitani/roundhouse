@@ -4173,6 +4173,7 @@ impl Analyzer {
         let from_origin =
             origin.and_then(|m| self.inferred_params.get(&(m.clone(), action_name.clone())));
         let mut ctx = base.clone();
+        ctx.instance_body = true;
         for (i, name) in params.fields.keys().enumerate() {
             if self.declared_untyped_param(class_id, action_name, Some(i), name) {
                 ctx.local_bindings.insert(name.clone(), Ty::Untyped);

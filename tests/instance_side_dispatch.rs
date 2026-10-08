@@ -113,3 +113,71 @@ fn a_receiverless_call_in_a_scope_body_still_answers_the_scope() {
         .collect();
     assert!(errors.is_empty(), "{errors:?}");
 }
+
+fn errors(files: &[(&str, &str)]) -> Vec<String> {
+    diagnose(&analyzed(files, POSTS_SCHEMA))
+        .into_iter()
+        .filter(|d| d.severity == Severity::Error)
+        .map(|d| d.message)
+        .collect()
+}
+
+const POST_HEADLINE: &str = "class Post < ApplicationRecord
+  def self.headline
+    [:class]
+  end
+
+  def headline
+    \"post\"
+  end
+";
+
+fn post_with(body: &str) -> String {
+    format!("{POST_HEADLINE}\n{body}end\n")
+}
+
+#[test]
+fn an_instance_eval_block_on_an_instance_answers_the_instance_side() {
+    let post = post_with("  def shout(other)\n    other.instance_eval { headline.upcase }\n  end\n");
+    let errors = errors(&[
+        ("app/models/post.rb", &post),
+        ("app/services/caller.rb", "class Caller\n  def run\n    Post.new.shout(Post.new)\n  end\nend\n"),
+    ]);
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn a_nilable_instance_receiver_answers_the_instance_side() {
+    let post = post_with("  def self.shout(id)\n    Post.find_by(id: id).headline.upcase\n  end\n");
+    let errors = errors(&[("app/models/post.rb", &post)]);
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+/// Ruby looks for an instance method up the whole chain before a
+/// subclass's class-side def of the same name could matter.
+#[test]
+fn an_inherited_instance_method_wins_over_a_class_method_on_the_subclass() {
+    let app = analyzed(
+        &[
+            ("app/services/parent.rb", "class Parent\n  def headline\n    \"parent\"\n  end\nend\n"),
+            ("app/services/child.rb", "class Child < Parent\n  def self.headline\n    [:class]\n  end\nend\n"),
+            ("app/services/caller.rb", "class Caller\n  def run\n    Child.new.headline\n  end\nend\n"),
+        ],
+        EMPTY_SCHEMA,
+    );
+    let caller = app.library_classes.iter().find(|c| c.name.0.as_str() == "Caller").expect("class");
+    assert_eq!(ret(&caller.methods, "run", false), Ty::Str);
+}
+
+#[test]
+fn a_bare_call_in_a_controller_action_answers_the_instance_side() {
+    let errors = errors(&[
+        ("app/models/post.rb", "class Post < ApplicationRecord\nend\n"),
+        (
+            "app/controllers/posts_controller.rb",
+            "class PostsController < ApplicationController\n  def self.headline\n    [:class]\n  end\n\n  def index\n    @headline = headline.upcase\n  end\n\n  private\n\n  def headline\n    \"posts\"\n  end\nend\n",
+        ),
+        ("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n"),
+    ]);
+    assert!(errors.is_empty(), "{errors:?}");
+}

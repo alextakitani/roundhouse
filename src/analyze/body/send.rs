@@ -767,6 +767,21 @@ impl<'a> BodyTyper<'a> {
         None
     }
 
+    fn defines_instance_method(&self, of: &ClassId, method: &Symbol) -> bool {
+        let mut current = Some(of.clone());
+        for _ in 0..32 {
+            let Some(id) = current else { return false };
+            let Some(cls) = self.classes().get(&id) else { return false };
+            if cls.instance_methods.contains_key(method)
+                || cls.includes.iter().any(|m| self.lookup_in_module(m, method).is_some())
+            {
+                return true;
+            }
+            current = cls.parent.clone();
+        }
+        false
+    }
+
     pub(super) fn dispatch(
         &self,
         recv_ty: Option<&Ty>,
@@ -1206,6 +1221,8 @@ impl<'a> BodyTyper<'a> {
                         elem: Box::new(Ty::Class { id: id.clone(), args: vec![] }),
                     };
                 }
+                // Class-side defs stay a fallback: a value typed as an instance may still be a class object (`@klass = Post`).
+                let instance_side = instance_receiver && self.defines_instance_method(id, method);
                 let mut current_id: Option<&ClassId> = Some(id);
                 let mut depth = 0usize;
                 // Set when the chain reaches a *named* superclass we don't
@@ -1339,12 +1356,10 @@ impl<'a> BodyTyper<'a> {
                             }
                         }
                     }
-                    let (first, second) = if instance_receiver {
-                        (&cls.instance_methods, &cls.class_methods)
-                    } else {
-                        (&cls.class_methods, &cls.instance_methods)
-                    };
-                    if let Some(ty) = first.get(method).or_else(|| second.get(method)) {
+                    if !instance_side && let Some(ty) = cls.class_methods.get(method) {
+                        return unwrap_fn_ret(&subst(ty));
+                    }
+                    if let Some(ty) = cls.instance_methods.get(method) {
                         return unwrap_fn_ret(&subst(ty));
                     }
                     // Mixed-in modules (`include IntervalHelper`)
@@ -1886,7 +1901,7 @@ impl<'a> BodyTyper<'a> {
                     if matches!(v, Ty::Nil | Ty::Var { .. }) {
                         continue;
                     }
-                    let r = self.dispatch(Some(v), method, block_ret, args);
+                    let r = self.dispatch_on(Some(v), method, block_ret, args, instance_receiver);
                     if !matches!(r, Ty::Var { .. }) {
                         resolved.push(r);
                     }
