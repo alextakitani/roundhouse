@@ -190,6 +190,46 @@ pub trait ArelVisitor {
 /// produces.
 pub struct SqliteVisitor;
 
+impl SqliteVisitor {
+    /// Execute an insert that returns selected columns from that same
+    /// statement. Generated-column persistence uses this to hydrate the
+    /// database-owned values without a second, post-commit SELECT.
+    pub(crate) fn visit_insert_returning(
+        &self,
+        ins: &Insert,
+        schema: &Schema,
+        returning_key: &Symbol,
+        key_is_integer: bool,
+        returning_columns: &[Symbol],
+    ) -> Expr {
+        let key_ident = crate::naming::sql_ident(returning_key.as_str());
+        // Spinel snapshots SQLite integer cells through sqlite3_column_int
+        // (32-bit). Return integer keys as text so the shared result capture
+        // does not truncate them before the adapter parses them back.
+        let key_projection = if key_is_integer {
+            format!("CAST({key_ident} AS TEXT)")
+        } else {
+            key_ident
+        };
+        let mut projection = vec![key_projection];
+        projection.extend(
+            returning_columns
+                .iter()
+                .map(|column| crate::naming::sql_ident(column.as_str())),
+        );
+        let projection = projection.join(", ");
+        let sql = concat_chain(vec![
+            insert_sql(ins, schema),
+            lit_str(format!(" RETURNING {projection}")),
+        ]);
+        db_call(
+            &ClassId(Symbol::from(DB_MOD)),
+            "exec_returning",
+            vec![sql],
+        )
+    }
+}
+
 impl ArelVisitor for SqliteVisitor {
     fn visit(&self, op: &ArelOp, schema: &Schema, owner: &ClassId) -> Expr {
         match op {
@@ -877,9 +917,22 @@ fn emit_exists(sel: &Select, table: &Table, param: bool) -> Expr {
 // ---------------------------------------------------------------------------
 
 fn visit_insert(ins: &Insert, schema: &Schema) -> Expr {
+    let db = ClassId(Symbol::from(DB_MOD));
+    let sql = insert_sql(ins, schema);
+    let exec_call = db_call(&db, "exec", vec![sql]);
+    if !ins.returns_rowid {
+        return exec_call;
+    }
+    let last_id = db_call(&db, "last_insert_rowid", vec![]);
+    seq(vec![exec_call, last_id])
+}
+
+/// Compose the INSERT statement before the visitor chooses `exec` or
+/// `exec_returning`. Keeping value escaping here ensures both paths retain
+/// the same inline, schema-ordered write semantics.
+fn insert_sql(ins: &Insert, schema: &Schema) -> Expr {
     let _ = lookup_table(schema, &ins.table.0); // validates table exists; not consumed beyond that
     let db = ClassId(Symbol::from(DB_MOD));
-
     let sql = if ins.assignments.is_empty() {
         lit_str(format!(
             "INSERT INTO {} DEFAULT VALUES",
@@ -906,12 +959,7 @@ fn visit_insert(ins: &Insert, schema: &Schema) -> Expr {
         segments.push(lit_str(")".to_string()));
         concat_chain(segments)
     };
-    let exec_call = db_call(&db, "exec", vec![sql]);
-    if !ins.returns_rowid {
-        return exec_call;
-    }
-    let last_id = db_call(&db, "last_insert_rowid", vec![]);
-    seq(vec![exec_call, last_id])
+    sql
 }
 
 fn visit_update(upd: &Update, schema: &Schema) -> Expr {

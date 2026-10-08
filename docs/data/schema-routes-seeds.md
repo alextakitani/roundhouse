@@ -186,15 +186,30 @@ This does not enable a PostgreSQL runtime backend.
 
 Normal model inserts and updates omit generated columns, while SELECT and
 reload retain them. Generated attributes start nil, including a database
-`NOT NULL` attribute. After insert, the shared adapter reads generated values
-by the inserted key and fills nil attributes before create callbacks; an
-assigned nonnil value remains in memory until reload. Updates leave the
-previous generated value in memory until explicit reload, as observed with
-Rails 8.1.4 and SQLite. The extra post-insert SELECT is a difference from
-Rails' `INSERT ... RETURNING`. Existing full-column update behavior also
-remains: saving only a generated-field assignment on a mixed table may still
-write unchanged ordinary fields. A table with no writable non-key fields
-uses `DEFAULT VALUES` on insert and issues no UPDATE.
+`NOT NULL` attribute. The `ruby`, `jruby`, and `spinel` persistence runtimes
+use one `INSERT ... RETURNING` statement to read the inserted key and generated
+values before create callbacks; there is no separate post-insert SELECT. The
+SQLite persistence path requires SQLite 3.35 or newer, matching the
+`Db.exec_returning` runtime gate. SQLite 3.31 through 3.34 support generated
+columns in DDL but cannot run this model-persistence path. Project emission
+also refuses targets whose runtime does not provide `Db.exec_returning`. These
+runtime gates do not change the standalone schema DDL renderers: they continue
+to preserve every accepted SQLite generated-column mode and stored-only
+PostgreSQL generated columns. The single statement does not wrap the rest of
+model save or callbacks in a transaction; callers that need rollback when
+later application code raises must use their transaction.
+Tables without a declared primary key can return SQLite's rowid from the
+insert adapter primitive, but the existing model create/save lifecycle does
+not support keyless models end to end.
+An explicitly assigned nonnil value remains in memory through callbacks and
+until reload. This create-time hydration does not add generated-column dirty
+tracking or refresh generated values after later writes; updates leave the
+previous value in memory until explicit reload, as observed with Rails 8.1.4
+and SQLite. Existing
+full-column update behavior also remains: saving only a generated-field
+assignment on a mixed table may still write unchanged ordinary fields. A
+table with no writable non-key fields uses `DEFAULT VALUES` on insert and
+issues no UPDATE.
 
 Direct writes that the current lowering would silently discard remain
 unsupported: generated-model `insert_all`/`insert_all!`, and `update_column`

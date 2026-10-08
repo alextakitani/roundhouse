@@ -1,9 +1,13 @@
 //! Generated columns keep their expression and storage mode in the schema,
 //! reach dialect DDL, and reject forms that cannot be preserved portably.
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
 use roundhouse::Symbol;
 use roundhouse::emit::shared::schema_sql::{Dialect, render_schema_statements_for};
-use roundhouse::ingest::{ingest_schema, survey};
+use roundhouse::ingest::{ingest_app_from_tree, ingest_schema, survey};
+use roundhouse::project::{BuildTarget, target_files};
 use roundhouse::schema::{GeneratedColumnStorage, Schema, Table};
 
 fn schema() -> Schema {
@@ -46,6 +50,78 @@ fn column<'a>(table: &'a Table, name: &str) -> &'a roundhouse::schema::Column {
                     .collect::<Vec<_>>()
             )
         })
+}
+
+fn generated_model_app() -> roundhouse::App {
+    let tree: HashMap<PathBuf, Vec<u8>> = [
+        (
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n",
+        ),
+        (
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        ),
+        ("db/schema.rb", include_str!("support/generated_columns_schema.rb")),
+        ("app/models/person.rb", include_str!("support/generated_columns_person.rb")),
+        (
+            "app/models/virtual_person.rb",
+            include_str!("support/generated_columns_virtual_person.rb"),
+        ),
+        (
+            "app/models/constant_person.rb",
+            include_str!("support/generated_columns_constant_person.rb"),
+        ),
+    ]
+    .iter()
+    .map(|(path, content)| (PathBuf::from(path), content.as_bytes().to_vec()))
+    .collect();
+    let mut app = ingest_app_from_tree(tree).expect("ingest generated-column app");
+    roundhouse::session::analyze_and_lower(&mut app);
+    app
+}
+
+#[test]
+fn generated_model_persistence_requires_a_runtime_with_insert_returning() {
+    let app = generated_model_app();
+
+    for target in [BuildTarget::Ruby, BuildTarget::Jruby, BuildTarget::Spinel] {
+        target_files(&app, Path::new("."), target).unwrap_or_else(|error| {
+            panic!("{target:?} runtime supports Db.exec_returning: {error}")
+        });
+    }
+
+    let unsupported = [
+        BuildTarget::Crystal,
+        BuildTarget::Elixir,
+        BuildTarget::Go,
+        BuildTarget::Kotlin,
+        BuildTarget::Python,
+        BuildTarget::Rust,
+        BuildTarget::Swift,
+        BuildTarget::CSharp,
+        BuildTarget::Typescript,
+        BuildTarget::TypescriptWorker,
+    ];
+    for target in unsupported {
+        let error = target_files(&app, Path::new("."), target).expect_err(
+            "an SDK target without the persistence runtime must refuse generated models",
+        );
+        assert!(
+            error.contains("generated-column model persistence"),
+            "{target:?}: {error}"
+        );
+        assert!(error.contains(target.as_str()), "{target:?}: {error}");
+        assert!(error.contains("Db.exec_returning"), "{target:?}: {error}");
+        assert!(error.contains("display_name"), "{target:?}: {error}");
+    }
+
+    let roda_error = target_files(&app, Path::new("."), BuildTarget::Roda)
+        .expect_err("Roda already rejects generated columns");
+    assert!(
+        roda_error.contains("Roda target does not support generated column"),
+        "{roda_error}"
+    );
 }
 
 #[test]
