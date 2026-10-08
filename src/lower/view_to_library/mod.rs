@@ -3323,7 +3323,7 @@ pub(crate) fn ivar_ty(name: &str, known_models: &[String]) -> crate::ty::Ty {
 /// Type of a partial/layout's record arg: a layout's `body` is the
 /// rendered-HTML String; a partial's record is the singular model for its
 /// directory (`stories/_listdetail` → `Story`), else Untyped.
-fn record_arg_ty(dir: &str, is_layout: bool, known_models: &[String]) -> crate::ty::Ty {
+pub(crate) fn record_arg_ty(dir: &str, is_layout: bool, known_models: &[String]) -> crate::ty::Ty {
     use crate::ty::Ty;
     if is_layout {
         return Ty::Str;
@@ -3541,7 +3541,7 @@ fn rewrite_lvalue(lv: &LValue) -> LValue {
 /// local (`keywords`, the strict locals after the first) keeps its name,
 /// because callers pass it by that name. Every other local is a
 /// positional param named by `safe_local` (`for` → `for_`).
-fn rewrite_local_assigns_to_locals(expr: &mut Expr, keywords: &[&str]) {
+pub(crate) fn rewrite_local_assigns_to_locals(expr: &mut Expr, keywords: &[&str]) {
     expr.node
         .for_each_child_mut(&mut |c| rewrite_local_assigns_to_locals(c, keywords));
     let reserved_read = match &*expr.node {
