@@ -1609,7 +1609,7 @@ impl Analyzer {
                 class_objects: Default::default(),
                 constants: Default::default(),
                 annotate_self_dispatch: false,
-                in_view: false, class_side: false, claimed_macro_template: false,
+                in_view: false, class_side: false, claimed_macro_template: false, instance_body: false,
             };
             self.body_typer().analyze_expr(&mut helper.body, &ctx);
         }
@@ -1827,7 +1827,7 @@ impl Analyzer {
                     class_objects: Default::default(),
                     constants: shared.clone(),
                     annotate_self_dispatch: false,
-                    in_view: false, class_side: false, claimed_macro_template: false,
+                    in_view: false, class_side: false, claimed_macro_template: false, instance_body: false,
                 };
                 let ty = typer.analyze_expr(value, &ctx);
                 if matches!(ty, Ty::Var { .. }) {
@@ -2096,7 +2096,7 @@ impl Analyzer {
                 local_bindings: HashMap::new(),
                 class_objects: Default::default(),
                 constants: global_constants.clone(),
-                annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false,
+                annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, instance_body: false,
             };
             for item in model.body.iter_mut() {
                 if let ModelBodyItem::Unknown { expr, .. } = item {
@@ -2112,7 +2112,7 @@ impl Analyzer {
                 local_bindings: HashMap::new(),
                 class_objects: Default::default(),
                 constants: class_constants.clone(),
-                annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false,
+                annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, instance_body: false,
             };
 
             // Pass A: type every method body with only `@attributes`
@@ -2172,7 +2172,7 @@ impl Analyzer {
                     local_bindings: HashMap::new(),
                     class_objects: Default::default(),
                     constants: class_constants.clone(),
-                    annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false,
+                    annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, instance_body: false,
                 };
 
                 for scope in model.scopes_mut() {
@@ -2220,7 +2220,7 @@ impl Analyzer {
                 local_bindings: HashMap::new(),
                 class_objects: Default::default(),
                 constants: global_constants.clone(),
-                annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false,
+                annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, instance_body: false,
             };
             if retype {
                 for item in controller.body.iter_mut() {
@@ -2240,7 +2240,7 @@ impl Analyzer {
                 local_bindings: HashMap::new(),
                 class_objects: Default::default(),
                 constants: class_constants.clone(),
-                annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false,
+                annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, instance_body: false,
             };
 
             // Snapshot this controller's own segment of the filter chain
@@ -2790,7 +2790,7 @@ impl Analyzer {
                             local_bindings: HashMap::new(),
                             class_objects: Default::default(),
                             constants: meta.class_constants.clone(),
-                            annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false,
+                            annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, instance_body: false,
                         };
                         // Seed helper-method params from the inferred-params
                         // table too, so `period(query)`'s body resolves on
@@ -3298,7 +3298,7 @@ impl Analyzer {
                         class_objects: Default::default(),
                         constants: class_constants.clone(),
                         annotate_self_dispatch: false,
-                        in_view: false, class_side: false, claimed_macro_template: false,
+                        in_view: false, class_side: false, claimed_macro_template: false, instance_body: false,
                     };
                     let origin = app
                         .concern_spliced_actions
@@ -3477,7 +3477,7 @@ impl Analyzer {
                 ivar_bindings: HashMap::new(),
                 local_bindings: HashMap::new(),
                 class_objects: Default::default(),
-                constants: Default::default(), annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false,
+                constants: Default::default(), annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, instance_body: false,
             };
 
             if retype {
@@ -3621,7 +3621,7 @@ impl Analyzer {
                     ivar_bindings: reseeded,
                     local_bindings: HashMap::new(),
                     class_objects: Default::default(),
-                    constants: Default::default(), annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false,
+                    constants: Default::default(), annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, instance_body: false,
                 };
                 for method in &mut lc.methods {
                     let mctx = self.seed_method_params(&reseeded_ctx, &lc_name, method, true);
@@ -4095,6 +4095,7 @@ impl Analyzer {
         let observed = self.inferred_params.get(&key);
         let mut ctx = base.clone();
         ctx.class_side = matches!(method.receiver, crate::dialect::MethodReceiver::Class);
+        ctx.instance_body = !ctx.class_side;
         // Class-method bodies named after a first-class model DSL
         // (`has_markdown`, `has_rich_text`, …) are macro templates —
         // association/`scope` leftovers inside them are claimed at
@@ -4172,6 +4173,7 @@ impl Analyzer {
         let from_origin =
             origin.and_then(|m| self.inferred_params.get(&(m.clone(), action_name.clone())));
         let mut ctx = base.clone();
+        ctx.instance_body = true;
         for (i, name) in params.fields.keys().enumerate() {
             if self.declared_untyped_param(class_id, action_name, Some(i), name) {
                 ctx.local_bindings.insert(name.clone(), Ty::Untyped);
@@ -7606,7 +7608,7 @@ pub(crate) fn extract_ivar_assignments_in(
                     Some(prev) => crate::analyze::body::union_of(prev, ty),
                     None => ty,
                 };
-                out.insert(name.clone(), merged);
+                out.insert(name.clone(), fixpoint_bound::bound(merged));
             }
         }
         // Short-circuit compound assignment to an ivar (`@x ||= y`,
@@ -7619,7 +7621,7 @@ pub(crate) fn extract_ivar_assignments_in(
                     Some(prev) => crate::analyze::body::union_of(prev, ty),
                     None => ty,
                 };
-                out.insert(name.clone(), merged);
+                out.insert(name.clone(), fixpoint_bound::bound(merged));
             }
         }
         // `@a, @b = expr` — destructuring assignment. Each ivar target
@@ -7638,7 +7640,7 @@ pub(crate) fn extract_ivar_assignments_in(
                             Some(prev) => crate::analyze::body::union_of(prev, ty),
                             None => ty,
                         };
-                        out.insert(name.clone(), merged);
+                        out.insert(name.clone(), fixpoint_bound::bound(merged));
                     }
                 }
             }
@@ -7797,7 +7799,7 @@ fn widen_hash_ivar_value(out: &mut HashMap<Symbol, Ty>, name: &Symbol, incoming:
         // the Crystal collector's "fresh entry" branch.
         out.insert(
             name.clone(),
-            Ty::Hash { key: Box::new(Ty::Str), value: Box::new(incoming.clone()) },
+            fixpoint_bound::bound(Ty::Hash { key: Box::new(Ty::Str), value: Box::new(incoming.clone()) }),
         );
         return;
     };
@@ -7815,7 +7817,7 @@ fn widen_hash_ivar_value(out: &mut HashMap<Symbol, Ty>, name: &Symbol, incoming:
         // The general widening is exactly the canonical type join.
         Box::new(crate::analyze::body::union_of((**value).clone(), incoming.clone()))
     };
-    out.insert(name.clone(), Ty::Hash { key, value });
+    out.insert(name.clone(), fixpoint_bound::bound(Ty::Hash { key, value }));
 }
 
 // Diagnostic emission -----------------------------------------------------

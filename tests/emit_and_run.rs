@@ -51,6 +51,58 @@ fn model_concern_delegate_through_belongs_to_runs() {
     assert!(run.stdout.contains("model concern delegate passed"));
 }
 
+/// A class object and its instances that define the same names: each
+/// side's call types and runs as that side's method.
+#[test]
+fn same_named_class_and_instance_methods_run_on_their_own_side() {
+    let run = emit_and_run::real_blog()
+        .write(
+            "app/models/greeter.rb",
+            "class Greeter
+  def self.call(name)
+    new(name).call
+  end
+
+  def initialize(name)
+    @name = name
+  end
+
+  def call
+    \"hello \" + @name
+  end
+end
+",
+        )
+        .edit(
+            "app/models/article.rb",
+            "  validates :title, presence: true\n",
+            "  validates :title, presence: true
+
+  def self.headline
+    [:class]
+  end
+
+  def headline
+    title.to_s
+  end
+
+  def shout
+    headline.upcase
+  end
+",
+        )
+        .run_ruby(
+            "raise \"class call\" unless Greeter.call(\"a\") == \"hello a\"
+raise \"instance call\" unless Greeter.new(\"b\").call == \"hello b\"
+raise \"class headline\" unless Article.headline == [:class]
+raise \"instance headline\" unless Article.new(title: \"hi\").shout == \"HI\"
+puts \"same-named sides passed\"
+",
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("same-named sides passed"));
+}
+
 #[path = "support/engine_mount.rs"]
 mod engine_mount;
 
@@ -8246,5 +8298,25 @@ fn an_rbs_array_block_runs_after_app_emission() {
         .write("app/lib/batch.rb", runtime_block_signature::RUBY)
         .write("sig/batch.rbs", runtime_block_signature::RBS)
         .run_ruby("raise 'wrong sum' unless Batch.new.consume == 3")
+        .assert_passes();
+}
+
+/// `pairs.to_h` with no block reads each element as a [key, value] pair; the
+/// ivar rewritten through it keeps its String keys and Integer values.
+#[test]
+fn an_ivar_rewritten_through_sort_by_to_h_runs() {
+    emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            "class Article < ApplicationRecord\n  def word_counts\n    @word_counts = {}\n    body.split.each do |w|\n      @word_counts[w] = 0 if @word_counts[w].nil?\n      @word_counts[w] += 1\n    end\n    @word_counts = @word_counts.sort_by { |k, v| [-v, k] }.to_h\n  end\n\n  def top_word\n    word_counts.keys.first\n  end\n",
+        )
+        .run_ruby(
+            r#"article = Article.create!(title: "Counts", body: "b a b c b a")
+counts = article.word_counts
+raise counts.inspect unless counts == { "b" => 3, "a" => 2, "c" => 1 }
+raise article.top_word.inspect unless article.top_word == "b"
+"#,
+        )
         .assert_passes();
 }
