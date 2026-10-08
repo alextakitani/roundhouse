@@ -52,13 +52,32 @@ use crate::expr::{Expr, ExprNode};
 /// declarations on its own classes — so what reaches here is the
 /// general shape only.
 pub fn lower_delegates(app: &mut crate::App) {
+    let mut model_concerns = std::collections::HashSet::new();
+    let mut pending: Vec<_> = app
+        .models
+        .iter()
+        .flat_map(crate::analyze::model_includes)
+        .collect();
+    while let Some(concern) = pending.pop() {
+        if !model_concerns.insert(concern.clone()) {
+            continue;
+        }
+        if let Some(class) = app
+            .library_classes
+            .iter()
+            .find(|class| class.name == concern)
+        {
+            pending.extend(class.includes.iter().cloned());
+        }
+    }
+
     let mut generated: Vec<(usize, Vec<MethodDef>)> = Vec::new();
     for (i, lc) in app.library_classes.iter_mut().enumerate() {
-        // A concern's module body is evaluated once, before its eventual
-        // includer is known. Model association delegates are therefore
-        // expanded only after an `included do` declaration has been
-        // spliced into each concrete model.
-        if lc.is_module {
+        // Keep module declarations deferred when that module contributes to
+        // a model: association targets can only be checked against the
+        // concrete model after its concern declarations have been spliced.
+        // Other library modules retain the ordinary delegate expansion.
+        if lc.is_module && model_concerns.contains(&lc.name) {
             continue;
         }
         let methods = expand_delegates_in_class(lc);
@@ -352,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn module_scope_delegates_stay_unexpanded_without_a_known_includer() {
+    fn standalone_module_delegates_are_still_expanded() {
         let mut app = crate::App::default();
         let mut concern =
             library_class("class ProfileAccess\n  delegate :email, to: :profile\nend\n");
@@ -366,10 +385,10 @@ mod tests {
             concern
                 .methods
                 .iter()
-                .all(|method| method.name.as_str() != "email")
+                .any(|method| method.name.as_str() == "email"),
+            "a module not used as a model concern retains ordinary delegate lowering"
         );
-        assert_eq!(concern.unknown_calls.len(), 1);
-        assert!(is_delegate_declaration(&concern.unknown_calls[0]));
+        assert!(concern.unknown_calls.is_empty());
     }
 
     #[test]
