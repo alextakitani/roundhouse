@@ -147,6 +147,19 @@ fn an_initializer_format_with_include_is_not_the_app_default() {
     assert!(!src.contains("Params.wrap"), "{src}");
 }
 
+/// Rails enables wrapping only when the format list contains `:json`;
+/// `:json_api` is a different mime and must not flip the app default.
+#[test]
+fn an_initializer_json_api_format_is_not_the_app_default() {
+    let src = App::new(RAILS_6)
+        .with(
+            "config/initializers/wrap_parameters.rb",
+            "ActiveSupport.on_load(:action_controller) do\n  wrap_parameters format: [:json_api]\nend\n",
+        )
+        .ruby("app/controllers/articles_controller.rb");
+    assert!(!src.contains("Params.wrap"), "{src}");
+}
+
 #[test]
 fn a_parent_switching_it_off_is_inherited_and_a_child_can_switch_it_back() {
     let app = App::new(RAILS_8).with(

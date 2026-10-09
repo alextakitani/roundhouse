@@ -7112,10 +7112,20 @@ fn read_wrap_parameters_by_default<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> bool
             if rest.contains("include:") || rest.contains("exclude:") || rest.contains("name:") {
                 continue;
             }
-            default = rest.contains(":json");
+            // Exact `:json` / `json` entry — not a substring of `:json_api`.
+            default = wrap_parameters_format_includes_json(rest);
         }
     }
     default
+}
+
+/// Whether a `wrap_parameters format: …` argument list names `:json`
+/// exactly (Rails' ParamsWrapper check), not a longer synonym such as
+/// `:json_api`.
+fn wrap_parameters_format_includes_json(rest: &str) -> bool {
+    rest.split(|c: char| matches!(c, ',' | '[' | ']' | '(' | ')' | ' ' | '\t'))
+        .map(|tok| tok.trim().trim_matches(|c| c == '"' || c == '\''))
+        .any(|tok| tok == ":json" || tok == "json")
 }
 
 fn extract_config_time_zone(source: &[u8]) -> Option<String> {
