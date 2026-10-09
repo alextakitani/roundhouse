@@ -93,6 +93,79 @@ fn strict_transpile_composes_a_literal_isolated_engine_mount() {
     }
 }
 
+/// Authenticated route blocks fail strict CLI emission, while survey mode
+/// reports each refusal and emits only their unguarded sibling route.
+#[test]
+fn authentication_route_guards_fail_closed_in_strict_and_survey_modes() {
+    let fixture = Fixture::new("auth-route-guards");
+    let app = fixture.write_app(false);
+    let strict_cases = [
+        (
+            "authenticate",
+            "authenticate :user do\n  get \"/account\", to: \"widgets#index\"\nend",
+        ),
+        (
+            "authenticated",
+            "authenticated :user, ->(user) { user.admin? } do\n  get \"/admin/reports\", to: \"widgets#index\"\nend",
+        ),
+        (
+            "unauthenticated",
+            "unauthenticated :user do\n  get \"/join\", to: \"widgets#index\"\nend",
+        ),
+    ];
+    for (wrapper, routes) in strict_cases {
+        std::fs::write(
+            app.join("config/routes.rb"),
+            format!("Rails.application.routes.draw do\n{routes}\nend\n"),
+        )
+        .unwrap();
+
+        let strict_out = fixture.0.join(format!("strict-{wrapper}"));
+        let strict = transpile(&app, "spinel", &strict_out, &[]);
+        let strict_stderr = String::from_utf8_lossy(&strict.stderr);
+        assert!(!strict.status.success(), "strict mode accepted `{wrapper}`: {strict_stderr}");
+        assert!(strict_stderr.contains("config/routes.rb"), "{strict_stderr}");
+        let expected_diagnostic = format!("unsupported routes DSL: `{wrapper}`");
+        assert!(
+            strict_stderr.contains(expected_diagnostic.as_str()),
+            "strict mode did not identify `{wrapper}`: {strict_stderr}"
+        );
+        assert!(!strict_out.exists(), "strict mode wrote output for `{wrapper}`");
+    }
+
+    std::fs::write(
+        app.join("config/routes.rb"),
+        r#"Rails.application.routes.draw do
+  authenticate :user do
+    get "/account", to: "widgets#index"
+  end
+  authenticated :user, ->(user) { user.admin? } do
+    get "/admin/reports", to: "widgets#index"
+  end
+  unauthenticated :user do
+    get "/join", to: "widgets#index"
+  end
+  get "/widgets", to: "widgets#index"
+end
+"#,
+    )
+    .unwrap();
+
+    let survey_out = fixture.0.join("survey");
+    let surveyed = transpile(&app, "spinel", &survey_out, &["--survey"]);
+    let survey_stderr = String::from_utf8_lossy(&surveyed.stderr);
+    assert!(surveyed.status.success(), "survey mode should keep the supported sibling: {survey_stderr}");
+    assert!(survey_stderr.contains("Survey: 3 ingest gap(s)"), "{survey_stderr}");
+    for wrapper in ["authenticate", "authenticated", "unauthenticated"] {
+        assert!(survey_stderr.contains(wrapper), "missing `{wrapper}` survey gap: {survey_stderr}");
+    }
+    let routes = std::fs::read_to_string(survey_out.join("config/routes.rb")).unwrap();
+    assert!(routes.contains("/widgets"), "the unguarded sibling was lost: {routes}");
+    for protected in ["/account", "/admin/reports", "/join"] {
+        assert!(!routes.contains(protected), "guarded route `{protected}` escaped: {routes}");
+    }
+}
+
 /// Nested literal engine namespaces can be loaded through their ancestor
 /// modules without allowing declarations in those ancestors.
 #[test]
