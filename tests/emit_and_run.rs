@@ -11,6 +11,8 @@ mod emit_and_run;
 mod class_attribute;
 #[path = "emit_and_run/integer_query_find_by.rs"]
 mod integer_query_find_by;
+#[path = "emit_and_run/strong_params.rs"]
+mod strong_params;
 
 #[path = "support/class_configuration.rs"]
 mod class_configuration;
@@ -22,6 +24,8 @@ mod data_factory;
 mod rails_root_join;
 #[path = "support/anonymous_keywords.rs"]
 mod anonymous_keywords;
+#[path = "support/delegate_association.rs"]
+mod delegate_association;
 
 /// A generated text column on the real-blog Article model exercises the
 /// schema-to-runtime path together with Rails-style symbol callbacks. The
@@ -95,6 +99,40 @@ fn anonymous_keyword_forwarding_runs_without_capturing_or_reordering_values() {
         .expect("emitted keyword forwarding class");
     assert!(emitted.contains("class KeywordForwarder"), "{emitted}");
     assert!(emitted.contains("request(kind: :get, path: path, **)"), "{emitted}");
+}
+
+#[test]
+fn model_concern_delegate_through_belongs_to_runs() {
+    let run = delegate_association::overlay().run_ruby(delegate_association::ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("model concern delegate passed"));
+}
+
+#[test]
+fn later_delegate_replaces_an_earlier_handwritten_method() {
+    let run = delegate_association::overlay()
+        .write(
+            "app/models/comment.rb",
+            r#"class Comment < ApplicationRecord
+  belongs_to :article
+
+  def article_body
+    "handwritten"
+  end
+
+  delegate :body, to: :article, prefix: true
+end
+"#,
+        )
+        .run_ruby(
+            r#"article = Article.create!(title: "Association title", body: "article body")
+comment = Comment.create!(article: article, commenter: "Reader", body: "Comment body")
+raise "later delegate did not replace the earlier method" unless comment.article_body == "article body"
+puts "later delegate ordering passed"
+"#,
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("later delegate ordering passed"));
 }
 
 /// A class object and its instances that define the same names: each
@@ -1556,16 +1594,17 @@ end
         )
         .write(
             "app/models/page.rb",
-            "class Page < ApplicationRecord\n  has_markdown :body\nend\n",
+            "class Page < ApplicationRecord\n  has_markdown :body\n\n  def searchable_content\n    body.content\n  end\nend\n",
         )
         .write(
             "app/models/section.rb",
-            "class Section < ApplicationRecord\nend\n",
+            "class Section < ApplicationRecord\n  def searchable_content\n    body\n  end\nend\n",
         )
         .write(
             "app/models/entry.rb",
             r#"class Entry < ApplicationRecord
   delegated_type :entryable, types: %w[ Page Section ]
+  delegate :searchable_content, to: :entryable
 end
 "#,
         )
@@ -1584,6 +1623,10 @@ raise "page reader nil" unless entry.page
 raise "body content lost: #{entry.page.body.content.inspect}" unless entry.page.body.content == "# Hello"
 # Zero-arg `page` on a record is the delegated_type reader, not pagination.
 raise "page reader must be Page, got #{entry.page.class}" unless entry.page.is_a?(Page)
+raise "delegated method lost" unless entry.searchable_content == "# Hello"
+section = Section.create!(body: "Section content")
+section_entry = Entry.create!(entryable: section)
+raise "delegated method lost on second type" unless section_entry.searchable_content == "Section content"
 puts "delegated_type singular reader plain text body passed"
 "##,
         )
@@ -5545,6 +5588,10 @@ fn bundled_uri_and_http_exception_constants_run() {
     URI.parse(url).is_a?(URI::HTTP)
   end
 
+  def self.https?(url)
+    URI.parse(url).is_a?(URI::HTTPS)
+  end
+
   def self.invalid_uri
     begin
       URI.parse("https://bad host/")
@@ -5555,6 +5602,10 @@ fn bundled_uri_and_http_exception_constants_run() {
 
   def self.construct
     URI::HTTP.new("http", nil, "example.test", 80, nil, "/", nil, nil, nil).to_s
+  end
+
+  def self.construct_https
+    URI::HTTPS.new("https", nil, "example.test", 443, nil, "/", nil, nil, nil).to_s
   end
 
   def self.invalid_constructor
@@ -5584,8 +5635,11 @@ end
         .run_ruby(
             r#"raise unless HttpConstantProbe.http?("https://example.test/")
 raise if HttpConstantProbe.http?("ftp://example.test/")
+raise unless HttpConstantProbe.https?("https://example.test/")
+raise if HttpConstantProbe.https?("http://example.test/")
 raise unless HttpConstantProbe.invalid_uri == "invalid"
 raise unless HttpConstantProbe.construct == "http://example.test/"
+raise unless HttpConstantProbe.construct_https == "https://example.test/"
 raise unless HttpConstantProbe.invalid_constructor == "arity"
 raise unless HttpConstantProbe.timeout("open") == "open"
 raise unless HttpConstantProbe.timeout("read") == "read"
@@ -8495,6 +8549,28 @@ fn an_ivar_rewritten_through_sort_by_to_h_runs() {
 counts = article.word_counts
 raise counts.inspect unless counts == { "b" => 3, "a" => 2, "c" => 1 }
 raise article.top_word.inspect unless article.top_word == "b"
+"#,
+        )
+        .assert_passes();
+}
+
+/// A class an initializer defines and the app reads only through `[]`
+/// (forem's `ApplicationConfig["KEY"]`) is the app's, as `X.` and `X::` are.
+#[test]
+fn an_initializer_class_read_through_brackets_runs() {
+    emit_and_run::real_blog()
+        .write(
+            "config/initializers/app_settings.rb",
+            "class AppSettings\n  DEFAULTS = { \"BANNER\" => \"Welcome\" }.freeze\n\n  def self.[](key)\n    DEFAULTS.fetch(key, \"\")\n  end\nend\n",
+        )
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            "class Article < ApplicationRecord\n  def banner\n    \"#{AppSettings[\"BANNER\"]}: #{title}\"\n  end\n",
+        )
+        .run_ruby(
+            r#"article = Article.create!(title: "Brackets", body: "Body text here")
+raise article.banner.inspect unless article.banner == "Welcome: Brackets"
 "#,
         )
         .assert_passes();
