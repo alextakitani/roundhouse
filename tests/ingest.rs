@@ -409,7 +409,11 @@ fn devise_authentication_route_guards_are_unsupported_and_survey_keeps_public_ro
         });
         let err = strict.expect_err("route authentication must fail strict ingest");
         assert!(err.to_string().contains("config/routes.rb"), "{err}");
-        assert!(err.to_string().contains(wrapper), "{err}");
+        let expected_diagnostic = format!("unsupported routes DSL: `{wrapper}`");
+        assert!(
+            err.to_string().contains(expected_diagnostic.as_str()),
+            "strict ingest did not identify `{wrapper}`: {err}"
+        );
     }
 
     let source = br#"Rails.application.routes.draw do
@@ -432,8 +436,9 @@ end
     let gaps = roundhouse::ingest::survey::drain();
     let table = result.expect("survey ingest recovers");
     for wrapper in ["authenticate", "authenticated", "unauthenticated"] {
+        let expected_diagnostic = format!("unsupported routes DSL: `{wrapper}`");
         assert!(
-            gaps.iter().any(|gap| format!("{gap:?}").contains(wrapper)),
+            gaps.iter().any(|gap| format!("{gap:?}").contains(expected_diagnostic.as_str())),
             "the refusal for `{wrapper}` must be surveyed: {gaps:?}"
         );
     }
@@ -720,8 +725,12 @@ fn cable_mounts_inherit_draw_and_concern_scope() {
             &draws,
         )
         .expect_err("auth wrapper must fail closed before a nested mount");
-        assert!(err.to_string().contains("unsupported routes DSL"), "{wrapper}: {err}");
-        assert!(err.to_string().contains(wrapper.split_whitespace().next().unwrap()), "{wrapper}: {err}");
+        let method = wrapper.split_whitespace().next().unwrap();
+        let expected_diagnostic = format!("unsupported routes DSL: `{method}`");
+        assert!(
+            err.to_string().contains(expected_diagnostic.as_str()),
+            "{wrapper}: {err}"
+        );
     }
 }
 

@@ -157,7 +157,11 @@ end
     assert!(surveyed.status.success(), "survey mode should keep the supported sibling: {survey_stderr}");
     assert!(survey_stderr.contains("Survey: 3 ingest gap(s)"), "{survey_stderr}");
     for wrapper in ["authenticate", "authenticated", "unauthenticated"] {
-        assert!(survey_stderr.contains(wrapper), "missing `{wrapper}` survey gap: {survey_stderr}");
+        let expected_diagnostic = format!("unsupported routes DSL: `{wrapper}`");
+        assert!(
+            survey_stderr.contains(expected_diagnostic.as_str()),
+            "missing `{wrapper}` survey diagnostic: {survey_stderr}"
+        );
     }
     let routes = std::fs::read_to_string(survey_out.join("config/routes.rb")).unwrap();
     assert!(routes.contains("/widgets"), "the unguarded sibling was lost: {routes}");
