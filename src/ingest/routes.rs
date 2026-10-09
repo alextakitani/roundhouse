@@ -394,8 +394,22 @@ fn ingest_literal_engine_mount(
             route_mount_gap(&draw, &engine.file, cx, detail);
             return None;
         }
-        if has_mount_block_call(&body, &["authenticated", "unauthenticated", "devise_scope"]) {
-            route_mount_gap(&draw, &engine.file, cx, "Devise visibility wrappers in engine routes are not enforced and cannot be composed");
+        if has_mount_block_call(&body, &["authenticate", "authenticated", "unauthenticated"]) {
+            route_mount_gap(
+                &draw,
+                &engine.file,
+                cx,
+                "authentication guards in engine routes are not enforced and cannot be composed",
+            );
+            return None;
+        }
+        if has_mount_block_call(&body, &["devise_scope"]) {
+            route_mount_gap(
+                &draw,
+                &engine.file,
+                cx,
+                "`devise_scope` in engine routes is not composed",
+            );
             return None;
         }
         if has_mount_block_call(&body, &["direct"]) {
@@ -1079,7 +1093,7 @@ fn ingest_route_stmts<'pr>(
         //     flattener build the right path. `find_comment` reading
         //     `params[:id]` depends on the member routes carrying `:id`.
         //   - `devise_scope` — a path-transparent Devise mapping wrapper.
-        //     Auth visibility wrappers are not passthroughs: the generated
+        //     Authentication guards are not passthroughs: the generated
         //     router cannot enforce their Warden constraint, so the generic
         //     unsupported-DSL path drops their children with a survey gap.
         if matches!(

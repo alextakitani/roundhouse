@@ -717,9 +717,9 @@ fn cable_mounts_inherit_draw_and_concern_scope() {
         }
     }
 
-    // These wrappers are rejected before the fixed runtime cable mount is
+    // These guards are rejected before the fixed runtime cable mount is
     // visited. Treating them as transparent would discard their guard.
-    for wrapper in ["authenticated :user", "unauthenticated :user"] {
+    for wrapper in ["authenticate :user", "authenticated :user", "unauthenticated :user"] {
         let source = format!(
             "Rails.application.routes.draw do\n  {wrapper} do\n    mount ActionCable.server => '/cable'\n  end\nend\n"
         );
@@ -728,7 +728,7 @@ fn cable_mounts_inherit_draw_and_concern_scope() {
             "config/routes.rb",
             &draws,
         )
-        .expect_err("auth wrapper must fail closed before a nested mount");
+        .expect_err("auth guard must fail closed before a nested mount");
         let method = wrapper.split_whitespace().next().unwrap();
         let expected_diagnostic = format!("unsupported routes DSL: `{method}`");
         assert!(
