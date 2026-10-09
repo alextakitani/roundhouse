@@ -7071,8 +7071,10 @@ fn read_wrap_parameters_by_default<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> bool
         let lines = code_lines(&source);
         for line in &lines {
             if let Some(rest) = line.strip_prefix("config.load_defaults") {
+                // `config.load_defaults 8.1` and `config.load_defaults(8.1)`.
                 let version: String = rest
                     .trim()
+                    .trim_start_matches('(')
                     .trim_matches(|c| c == '"' || c == '\'')
                     .chars()
                     .take_while(|c| c.is_ascii_digit() || *c == '.')
@@ -7102,8 +7104,15 @@ fn read_wrap_parameters_by_default<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> bool
             } else if rest.starts_with("false") {
                 default = false;
             }
-        } else if let Some(i) = line.find("wrap_parameters format:") {
-            default = line[i..].contains(":json");
+        } else if let Some(rest) = line.strip_prefix("wrap_parameters format:") {
+            // Receiverless only — `WidgetsController.wrap_parameters …` is
+            // that controller's call, not the app-wide on_load default.
+            // Format alone (the pre-7 generator); `include:` / `exclude:` /
+            // `name:` on the same line are not modeled as the app default.
+            if rest.contains("include:") || rest.contains("exclude:") || rest.contains("name:") {
+                continue;
+            }
+            default = rest.contains(":json");
         }
     }
     default

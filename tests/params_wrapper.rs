@@ -113,12 +113,69 @@ fn an_explicit_config_key_wins_over_load_defaults() {
 }
 
 #[test]
+fn parenthesized_load_defaults_wraps() {
+    let src = App::new(
+        "module Blog\n  class Application < Rails::Application\n    config.load_defaults(8.1)\n  end\nend\n",
+    )
+    .ruby("app/controllers/articles_controller.rb");
+    assert!(src.contains(ARTICLE_WRAP), "{src}");
+}
+
+/// A controller-scoped call in an initializer is that controller's, not
+/// the app-wide on_load default — wrapping stays off under Rails 6.
+#[test]
+fn a_controller_receiver_in_an_initializer_is_not_the_app_default() {
+    let src = App::new(RAILS_6)
+        .with(
+            "config/initializers/wrap_parameters.rb",
+            "ArticlesController.wrap_parameters format: [:json]\n",
+        )
+        .ruby("app/controllers/sessions_controller.rb");
+    assert!(!src.contains("Params.wrap"), "{src}");
+}
+
+/// The pre-7 generator's `format: [:json]` alone is the app default;
+/// extra options on that line are not modeled as a silent global wrap.
+#[test]
+fn an_initializer_format_with_include_is_not_the_app_default() {
+    let src = App::new(RAILS_6)
+        .with(
+            "config/initializers/wrap_parameters.rb",
+            "ActiveSupport.on_load(:action_controller) do\n  wrap_parameters format: [:json], include: [:token]\nend\n",
+        )
+        .ruby("app/controllers/articles_controller.rb");
+    assert!(!src.contains("Params.wrap"), "{src}");
+}
+
+#[test]
 fn a_parent_switching_it_off_is_inherited_and_a_child_can_switch_it_back() {
     let app = App::new(RAILS_8).with(
         "app/controllers/application_controller.rb",
         "class ApplicationController < ActionController::API\n  wrap_parameters false\nend\n",
     );
     assert!(!app.ruby("app/controllers/articles_controller.rb").contains("Params.wrap"));
+    let src = app
+        .with(
+            "app/controllers/articles_controller.rb",
+            &format!("class ArticlesController < ApplicationController\n  wrap_parameters format: [:json]\n{CREATE}end\n"),
+        )
+        .ruby("app/controllers/articles_controller.rb");
+    assert!(src.contains(ARTICLE_WRAP), "{src}");
+}
+
+/// An unreadable ancestor call leaves the format unknown, but a child
+/// that sets `format:` replaces the options in Rails — so wrapping is
+/// decidable again for that controller alone.
+#[test]
+fn a_child_format_call_overrides_an_unreadable_ancestor() {
+    let app = App::new(RAILS_8).with(
+        "app/controllers/application_controller.rb",
+        "class ApplicationController < ActionController::API\n  wrap_parameters wrapper_options\nend\n",
+    );
+    assert!(
+        !app.ruby("app/controllers/sessions_controller.rb").contains("Params.wrap"),
+        "siblings without a clarifying call stay unwrapped"
+    );
     let src = app
         .with(
             "app/controllers/articles_controller.rb",

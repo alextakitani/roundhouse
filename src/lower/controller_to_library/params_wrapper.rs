@@ -49,8 +49,9 @@ struct Options {
 
 /// The wrapping for `controller`, or `None` when Rails would not wrap
 /// its JSON requests — or when a `wrap_parameters` call is in a form
-/// read here not at all, which keeps today's unwrapped behavior and its
-/// survey line rather than guessing.
+/// read here not at all and no later call makes the JSON format known
+/// again (a child `wrap_parameters false` or `format:` replaces the
+/// ancestor's options in Rails, so that controller stays decidable).
 pub(super) fn wrapper_spec(
     controller: &Controller,
     ancestors: &[&Controller],
@@ -59,6 +60,9 @@ pub(super) fn wrapper_spec(
     app_default: bool,
 ) -> Option<WrapperSpec> {
     let mut opts = Options { json: app_default, ..Options::default() };
+    // An unreadable call leaves the effective format unknown until a
+    // later `false` or `format:` replaces it (Rails' own carry rule).
+    let mut json_known = true;
     for c in ancestors.iter().copied().chain(std::iter::once(controller)) {
         for item in &c.body {
             let ControllerBodyItem::Unknown { expr, .. } = item else { continue };
@@ -68,8 +72,18 @@ pub(super) fn wrapper_spec(
             if method.as_str() != "wrap_parameters" {
                 continue;
             }
-            opts = apply_call(&opts, args)?;
+            let Some(next) = apply_call(&opts, args) else {
+                json_known = false;
+                continue;
+            };
+            if call_sets_json_format(args) {
+                json_known = true;
+            }
+            opts = next;
         }
+    }
+    if !json_known {
+        return None;
     }
     if !opts.json {
         return None;
@@ -100,6 +114,37 @@ pub(super) fn wrapper_spec(
 /// module reads, so `check` does not list it as an unrecognized macro.
 pub fn is_recognized_wrap_parameters_call(args: &[Expr]) -> bool {
     apply_call(&Options::default(), args).is_some()
+}
+
+/// Whether this call replaces the JSON-format half of the options in
+/// force: `wrap_parameters false`, or any form that names `format:`.
+/// A bare name / model / `include:` leaves the prior format (or the
+/// unknown state after an unreadable ancestor) alone.
+fn call_sets_json_format(args: &[Expr]) -> bool {
+    let Some((first, rest)) = args.split_first() else {
+        return false;
+    };
+    if matches!(&*first.node, ExprNode::Lit { value: Literal::Bool { value: false } }) {
+        return true;
+    }
+    let entries = match &*first.node {
+        ExprNode::Hash { entries, .. } => Some(entries.as_slice()),
+        _ => match rest {
+            [extra] => match &*extra.node {
+                ExprNode::Hash { entries, .. } => Some(entries.as_slice()),
+                _ => None,
+            },
+            _ => None,
+        },
+    };
+    entries.is_some_and(|entries| {
+        entries.iter().any(|(key, _)| {
+            matches!(
+                &*key.node,
+                ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "format"
+            )
+        })
+    })
 }
 
 /// `wrap_parameters(...)` — Rails' `ClassMethods#wrap_parameters`: only

@@ -60,7 +60,6 @@ module CgiIo
       ctype  = env["CONTENT_TYPE"] || ""
       if length > 0 && ctype.start_with?("application/x-www-form-urlencoded")
         body = stdin.read(length).to_s
-        parse_form_into(body, params)
         parse_form_into(body, body_params)
       elsif length > 0 && ctype.start_with?("multipart/form-data")
         # File parts land in the params tree as UploadedFile objects
@@ -68,8 +67,6 @@ module CgiIo
         # runtime/multipart.rb.
         body = stdin.read(length).to_s
         form = ActionDispatch::Http::Multipart.parse(body, ctype)
-        form.fields.each { |k, v| assign_form_pair(params, k, v) }
-        form.files.each { |k, v| assign_form_pair(params, k, v) }
         form.fields.each { |k, v| assign_form_pair(body_params, k, v) }
         form.files.each { |k, v| assign_form_pair(body_params, k, v) }
       elsif length > 0 && ctype.start_with?("application/json")
@@ -80,14 +77,13 @@ module CgiIo
         body = stdin.read(length).to_s
         begin
           parsed = JSON.parse(body)
-          if parsed.is_a?(Hash)
-            parsed.each { |k, v| params[k] = v }
-            parsed.each { |k, v| body_params[k] = v }
-          end
+          parsed.each { |k, v| body_params[k] = v } if parsed.is_a?(Hash)
         rescue JSON::ParserError
           nil
         end
       end
+      # Merged `params` is body ∪ query (query already landed above).
+      body_params.each { |k, v| params[k] = v }
     end
 
     # Rails-style method override: a POST with hidden `_method=delete` (or

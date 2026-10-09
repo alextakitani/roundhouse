@@ -1227,20 +1227,12 @@ fn build_methods(
         );
         let (mut stmts, wraps) = preamble;
         // ParamsWrapper runs before every callback in Rails (it wraps
-        // `process_action` outside them), so it leads the preamble.
+        // `process_action` outside them), so it leads as `Lead` — not a
+        // filter `Block` with empty guards.
         if let Some(spec) = wrapper {
             stmts.insert(
                 0,
-                PreambleStmt::Block {
-                    body: self::params_wrapper::wrap_statement(spec),
-                    only: Vec::new(),
-                    except: Vec::new(),
-                    if_cond: None,
-                    unless_cond: None,
-                    if_cond_expr: None,
-                    unless_cond_expr: None,
-                    halt_check: false,
-                },
+                PreambleStmt::Lead { body: self::params_wrapper::wrap_statement(spec) },
             );
         }
         pending_dispatcher = Some((stmts, wraps));
