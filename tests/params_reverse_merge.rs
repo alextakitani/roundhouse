@@ -87,3 +87,18 @@ fn the_expect_form_keeps_its_refusal() {
     );
     assert!(src.contains("_p.status = 0"), "{src}");
 }
+
+/// `return <chain>.reverse_merge(...)`: the statements replace the
+/// `return`, which moves onto the final `_p`.
+#[test]
+fn an_explicit_return_is_rewritten_too() {
+    for target in [BuildTarget::Ruby, BuildTarget::Spinel] {
+        let src = controller_for(target, "return params.require(:widget).permit(:name).reverse_merge(status: 0)");
+        assert!(
+            src.contains(r#"_p = WidgetParams.from_raw(Params.require_present(@params, "widget"))"#),
+            "{target:?}:\n{src}"
+        );
+        assert!(src.contains("_p.status = 0\n    _p.status_provided = true\n    return _p\n"), "{target:?}:\n{src}");
+        assert!(!src.contains(".merge("), "{target:?}:\n{src}");
+    }
+}

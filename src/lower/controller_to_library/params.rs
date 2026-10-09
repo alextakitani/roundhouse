@@ -1006,10 +1006,12 @@ fn match_reverse_merge(expr: &Expr) -> Option<(Symbol, Vec<Symbol>, Vec<Symbol>)
     Some((resource, fields, nested))
 }
 
-/// The expression a body returns: the last statement, through nested Seqs.
+/// The expression a body returns: the last statement, through nested Seqs
+/// and an explicit `return`.
 fn body_tail(body: &Expr) -> &Expr {
     match &*body.node {
         ExprNode::Seq { exprs } if !exprs.is_empty() => body_tail(&exprs[exprs.len() - 1]),
+        ExprNode::Return { value } => body_tail(value),
         _ => body,
     }
 }
@@ -2020,15 +2022,31 @@ pub fn rewrite_to_from_raw(expr: &Expr, specs: &ParamsSpecs, guard: bool) -> Exp
                 return Some(build_from_raw_merge(&spec.class_id, entries, e.span, arg));
             }
         }
-        // Reverse-merge form (Form 4), at the body's tail only.
+        // Reverse-merge form (Form 4), at the body's tail only. Under an
+        // explicit `return` the statements replace the `return`, which
+        // moves onto the final `_p`.
+        let defaults = |e: &Expr| -> Option<Expr> {
+            let (resource, fields, _) = match_reverse_merge(e)?;
+            let ExprNode::Send { recv: Some(recv), args, .. } = &*e.node else { unreachable!() };
+            let ExprNode::Hash { entries, .. } = &*recv.node else { unreachable!() };
+            let (_, permitted) = match_permit_call(&args[0])?;
+            let spec = specs.find(&resource, &fields)?;
+            let arg = factory_arg(&args[0], guard, e.span);
+            Some(build_from_raw_defaults(&spec.class_id, entries, &permitted, e.span, arg))
+        };
+        if let ExprNode::Return { value } = &*e.node {
+            if std::ptr::eq(value, tail) {
+                if let Some(seq) = defaults(value) {
+                    let ExprNode::Seq { mut exprs } = *seq.node else { unreachable!() };
+                    let last = exprs.pop().expect("from_raw Seq ends in `_p`");
+                    exprs.push(Expr::new(e.span, ExprNode::Return { value: last }));
+                    return Some(Expr::new(e.span, ExprNode::Seq { exprs }));
+                }
+            }
+        }
         if std::ptr::eq(e, tail) {
-            if let Some((resource, fields, _)) = match_reverse_merge(e) {
-                let ExprNode::Send { recv: Some(recv), args, .. } = &*e.node else { unreachable!() };
-                let ExprNode::Hash { entries, .. } = &*recv.node else { unreachable!() };
-                let (_, permitted) = match_permit_call(&args[0])?;
-                let spec = specs.find(&resource, &fields)?;
-                let arg = factory_arg(&args[0], guard, e.span);
-                return Some(build_from_raw_defaults(&spec.class_id, entries, &permitted, e.span, arg));
+            if let Some(seq) = defaults(e) {
+                return Some(seq);
             }
         }
         let (resource, fields) = match_permit_call(e)?;
