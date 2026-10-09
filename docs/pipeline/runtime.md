@@ -244,6 +244,24 @@ undocumented one reads as intent to the next session precisely because
 it is applied consistently, and the emit gives no signal that anyone
 weighed it.
 
+### A JSON body is not wrapped on the strict targets
+
+Rails' ParamsWrapper copies a JSON request body under the controller's
+model name (`params[:article]`) when the app's `load_defaults` is 7.0
+or later, an initializer asks for it, or the controller says so with
+`wrap_parameters`. The ruby family does the same: the compiler decides
+each controller's key and copied keys
+(`lower::controller_to_library::params_wrapper`), the generated
+`process_action` opens with `Params.wrap` (`runtime/ruby/params.rb`),
+and the dispatchers hand the request its body params apart from the
+query string and the path (`request_parameters`).
+
+The strict targets do not: Rust and Python read no JSON body at all,
+and the TypeScript server merges one into `params` without keeping the
+body apart. A client posting the fields at the top level gets them at
+the top level only, so `params.expect(article: …)` finds nothing there.
+The capability is `FormatBreadth::wraps_json_params`.
+
 ### A missing strong-params resource is `{}` on the strict targets, not 400
 
 Rails refuses `params.expect(article: [...])` when `article` is missing,
