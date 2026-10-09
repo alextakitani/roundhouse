@@ -7,7 +7,7 @@
 
 use crate::expr::{Expr, ExprNode, LValue, Literal};
 
-use super::util::{arm_body_already_value, case_pattern_supported, emit_case_pattern, indent, peel_nil};
+use super::util::{arm_body_already_value, indent, peel_nil, try_emit_case_pattern};
 use super::{
     current_return_is_option, current_return_is_unit, current_return_ty,
     emit_expr, emit_expr_tail, in_constructor, in_return_tail, mark_rebound_var,
@@ -428,14 +428,18 @@ pub(super) fn emit_case(scrutinee: &Expr, arms: &[crate::expr::Arm]) -> String {
     // second `_` would be unreachable.
     //
     // Only literal, binding and wildcard patterns have a Rust `match`
-    // form. A range, class or other `===` pattern, a nil/float literal,
-    // or a guarded arm has none, and rendering it as `_` makes the first
-    // such arm swallow every input, so report it instead.
+    // form (`try_emit_case_pattern`). A range, class or other `===`
+    // pattern, a nil/float literal, or a guarded arm has none — report
+    // instead of inventing `_` (which would let the first such arm
+    // swallow every input). Fail-closed matches Python/TS intent; the
+    // supported set keeps Bind for indexer symbol dispatch, which those
+    // emitters do not.
     // The diagnostic points at the first such arm's guard or pattern
     // expression; a literal pattern carries no span, so it falls back to
     // the scrutinee.
-    if let Some(arm) =
-        arms.iter().find(|arm| arm.guard.is_some() || !case_pattern_supported(&arm.pattern))
+    if let Some(arm) = arms
+        .iter()
+        .find(|arm| arm.guard.is_some() || try_emit_case_pattern(&arm.pattern).is_none())
     {
         let span = match (&arm.guard, &arm.pattern) {
             (Some(guard), _) => guard.span,
@@ -450,7 +454,8 @@ pub(super) fn emit_case(scrutinee: &Expr, arms: &[crate::expr::Arm]) -> String {
     let arm_strs: Vec<String> = arms
         .iter()
         .map(|arm| {
-            let pat_s = emit_case_pattern(&arm.pattern);
+            let pat_s = try_emit_case_pattern(&arm.pattern)
+                .expect("emit_case gated unsupported patterns above");
             // Emit via `emit_expr_tail` so Ivar reads see
             // `IN_RETURN_TAIL=true` and add `.clone()` for non-Copy
             // fields. Without that, `Value::from(self.body)` below

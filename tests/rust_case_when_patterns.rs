@@ -1,58 +1,48 @@
-//! Rust renders `case`/`when` as a `match`. Only literal, binding and
-//! wildcard patterns have a `match` form; a range, class or endless-range
-//! `when` used to come out as `_`, so the first such arm won for every
-//! input (`case -3 when 0..3 then "low" ... else "neg"` returned "low").
-//! Those shapes are reported unsupported instead, as Python and
-//! TypeScript already do.
+//! Rust renders `case`/`when` as a `match`. Only literal (Str/Sym/Int/
+//! Bool), binding and wildcard patterns have a `match` form; a range,
+//! class, nil/float, or guarded `when` used to come out as `_`, so the
+//! first such arm won for every input. Those shapes are reported
+//! unsupported instead (fail-closed, same intent as Python/TS; Bind
+//! stays for indexer symbol dispatch).
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+#[path = "support/emit_and_run.rs"]
+mod emit_and_run;
 
 use roundhouse::diagnostic::{Diagnostic, DiagnosticKind, Severity};
-use roundhouse::emit::diagnostics::scope;
-use roundhouse::ingest::ingest_app_from_tree;
-use roundhouse::project::{BuildTarget, target_files};
+use roundhouse::project::BuildTarget;
 
-const SKIP: &[&str] = &["tmp", "log", "storage", "node_modules", ".git"];
-
-fn read_tree(root: &Path, dir: &Path, out: &mut HashMap<PathBuf, Vec<u8>>) {
-    for entry in std::fs::read_dir(dir).unwrap() {
-        let path = entry.unwrap().path();
-        let rel = path.strip_prefix(root).unwrap().to_path_buf();
-        if path.is_dir() {
-            if !SKIP.iter().any(|s| rel == Path::new(s)) {
-                read_tree(root, &path, out);
-            }
-        } else {
-            out.insert(rel, std::fs::read(&path).unwrap());
-        }
-    }
+/// real-blog with `Article.probe(x)` added; returns emitted `article.rs`,
+/// error diagnostics, and the app (for span provenance).
+fn emit_rust_with_probe(body: &str) -> (String, Vec<Diagnostic>, roundhouse::App) {
+    let (emitted, app, errors) = emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            &format!("class Article < ApplicationRecord\n  def self.probe(x)\n    {body}\n  end\n"),
+        )
+        .emit_with_app(BuildTarget::Rust);
+    let article = std::fs::read_to_string(emitted.join("src/models/article.rs"))
+        .expect("emitted src/models/article.rs");
+    (article, errors, app)
 }
 
-/// real-blog with `Article.probe(x)` added; returns the emitted
-/// `article.rs` and the error diagnostics.
-fn emit_rust_with_probe(body: &str) -> (String, Vec<Diagnostic>, String) {
-    let root = roundhouse::fixtures::real_blog();
-    let mut tree = HashMap::new();
-    read_tree(root, root, &mut tree);
-    let model = PathBuf::from("app/models/article.rb");
-    let source = String::from_utf8(tree[&model].clone()).unwrap().replacen(
-        "class Article < ApplicationRecord\n",
-        &format!("class Article < ApplicationRecord\n  def self.probe(x)\n    {body}\n  end\n"),
-        1,
-    );
-    tree.insert(model, source.clone().into_bytes());
-    let mut app = ingest_app_from_tree(tree).unwrap();
-    roundhouse::session::analyze_and_lower(&mut app);
-    let (files, diagnostics) = scope(|| target_files(&app, root, BuildTarget::Rust));
-    let article = files
-        .unwrap()
-        .into_iter()
-        .find(|(path, _)| path.ends_with("models/article.rs"))
-        .map(|(_, text)| text)
-        .unwrap_or_default();
-    let errors = diagnostics.into_iter().filter(|d| d.severity == Severity::Error).collect();
-    (article, errors, source)
+fn case_rust_unsupported<'a>(errors: &'a [Diagnostic]) -> Vec<&'a Diagnostic> {
+    errors
+        .iter()
+        .filter(|d| {
+            d.severity == Severity::Error
+                && matches!(
+                    &d.kind,
+                    DiagnosticKind::Unsupported { construct, target: Some(t), .. }
+                        if construct.as_str() == "Case" && t.as_str() == "rust"
+                )
+        })
+        .collect()
+}
+
+fn span_text(app: &roundhouse::App, d: &Diagnostic) -> String {
+    let source = roundhouse::ide::source(app, d.span.file).expect("diagnostic has source");
+    source.text[d.span.start as usize..d.span.end as usize].to_string()
 }
 
 #[test]
@@ -64,18 +54,20 @@ fn non_literal_when_patterns_are_unsupported_not_wildcards() {
         ("case x\n    when ..0 then \"nonpos\"\n    when 10.. then \"big\"\n    else \"mid\"\n    end", "..0"),
         ("case x\n    when String then \"s\"\n    when Integer then \"i\"\n    else \"o\"\n    end", "String"),
         ("case x\n    when 0 then \"zero\"\n    when 1..5 then \"few\"\n    else \"many\"\n    end", "1..5"),
+        // Nil Lit has no pattern span → falls back to the scrutinee (`x`).
+        // (Case `Arm.guard` is synthesizer-only; Ruby `when` does not carry it.)
+        ("case x\n    when nil then \"n\"\n    else \"o\"\n    end", "x"),
     ] {
-        let (article, errors, source) = emit_rust_with_probe(body);
-        assert!(!errors.is_empty(), "rust accepted {body}:\n{article}");
-        assert_eq!(errors.len(), 1, "{body}: {errors:?}");
+        let (article, errors, app) = emit_rust_with_probe(body);
+        let case_errs = case_rust_unsupported(&errors);
         assert!(
-            matches!(&errors[0].kind, DiagnosticKind::Unsupported { construct, target: Some(t), .. }
-                if construct.as_str() == "Case" && t.as_str() == "rust"),
-            "{body}: {errors:?}"
+            !case_errs.is_empty(),
+            "rust accepted {body}:\n{article}\nall errors: {errors:?}"
         );
-        let span = errors[0].span;
+        assert_eq!(case_errs.len(), 1, "{body}: {case_errs:?}");
+        let span = case_errs[0].span;
         assert!(!span.is_synthetic(), "lost source span");
-        assert_eq!(&source[span.start as usize..span.end as usize], failing, "{body}: span");
+        assert_eq!(span_text(&app, case_errs[0]), failing, "{body}: span");
     }
 }
 
@@ -84,6 +76,9 @@ fn literal_when_patterns_still_emit_a_match() {
     let (article, errors, _) = emit_rust_with_probe(
         "case x\n    when 1, 2 then \"small\"\n    when 3 then \"three\"\n    else \"other\"\n    end",
     );
-    assert!(errors.is_empty(), "{errors:?}");
+    assert!(
+        case_rust_unsupported(&errors).is_empty(),
+        "{errors:?}"
+    );
     assert!(article.contains("3 => "), "{article}");
 }
