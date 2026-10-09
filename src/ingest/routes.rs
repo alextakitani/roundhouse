@@ -974,6 +974,8 @@ fn ingest_route_body(
     ingest_route_stmts(flatten_statements(body).into_iter(), file, parent, cx)
 }
 
+/// Walk route statements, recording unsupported entries in survey mode and
+/// returning their errors in strict mode.
 fn ingest_route_stmts<'pr>(
     stmts: impl Iterator<Item = Node<'pr>>,
     file: &str,
@@ -1376,6 +1378,7 @@ fn redirect_expression_is_string(expr: &crate::expr::Expr) -> bool {
     }
 }
 
+/// Recognize a route DSL call; unknown calls return an unsupported-DSL error.
 fn ingest_route_call(
     call: &ruby_prism::CallNode<'_>,
     method: &str,
