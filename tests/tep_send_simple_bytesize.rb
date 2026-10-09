@@ -9,6 +9,7 @@
 require_relative "tep_server_harness"
 
 MSG = "requisição inválida" # 19 characters, 22 bytes
+check("probe distinguishes bytes from characters", MSG.bytesize != MSG.length)
 
 SENDERS = {
   "threaded" => ->(fd) { Tep::Server::Threaded.send_simple(fd, 400, MSG) },

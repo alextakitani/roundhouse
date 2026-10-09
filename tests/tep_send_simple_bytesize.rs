@@ -33,7 +33,7 @@ fn send_simple_content_length_counts_bytes() {
         failed.join("\n")
     );
     assert!(
-        stdout.lines().any(|line| line == "3/3 checks pass"),
+        stdout.lines().any(|line| line == "4/4 checks pass"),
         "fewer checks ran than expected\n=== stdout ===\n{stdout}"
     );
 }

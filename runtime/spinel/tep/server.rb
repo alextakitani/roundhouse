@@ -271,8 +271,7 @@ module Tep
     end
 
     # bytesize, as write_response: a multibyte `msg` would otherwise
-    # announce fewer bytes than the page carries, and a keep-alive client
-    # reads the surplus as the next response's status line.
+    # announce fewer bytes than the page carries.
     def send_simple(client, status, msg)
       reason = Tep.reason(status)
       body = "<h1>" + status.to_s + " " + reason + "</h1><p>" + msg + "</p>\n"
