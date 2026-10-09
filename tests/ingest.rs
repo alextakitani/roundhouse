@@ -385,6 +385,8 @@ end
     );
 }
 
+/// Strict ingest rejects authentication guards; survey mode reports and omits
+/// guarded routes while retaining public siblings.
 #[test]
 fn devise_authentication_route_guards_are_unsupported_and_survey_keeps_public_routes() {
     for (wrapper, route) in [
@@ -450,6 +452,8 @@ end
     assert_eq!(flat[0].path, "/health", "the public sibling must survive: {flat:?}");
 }
 
+/// `devise_scope` is path-transparent and does not impose an authentication
+/// guard.
 #[test]
 fn devise_scope_passthrough_nested_routes() {
     let source = br#"Rails.application.routes.draw do
