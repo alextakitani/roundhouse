@@ -517,6 +517,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("ActiveRecord::RecordNotFound", None),
         ("ActiveRecord::RecordNotUnique", None),
         ("ActiveRecord::ValueTooLong", None),
+        ("ActiveRecord::SoleRecordExceeded", None),
         // Not `ActiveRecord::Base`: no instance surface is registered there, so `e.record.errors` would still fail.
         ("ActiveRecord::RecordInvalid", Some(("record", Ty::Untyped))),
         // Names overlap `project::RUBY_FAMILY_RUNTIME_CONSTANTS` (emit
@@ -607,6 +608,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // A class test such as `URI.parse(url).is_a?(URI::HTTP)` names the
     // real bundled class, without claiming any extra instance methods.
     register_stdlib_class(classes, "URI::HTTP", &[], &[]);
+    register_stdlib_class(classes, "URI::HTTPS", &[], &[]);
     for response in ["Net::HTTPRedirection", "Net::HTTPOK"] {
         register_stdlib_class(classes, response, &[], &[]);
     }

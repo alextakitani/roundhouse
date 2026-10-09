@@ -169,6 +169,7 @@ class Routing(unittest.TestCase):
         self.assertNotIn("compare-jruby", plan["jobs"])
         self.assertNotIn("writebook-inventory", plan["jobs"])
         self.assertNotIn("build-wasm", plan["jobs"])
+        self.assertIn("generated_columns_spinel", plan["spinel_tests"])
 
     def test_spinel_compact_gate_only_requires_publication_floor(self):
         plan = ci.select([], spinel_lane=True)
@@ -442,9 +443,18 @@ class Routing(unittest.TestCase):
         ]:
             with self.subTest(path=path):
                 plan = ci.select([path])
+                if path in {
+                    "src/lower/arel/visitor.rs",
+                    "tests/support/emit_and_run.rs",
+                }:
+                    expected = [*ci.PARAM_BIND_TESTS, "generated_columns_spinel"]
+                elif path.startswith("src/"):
+                    expected = ci.PARAM_BIND_TESTS
+                else:
+                    expected = ["param_binds"]
                 self.assertEqual(
                     plan["spinel_tests"],
-                    ci.PARAM_BIND_TESTS if path.startswith("src/") or path == "tests/support/emit_and_run.rs" else ["param_binds"],
+                    expected,
                 )
                 self.assertEqual(
                     self.extras(plan), set(ci.CORE) | {"spinel-framework"}
@@ -454,7 +464,7 @@ class Routing(unittest.TestCase):
         # must too when that file is the only change.
         self.assertEqual(
             ci.select(["src/emit/ruby/library.rs"])["spinel_tests"],
-            ci.PARAM_BIND_TESTS,
+            [*ci.PARAM_BIND_TESTS, "generated_columns_spinel"],
         )
         self.assertEqual(
             ci.select(["runtime/spinel/db.rb"])["spinel_tests"],
@@ -483,6 +493,64 @@ class Routing(unittest.TestCase):
         ]:
             with self.subTest(path=path):
                 self.assertNotIn("param_binds", ci.select([path])["spinel_tests"])
+
+    def test_json_types_spinel_owns_schema_and_runtime_inputs(self):
+        suite = "postgres_json_types_spinel"
+        paths = [
+            "tests/postgres_json_types_spinel.rs",
+            "src/schema.rs",
+            "src/ingest/schema.rs",
+            "src/ingest/structure_sql.rs",
+            "src/ingest/model.rs",
+            "src/emit/shared/schema_sql.rs",
+            "src/lower/arel/ruby_values.rs",
+            "src/lower/model_to_library/mod.rs",
+            "src/lower/model_to_library/schema.rs",
+        ]
+        for path in paths:
+            with self.subTest(path=path):
+                plan = ci.select([path])
+                self.assertIn(suite, plan["spinel_tests"])
+                self.assertTrue(set(ci.CORE).issubset(plan["jobs"]))
+                self.assertIn("spinel-framework", plan["jobs"])
+
+        shared = ci.select(["src/emit/shared/schema_sql.rs"])
+        self.assertEqual(shared["spinel_tests"], ci.SPINEL_TESTS)
+        self.assertIn(suite, ci.select([], full=True)["spinel_tests"])
+
+    def test_generated_columns_spinel_owns_schema_support_and_lowering_inputs(self):
+        suite = "generated_columns_spinel"
+        paths = [
+            "tests/generated_columns_spinel.rs",
+            "tests/support/generated_columns_schema.rb",
+            "tests/support/generated_columns_person.rb",
+            "tests/support/generated_columns_virtual_person.rb",
+            "tests/support/generated_columns_constant_person.rb",
+            "tests/support/generated_columns_contract.rb",
+            "src/schema.rs",
+            "src/schema/generated.rs",
+            "src/ingest/schema.rs",
+            "src/ingest/structure_sql.rs",
+            "src/lower/persistence.rs",
+            "src/lower/model_to_library/mod.rs",
+            "src/lower/model_to_library/row.rs",
+            "src/lower/model_to_library/schema.rs",
+            "src/lower/model_to_library/adapter_emit/mod.rs",
+            "src/lower/arel/visitor.rs",
+            "tests/support/emit_and_run.rs",
+        ]
+        for path in paths:
+            with self.subTest(path=path):
+                plan = ci.select([path])
+                self.assertIn(suite, plan["spinel_tests"])
+                self.assertTrue(set(ci.CORE).issubset(plan["jobs"]))
+                self.assertIn("spinel-framework", plan["jobs"])
+
+        # A shared DDL edit already selects full target coverage; the new
+        # native regression must be present in that full suite too.
+        shared = ci.select(["src/emit/shared/schema_sql.rs"])
+        self.assertEqual(shared["spinel_tests"], ci.SPINEL_TESTS)
+        self.assertIn(suite, shared["spinel_tests"])
 
     def test_jdbc_probes_select_the_existing_comparison_without_archives(self):
         for path, native_jobs, suites in [
@@ -518,6 +586,11 @@ class Routing(unittest.TestCase):
             "runtime/spinel/multipart.rb": "spinel_param_builder",
             "runtime/spinel/date.rb": "date_columns_spinel",
             "runtime/spinel/active_support_date_parsing.rb": "date_columns_spinel",
+            "runtime/spinel/net_http.rb": "spinel_net_http_start",
+            "runtime/spinel/http_stub.rb": "spinel_net_http_start",
+            "runtime/spinel/http_stub.rbs": "spinel_net_http_start",
+            "runtime/spinel/tcp_socket_stub.rb": "spinel_net_http_start",
+            "runtime/spinel/tcp_socket_stub.rbs": "spinel_net_http_start",
         }
         for path, binary in cases.items():
             with self.subTest(path=path):
@@ -568,7 +641,19 @@ class Routing(unittest.TestCase):
             ],
             "runtime/spinel/active_support_time_parsing.rb": [
                 "spinel_db_lease", *ci.PARAM_BIND_TESTS, "spinel_stmt_cache_lru",
-                "db_sqlite_concurrency",
+                "db_sqlite_concurrency", "spinel_pg_db",
+            ],
+            # The PostgreSQL shim owns only its own gate, not the SQLite
+            # database suites its `db` name would otherwise select.
+            "runtime/spinel/db_pg.rb": ["spinel_pg_db"],
+            "runtime/spinel/db_pg.rbs": ["spinel_pg_db"],
+            "runtime/spinel/pg_errors.rb": ["spinel_pg_db"],
+            "runtime/spinel/pg_errors.rbs": ["spinel_pg_db"],
+            "tests/spinel_pg_db_cases.rb": ["spinel_pg_db"],
+            "runtime/ruby/db.rbs": [
+                "framework_tests_spinel",
+                "spinel_db_lease", *ci.PARAM_BIND_TESTS, "spinel_stmt_cache_lru",
+                "db_sqlite_concurrency", "spinel_pg_db",
             ],
             "runtime/spinel/date.rb": ["date_columns_spinel"],
             "runtime/spinel/date.rbs": ["date_columns_spinel"],
@@ -693,6 +778,7 @@ class Routing(unittest.TestCase):
     def test_full_manual_and_publication_are_distinct(self):
         plan = ci.select([], full=True)
         self.assertEqual(plan["spinel_tests"], ci.SPINEL_TESTS)
+        self.assertIn("generated_columns_spinel", plan["spinel_tests"])
         self.assertTrue(set(ci.SPINEL11).issubset(plan["jobs"]))
         self.assertIn("archive-results", plan["jobs"])
         self.assertNotIn("archive-results", plan["required"])

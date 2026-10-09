@@ -1058,6 +1058,21 @@ pub(crate) fn build_methods(
     build_methods_with_finder_inputs(model, models, schema, params_specs, FinderInputs::Scalar)
 }
 
+/// Return the instance method surface synthesized for a model, for ingest
+/// passes that need collision checks without depending on `MethodDef` details.
+pub(crate) fn method_names(
+    model: &Model,
+    models: &[Model],
+    schema: &Schema,
+    params_specs: &crate::lower::controller_to_library::params::ParamsSpecs,
+) -> HashSet<String> {
+    build_methods(model, models, schema, params_specs)
+        .into_iter()
+        .filter(|method| method.receiver == MethodReceiver::Instance)
+        .map(|method| method.name.as_str().to_string())
+        .collect()
+}
+
 /// Add the schema dispatch only when its shared Ruby-family owner is shipped.
 fn build_methods_with_finder_inputs(
     model: &Model,
@@ -1265,13 +1280,14 @@ fn build_methods_with_finder_inputs(
 ///     `@parsed_url` reader left the ivar untyped/unread and Spinel's
 ///     strict emit failed with `error[ivar_unresolved]`.
 ///   * Column / association / scope synthesizers still win over a
-///     duplicate body name (the corpus does not redefine those). The
-///     replace predicate matches unsigned bare-ivar attr_* halves only
-///     (`signature: None`); schema column readers stamp a signature and
-///     are never replaced.
+///     duplicate body name. A later source-level `delegate` may replace
+///     an earlier real method, but only when that method was already
+///     selected from the model body; generated framework methods are not
+///     reordered by source spans.
 fn push_user_methods(methods: &mut Vec<MethodDef>, model: &Model) {
     use crate::dialect::{AccessorKind, ModelBodyItem};
     use crate::expr::{ExprNode, LValue};
+    let mut selected_source_methods = HashSet::new();
     for item in &model.body {
         let ModelBodyItem::Method { method, .. } = item else { continue };
         if let Some(idx) = methods
@@ -1309,12 +1325,22 @@ fn push_user_methods(methods: &mut Vec<MethodDef>, model: &Model) {
                     }
                     AccessorKind::Method => false,
                 };
-            if incoming_is_real && existing_is_attr_half {
+            let incoming_is_later_delegate =
+                method.receiver == crate::dialect::MethodReceiver::Instance
+                    && !method.name_span.is_synthetic()
+                    && method.name_span.start == method.name_span.end
+                    && selected_source_methods.contains(&existing.name_span)
+                    && existing.name_span.file == method.name_span.file
+                    && method.name_span.start > existing.name_span.start;
+            if incoming_is_real && (existing_is_attr_half || incoming_is_later_delegate) {
+                selected_source_methods.remove(&existing.name_span);
                 methods[idx] = method.clone();
+                selected_source_methods.insert(method.name_span);
             }
             continue;
         }
         methods.push(method.clone());
+        selected_source_methods.insert(method.name_span);
     }
 }
 
@@ -2384,21 +2410,25 @@ pub fn ty_of_column(t: &ColumnType) -> Ty {
         ColumnType::Boolean => Ty::Bool,
         ColumnType::Date | ColumnType::DateTime | ColumnType::Time => Ty::Str,
         ColumnType::Binary => Ty::Str,
-        // A `json` column is stored TEXT and nothing parses it: the
+        // A schema-less `json` or `jsonb` column is stored TEXT and nothing
+        // parses it: the
         // Row field, hydration, `[]`, `attributes` and the adapter's
         // escape all move the serialized string. `Hash[String, String]`
         // was a declaration no synthesized path implemented. What gives
         // such a column STRUCTURE is a `has_json` declaration, and that
         // is modeled as typed per-key accessors over this text
         // (`lower::has_json`), not as a Hash the whole column decodes to.
-        ColumnType::Json => Ty::Str,
+        ColumnType::Json | ColumnType::Jsonb => Ty::Str,
         ColumnType::Uuid => Ty::Str,
         ColumnType::Reference { .. } => Ty::Int,
     }
 }
 
 /// The column's type AS STORED IN A RECORD — `ty_of_column` widened with
-/// `Nil` when the schema says the column is nullable. Rails' unset value
+/// `Nil` when the schema says the column is nullable or the column is
+/// database-generated. A generated attribute is unset on a new record
+/// until the INSERT computes it, even when the database column is NOT NULL.
+/// Rails' unset value
 /// for such a column is NULL, not the type's zero: a nullable unique
 /// column left unset must not collide row-to-row (lobsters'
 /// `users.password_reset_token`), and `where(merged_story_id: nil)` has
@@ -2414,7 +2444,7 @@ pub fn ty_of_column(t: &ColumnType) -> Ty {
 /// doesn't change.
 pub fn ty_of_column_slot(col: &Column) -> Ty {
     let base = ty_of_column(&col.col_type);
-    if col.nullable && !col.primary_key {
+    if (col.nullable || col.generated.is_some()) && !col.primary_key {
         Ty::Union { variants: vec![base, Ty::Nil] }
     } else {
         base

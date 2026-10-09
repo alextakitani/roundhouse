@@ -868,6 +868,50 @@ fn focused_framework_loop_runs_every_selection_and_preserves_failure() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// The PostgreSQL Db gate runs in the native framework loop: the job has
+/// a PostgreSQL service, checks spinel-pg out at a pinned commit only when
+/// the plan selects the gate, and hands both to the loop step.
+#[test]
+fn framework_loop_supplies_postgres_and_pinned_spinel_pg_to_the_pg_gate() {
+    let ci: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
+    let sha = ci["env"]["SPINEL_PG_SHA"].as_str().unwrap();
+    assert!(
+        sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()),
+        "SPINEL_PG_SHA must be a full commit sha: {sha}"
+    );
+    let job = &ci["jobs"]["spinel-framework"];
+    let service = &job["services"]["postgres"];
+    assert!(service["image"].as_str().unwrap().starts_with("postgres:"));
+    assert_eq!(service["ports"][0].as_str(), Some("5432:5432"));
+    assert!(service["options"].as_str().unwrap().contains("pg_isready"));
+    let steps = job["steps"].as_sequence().unwrap();
+    let checkout = steps
+        .iter()
+        .find(|step| step["with"]["repository"].as_str() == Some("rubys/spinel-pg"))
+        .expect("spinel-pg checkout");
+    assert_eq!(
+        checkout["with"]["ref"].as_str(),
+        Some("${{ env.SPINEL_PG_SHA }}")
+    );
+    assert_eq!(checkout["with"]["path"].as_str(), Some("spinel-pg"));
+    assert!(checkout["if"].as_str().unwrap().contains("'spinel_pg_db'"));
+    let run = steps
+        .iter()
+        .find(|step| step["name"].as_str() == Some("Run selected native framework checks"))
+        .unwrap();
+    assert_eq!(
+        run["env"]["SPINEL_PG_DIR"].as_str(),
+        Some("${{ github.workspace }}/spinel-pg")
+    );
+    assert!(
+        run["env"]["DATABASE_URL"]
+            .as_str()
+            .unwrap()
+            .contains("@127.0.0.1:5432/")
+    );
+}
+
 #[test]
 fn spinel_jobs_are_selected_explicitly_and_archive_evidence_reaches_pages() {
     let ci: serde_yaml_ng::Value =

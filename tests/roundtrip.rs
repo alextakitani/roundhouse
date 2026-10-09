@@ -16,6 +16,7 @@ fn sp() -> Span {
     Span::synthetic()
 }
 
+/// Verifies that a representative blog app survives an IR serialization round-trip.
 #[test]
 fn tiny_blog_round_trips() {
     let mut tables = IndexMap::new();
@@ -30,6 +31,9 @@ fn tiny_blog_round_trips() {
                     nullable: false,
                     default: None,
                     primary_key: true,
+                    generated: None,
+                    generated_text_compatible: None,
+                    generated_int4_compatible: None,
                 },
                 Column {
                     name: Symbol::from("title"),
@@ -37,6 +41,9 @@ fn tiny_blog_round_trips() {
                     nullable: false,
                     default: None,
                     primary_key: false,
+                    generated: None,
+                    generated_text_compatible: None,
+                    generated_int4_compatible: None,
                 },
             ],
             indexes: vec![],

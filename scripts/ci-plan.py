@@ -63,8 +63,58 @@ SPINEL_TESTS = [
     "spinel_stmt_cache_lru",
     "db_sqlite_concurrency",
     "spinel_param_builder",
+    "spinel_net_http_start",
     "rails_compat_vectors_spinel",
+    "spinel_pg_db",
+    "generated_columns_spinel",
+    "postgres_json_types_spinel",
 ]
+# Inputs of the PostgreSQL Db gate (tests/spinel_pg_db.rs): the shim, its
+# RBS, the contract and time parsing it compiles with, and the cases.
+PG_DB_INPUTS = {
+    "runtime/spinel/db_pg.rb",
+    "runtime/spinel/db_pg.rbs",
+    "runtime/spinel/pg_errors.rb",
+    "runtime/spinel/pg_errors.rbs",
+    "runtime/ruby/db.rbs",
+    "runtime/spinel/active_support_time_parsing.rb",
+    "runtime/spinel/active_support_time_parsing.rbs",
+    "tests/spinel_pg_db_cases.rb",
+}
+GENERATED_COLUMNS_SPINEL_INPUTS = {
+    "src/emit/ruby/library.rs",
+    "src/emit/shared/schema_sql.rs",
+    "src/schema.rs",
+    "src/schema/generated.rs",
+    "src/ingest/schema.rs",
+    "src/ingest/structure_sql.rs",
+    "src/lower/persistence.rs",
+    "src/lower/generated_write_guard.rs",
+    "src/lower/model_to_library/mod.rs",
+    "src/lower/model_to_library/row.rs",
+    "src/lower/model_to_library/schema.rs",
+    "tests/support/emit_and_run.rs",
+}
+# Inputs of the reopened Net::HTTP gate (tests/spinel_net_http_start.rs):
+# the reopen and the two stub tables it compiles with.
+NET_HTTP_INPUTS = {
+    "runtime/spinel/net_http.rb",
+    "runtime/spinel/http_stub.rb",
+    "runtime/spinel/http_stub.rbs",
+    "runtime/spinel/tcp_socket_stub.rb",
+    "runtime/spinel/tcp_socket_stub.rbs",
+}
+JSON_TYPES_SPINEL_INPUTS = {
+    "src/schema.rs",
+    "src/ingest/schema.rs",
+    "src/ingest/structure_sql.rs",
+    "src/ingest/model.rs",
+    "src/emit/shared/schema_sql.rs",
+    "src/lower/arel/ruby_values.rs",
+    "src/lower/model_to_library/mod.rs",
+    "src/lower/model_to_library/schema.rs",
+}
+
 SPINEL11 = [
     "spinel-build",
     "spinel-framework",
@@ -211,6 +261,15 @@ def native_coverage(path):
         suites.add(focused[1])
     if path == "tests/support/db_concurrency_spinel.rb":
         suites.add("db_sqlite_concurrency")
+    if (
+        path in GENERATED_COLUMNS_SPINEL_INPUTS
+        or path.startswith("tests/support/generated_columns_")
+        or path.startswith("src/lower/arel/")
+        or path.startswith("src/lower/model_to_library/adapter_emit/")
+    ):
+        suites.add("generated_columns_spinel")
+    if path in JSON_TYPES_SPINEL_INPUTS:
+        suites.add("postgres_json_types_spinel")
     # Gate drivers stay flat beside their Rust harness. Match the most
     # specific suite first (e.g. param_binds_values before param_binds).
     if path == "tests/param_binds_text_cleanup.rb":
@@ -223,6 +282,8 @@ def native_coverage(path):
                 break
     if path == "runtime/spinel/test/statement_cache_cases.rb":
         suites.add("param_binds")
+    if path in PG_DB_INPUTS:
+        suites.add("spinel_pg_db")
     if path in {
         "tests/support/emit_and_run.rs",
         "src/lower/model_to_library/adapter_emit.rs",
@@ -247,7 +308,11 @@ def native_coverage(path):
             )
         ) or path.startswith("runtime/spinel/tep/url."):
             owned_tests.add("rails_compat_vectors_spinel")
-        if any(
+        if name in {"db_pg.rb", "db_pg.rbs", "pg_errors.rb", "pg_errors.rbs"}:
+            # PostgreSQL, not SQLite: the SQLite database suites below
+            # never load it.
+            owned_tests.add("spinel_pg_db")
+        elif any(
             word in path for word in ("/db", "sqlite", "active_support_time_parsing")
         ):
             # Shared database inputs own lease/ownership, binds, cache recency,
@@ -262,6 +327,8 @@ def native_coverage(path):
             )
         if any(word in name for word in ("param", "multipart", "request")):
             owned_tests.add("spinel_param_builder")
+        if path in NET_HTTP_INPUTS:
+            owned_tests.add("spinel_net_http_start")
         if name in {
             "date.rb",
             "date.rbs",
