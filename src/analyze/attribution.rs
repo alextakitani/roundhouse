@@ -462,6 +462,53 @@ impl<'a> AttributionCtx<'a> {
 /// Recorded ancestry is evidence of missing coverage, NOT method ownership:
 /// even a typo on a gem-dependent receiver can be a note. Types and emitted
 /// methods remain unchanged; ambiguous ancestry does not claim a diagnostic.
+/// An unsupported constant that an initializer assigns (`::DB =
+/// MiniSqlMultisiteConnection.instance`, `ForemStatsClient = …`). Rails
+/// runs every initializer at boot, so the app's reads of it are sound,
+/// but a top-level assignment there has no home in the ingested tree yet:
+/// the reads are the tool's gap, not the app's errors. Matched by the
+/// declaration Rubydex resolves the reference to, so a namesake in
+/// another namespace stays an error.
+pub fn attribute_initializer_constants(diags: &mut [Diagnostic], app: &App) {
+    if !diags.iter().any(|d| d.severity != Severity::Info && is_unsupported_constant(d)) {
+        return;
+    }
+    let resolver = app.const_resolver.for_sources(&app.sources);
+    let root = app.root.trim_end_matches('/');
+    let mut assigned: HashMap<String, String> = HashMap::new();
+    for (i, f) in app.sources.iter().enumerate() {
+        let rel = f.path.strip_prefix(root).unwrap_or(&f.path).trim_start_matches('/');
+        if !rel.starts_with("config/initializers/") {
+            continue;
+        }
+        let file = FileId(i as u32 + 1);
+        for name in resolver.constants_assigned_in(file) {
+            assigned.entry(name.trim_start_matches("::").to_string()).or_insert_with(|| rel.to_string());
+        }
+    }
+    if assigned.is_empty() {
+        return;
+    }
+    for d in diags.iter_mut() {
+        if d.severity == Severity::Info || !is_unsupported_constant(d) {
+            continue;
+        }
+        let DiagnosticKind::Unsupported { detail, .. } = &d.kind else { continue };
+        let segments: Vec<crate::ident::Symbol> =
+            detail.trim_start_matches("::").split("::").map(crate::ident::Symbol::from).collect();
+        let Some(resolved) = resolver.declaration_name(d.span, &segments) else { continue };
+        let Some(path) = assigned.get(resolved.trim_start_matches("::")) else { continue };
+        d.severity = Severity::Info;
+        d.message.push_str(&format!(
+            " — likely roundhouse coverage, not an app error (assigned in {path}: a constant an initializer assigns is not ingested yet)"
+        ));
+    }
+}
+
+fn is_unsupported_constant(d: &Diagnostic) -> bool {
+    matches!(&d.kind, DiagnosticKind::Unsupported { construct, .. } if construct.as_str() == "constant")
+}
+
 pub fn attribute_unknown_gems(diags: &mut [Diagnostic], app: &App) {
     let Some(lock) = &app.gem_lock else { return };
     let census = crate::gems::GemCensus::of(lock);

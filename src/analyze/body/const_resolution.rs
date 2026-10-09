@@ -321,6 +321,14 @@ impl ConstResolver {
         self.file(file).into_iter().flat_map(|file| file.namespace_definitions.iter().map(|name| name.as_ref()))
     }
 
+    /// The constants (fully qualified) `file` assigns (`X = …`), without
+    /// its classes and modules.
+    pub(crate) fn constants_assigned_in(&self, file: FileId) -> impl Iterator<Item = &str> {
+        self.file(file).into_iter().flat_map(|file| {
+            file.constants.iter().filter_map(|(_, _, id)| file.constant_classes.get(id).map(|c| c.0.as_str()))
+        })
+    }
+
     /// `namespaces_declared_in` less the aliases: `Alias = Bar` names
     /// `Bar`'s class, not one `file` makes.
     pub(crate) fn receivers_declared_in(&self, file: FileId) -> impl Iterator<Item = &str> {
