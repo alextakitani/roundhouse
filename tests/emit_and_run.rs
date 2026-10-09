@@ -11,6 +11,8 @@ mod emit_and_run;
 mod class_attribute;
 #[path = "emit_and_run/integer_query_find_by.rs"]
 mod integer_query_find_by;
+#[path = "emit_and_run/strong_params.rs"]
+mod strong_params;
 
 #[path = "support/class_configuration.rs"]
 mod class_configuration;
