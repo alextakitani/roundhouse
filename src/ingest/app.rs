@@ -226,15 +226,22 @@ fn keep_initializer_defined(
             if !(rel.starts_with("app/") || rel.starts_with("lib/")) {
                 return false;
             }
-            let named_in_text = f.text.match_indices(name).any(|(i, _)| {
-                let before = f.text[..i].chars().next_back();
+            // In Ruby, a comment or a string naming it is not a reference.
+            if rel.ends_with(".rb") {
+                return f.text.contains(name) && names_root_constant(&f.text, name);
+            }
+            // A template is not Ruby to parse, so its text is matched.
+            f.text.match_indices(name).any(|(i, _)| {
+                let head = &f.text[..i];
+                let rooted = head.strip_suffix("::").is_some_and(|h| {
+                    !h.chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_' || c == ':')
+                });
+                let before = head.chars().next_back();
                 let after = f.text[i + name.len()..].chars().next();
                 // Not only `X.` / `X::`: forem reads `ApplicationConfig["KEY"]`.
-                !before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == ':')
+                (rooted || !before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == ':'))
                     && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
-            });
-            // A template is not Ruby to parse; in Ruby, a comment or a string naming it is not a reference.
-            named_in_text && (!rel.ends_with(".rb") || names_root_constant(&f.text, name))
+            })
         })
     };
     for lc in candidates {

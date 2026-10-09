@@ -75,6 +75,16 @@ fn an_initializer_class_named_only_in_a_comment_is_not_kept() {
         std::fs::write(file, source).unwrap();
     }
     let out = check_continue(&root);
+    assert!(out.contains(&format!("roundhouse-check: {} —", root.display())), "check did not complete:\n{out}");
     assert!(!out.contains("NoSuchConstantAnywhere"), "LegacyHook was kept:\n{out}");
+
+    // Named as code, rooted, it is kept, and its body reports.
+    std::fs::write(
+        root.join("app/models/article.rb"),
+        "class Article < ApplicationRecord\n  def label = ::LegacyHook.run\nend\n",
+    )
+    .unwrap();
+    let out = check_continue(&root);
+    assert!(out.contains("NoSuchConstantAnywhere"), "rooted `::LegacyHook` did not keep it:\n{out}");
     std::fs::remove_dir_all(root).unwrap();
 }
