@@ -60,6 +60,18 @@ incorrect `Book | untyped` union. The inventory admits exactly those two
 additional warnings, without dropping the call warnings, changing the
 Writebook pin, or relaxing error, gap, emission or corpus checks.
 
+The anonymous keyword-forwarding recovery in PR #614 ingests five previously
+skipped helper bodies across `ArrangementHelper`, `BooksHelper`, and
+`LeavesHelper`. Their `tag.div`, `button_to`, `tag.li`, `tag.nav`, and
+`form_with` destinations still lack verified retained keyword contracts, so
+the inventory records five explicit all-target errors at those calls and ten
+`gradual_untyped` warnings at their view callers. The five corresponding
+ingest-gap occurrences and old Spinel keyword-rest declaration errors are
+removed; corpus identities, lowering residue, and Ruby-emission residue are
+unchanged. This reviewed inventory change records recovered source and its
+remaining limits, not runnable Writebook helper or whole-app support. The
+corpus pin and the inventory gate are unchanged.
+
 ## Roadmap, not a support claim
 
 1. **Routes.** [PR #199](https://github.com/rubys/roundhouse/pull/199) owns the
@@ -116,9 +128,31 @@ attr `content`) was the prior prerequisite and remains covered by
 `tests/relation_delegated_reader_typing.rs` and
 `tests/emit_and_run.rs::delegated_type_singular_reader_plain_text_body_runs`.
 
-Still separate: `delegate :title, to: :leafable` through Leafable,
-renderer/Redcarpet, embeds/uploads, option-carrying `strict_loading:`, and
-load-hook notifications. Generic string eval stays unsupported.
+Model `delegate` declarations and delegates inside concern `included do`
+blocks are lowered to ordinary methods after those items are spliced into
+their models. Top-level `delegate` calls in module bodies remain unsupported:
+their receiver and generated method surface depend on each eventual includer.
+This covers
+zero-argument forwarding, setters and fixed-arity operators, `prefix: true` or
+an explicit Symbol/String prefix. `allow_nil: true` remains unsupported because
+Rails distinguishes a nil target that responds to the delegated method from
+one that does not; a simple nil guard would change behavior. Delegated names
+that collide with the model's synthesized method surface are also left
+unexpanded rather than silently choosing the wrong definition. The four
+Writebook `Leafable#title` check errors are cleared; the behavior is also
+exercised by abstract `emit_and_run` overlays, which execute emitted Ruby
+through persisted `belongs_to` and polymorphic `delegated_type` associations.
+The latter covers Leaf's `searchable_content`-style delegation. This does not
+claim collection association proxies, arbitrary argument/block forwarding or
+unsupported options such as `private:`; targets using `yield` or
+`block_given?` are left unexpanded, as are declarations under a lexical
+`private`/`protected` marker rather than being emitted with the wrong
+visibility. The remaining `URI::HTTPS`
+constant error is cleared by registering the bundled Ruby class value; this
+does not claim the separate embed-provider or sanitizer integrations.
+Renderer/Redcarpet, embeds/uploads, option-carrying
+`strict_loading:`, and load-hook notifications remain separate. Generic string
+eval stays unsupported.
 
 The original Page tests were emitted with `--target ruby --survey
 --allow-unsupported` and attempted with `ruby -Itest -I. test/models/page_test.rb`.

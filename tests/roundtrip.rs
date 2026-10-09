@@ -16,6 +16,7 @@ fn sp() -> Span {
     Span::synthetic()
 }
 
+/// Verifies that a representative blog app survives an IR serialization round-trip.
 #[test]
 fn tiny_blog_round_trips() {
     let mut tables = IndexMap::new();
@@ -30,6 +31,9 @@ fn tiny_blog_round_trips() {
                     nullable: false,
                     default: None,
                     primary_key: true,
+                    generated: None,
+                    generated_text_compatible: None,
+                    generated_int4_compatible: None,
                 },
                 Column {
                     name: Symbol::from("title"),
@@ -37,6 +41,9 @@ fn tiny_blog_round_trips() {
                     nullable: false,
                     default: None,
                     primary_key: false,
+                    generated: None,
+                    generated_text_compatible: None,
+                    generated_int4_compatible: None,
                 },
             ],
             indexes: vec![],
@@ -150,7 +157,9 @@ fn tiny_blog_round_trips() {
         helper_method_index: std::collections::HashMap::new(),
         view_visible_controller_methods: std::collections::BTreeSet::new(),
         global_id_locate_models: std::collections::BTreeSet::new(),
+        global_id_locate_signed_models: std::collections::BTreeSet::new(),
         attachable_unsigned_models: Vec::new(),
+        pending_attachment_on_load: Vec::new(),
         load_hook_class_macros: Vec::new(),
         partial_local_types: std::collections::HashMap::new(),
         view_ivar_types: std::collections::HashMap::new(),

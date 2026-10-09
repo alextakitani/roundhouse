@@ -377,7 +377,10 @@ fn takes_trailing_ascription(node: &Node<'_>) -> bool {
         || node.as_yield_node().is_some()
 }
 
-fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
+/// Strict expression ingest: never substitutes survey-mode `nil`.
+/// Call sites that claim a default or other recovered value use this so
+/// a survey recovery cannot be mistaken for a successful parse.
+pub(super) fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
     if !takes_trailing_ascription(node) {
         return ingest_expr_node(node, file);
     }
@@ -540,6 +543,31 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
                     }
                 }
             }
+            // `params.expect(widget: :name)`: Rails wraps a non-Array
+            // filter value (`Array.wrap` in `permit_hash`), so it is
+            // `params.expect(widget: [:name])`, the spelling every
+            // consumer of the expect shape reads.
+            let mut args = args;
+            if method == "expect"
+                && block.is_none()
+                && args.len() == 1
+                && recv.as_ref().is_some_and(|r| {
+                    matches!(&*r.node, ExprNode::Send { recv: None, method, args, block: None, .. }
+                        if method.as_str() == "params" && args.is_empty())
+                })
+            {
+                if let ExprNode::Hash { entries, .. } = &mut *args[0].node {
+                    for (_, v) in entries.iter_mut() {
+                        if matches!(&*v.node, ExprNode::Lit { value: Literal::Sym { .. } }) {
+                            let sym = v.clone();
+                            *v = Expr::new(sym.span, ExprNode::Array {
+                                elements: vec![sym],
+                                style: crate::expr::ArrayStyle::Brackets,
+                            });
+                        }
+                    }
+                }
+            }
             // `binding.local_variable_get(:class)` is how Ruby reads a
             // local named after a reserved word (a keyword param such as
             // `class:`). It is a plain local read, so ingest it as one.
@@ -579,7 +607,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
                 && block.is_none()
                 && recv.is_some()
                 && args.len() == 1
-                && !matches!(&*args[0].node, ExprNode::ForwardArgs | ExprNode::ForwardKeywords)
+                && !matches!(&*args[0].node, ExprNode::ForwardArgs | ExprNode::ForwardKeywords | ExprNode::ForwardKeywordsWithPairs { .. })
             {
                 let r = recv.unwrap();
                 let mut defaults = args.into_iter().next().unwrap();
@@ -2574,9 +2602,14 @@ fn detect_leading_guard<'a>(node: &Node<'a>) -> Option<Node<'a>> {
     Some(if_node.predicate())
 }
 
-/// The argument-list walk is adapted from Tim Tischler's F7 commit
-/// 013588ec. Preserve the marker instead of erasing keyword identity
-/// into a positional hash and synthesizing three user-visible bindings.
+/// Preserve packet identity for a lone anonymous `**`, or for static symbol
+/// key/value pairs followed by one trailing anonymous `**`. The latter keeps
+/// pair order and lets the packet override duplicate explicit keys. Earlier
+/// or repeated anonymous splats, named/dynamic splats in the same group, and
+/// non-static keys remain unsupported because the IR has no ordered dynamic
+/// merge form. The argument-list walk is adapted from Tim Tischler's F7 commit
+/// 013588ec; retaining the marker avoids a positional hash and synthetic
+/// user-visible bindings.
 fn ingest_forwardable_arguments(
     a: &ruby_prism::ArgumentsNode<'_>,
     file: &str,
@@ -2593,21 +2626,65 @@ fn ingest_forwardable_arguments(
         } else {
             if let Some(hash) = arg.as_keyword_hash_node() {
                 let elements: Vec<_> = hash.elements().iter().collect();
-                if elements.iter().any(|e| e.as_assoc_splat_node().is_some_and(|s| s.value().is_none())) {
-                    if elements.len() != 1 {
-                        // Mixed forwarding remains outside this slice. Keep
-                        // its existing ledger identity; only lone `**` is new.
+                let anonymous_splats: Vec<usize> = elements
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, e)| {
+                        e.as_assoc_splat_node()
+                            .is_some_and(|s| s.value().is_none())
+                            .then_some(i)
+                    })
+                    .collect();
+                if !anonymous_splats.is_empty() {
+                    if elements.len() == 1 {
+                        let loc = elements[0].location();
+                        args.push(Expr::new(Span {
+                            file: super::sources::file_id(file),
+                            start: loc.start_offset() as u32,
+                            end: loc.end_offset() as u32,
+                        }, ExprNode::ForwardKeywords));
+                        continue;
+                    }
+                    if anonymous_splats.len() != 1
+                        || anonymous_splats[0] != elements.len() - 1
+                    {
                         return Err(IngestError::Unsupported {
                             file: file.into(),
                             message: "anonymous `**` keyword forwarding not yet supported".into(),
                         });
                     }
-                    let loc = elements[0].location();
+
+                    let mut entries = Vec::with_capacity(elements.len() - 1);
+                    for element in &elements[..elements.len() - 1] {
+                        let Some(assoc) = element.as_assoc_node() else {
+                            // In particular, a named `**options` before the
+                            // anonymous packet would require a second dynamic
+                            // merge in the IR. Keep that mixed shape explicit
+                            // on the unsupported ledger until it is modeled.
+                            return Err(IngestError::Unsupported {
+                                file: file.into(),
+                                message: "anonymous `**` keyword forwarding not yet supported".into(),
+                            });
+                        };
+                        let key = ingest_expr(&assoc.key(), file)?;
+                        if !matches!(
+                            &*key.node,
+                            ExprNode::Lit { value: Literal::Sym { .. } }
+                        ) {
+                            return Err(IngestError::Unsupported {
+                                file: file.into(),
+                                message: "anonymous `**` keyword forwarding requires static symbol keys".into(),
+                            });
+                        }
+                        let value = ingest_expr(&assoc.value(), file)?;
+                        entries.push((key, value));
+                    }
+                    let loc = hash.location();
                     args.push(Expr::new(Span {
                         file: super::sources::file_id(file),
                         start: loc.start_offset() as u32,
                         end: loc.end_offset() as u32,
-                    }, ExprNode::ForwardKeywords));
+                    }, ExprNode::ForwardKeywordsWithPairs { entries }));
                     continue;
                 }
             }

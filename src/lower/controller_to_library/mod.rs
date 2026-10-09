@@ -229,16 +229,6 @@ pub fn lower_controllers_with_arel_views_and_assocs(
 /// value instead of being clobbered by a synthesized `render`. `None`
 /// preserves the legacy "every public method is an action" behavior for
 /// callers that haven't wired routes yet.
-/// A type that answers a Relation — directly, or as the return of a
-/// parameterized scope.
-fn returns_relation(ty: &Ty) -> bool {
-    match ty {
-        Ty::Relation { .. } => true,
-        Ty::Fn { ret, .. } => returns_relation(ret),
-        _ => false,
-    }
-}
-
 /// The optional, feature-gated inputs to
 /// [`lower_controllers_with_arel_views_assocs_and_routes`]. Each field
 /// defaults to "feature off" (empty slice / `None` / `false`), matching
@@ -320,7 +310,7 @@ pub fn lower_controllers_with_arel_views_assocs_and_routes(
     // The view↔controller ivar contract: each action view's read-ivars,
     // so the render rewrite passes `@<name>` for each (matching the view's
     // generated parameter list). See view_to_library::action_view_ivar_map.
-    let view_ivars = crate::lower::view_to_library::action_view_ivar_map(views, controllers);
+    let view_ivars = crate::lower::view_to_library::action_view_ivar_map(views, controllers, models);
     // Controller-side partial renders (`render partial: "commentbox",
     // locals: {…}`) bind against the partial's def-site parameter order.
     let partials: PartialMap =
@@ -489,7 +479,7 @@ pub fn lower_controllers_with_arel_views_assocs_and_routes(
     let relation_scope_names: std::collections::HashSet<Symbol> = classes
         .values()
         .flat_map(|ci| ci.class_methods.iter())
-        .filter(|(_, ty)| returns_relation(ty))
+        .filter(|(_, ty)| crate::lower::arel::returns_relation(ty))
         .map(|(n, _)| n.clone())
         .collect();
 
@@ -538,6 +528,7 @@ pub fn lower_controllers_with_arel_views_assocs_and_routes(
                 if !refined_across_methods {
                     rewritten |= crate::lower::arel::rewrite_arel_in_expr_with_ruby_values(
                         &mut method.body, schema, &classes, assocs, ruby_read_values,
+                        &relation_scope_names,
                     );
                 }
             }
@@ -2925,7 +2916,8 @@ fn lower_action_body(
     // the typed factory `<Resource>Params.from_raw(@params)`. The
     // controller's `<resource>_params` helper body becomes that single
     // call; downstream call sites see a typed value, not a Hash.
-    let with_typed_params = self::params::rewrite_to_from_raw(&with_params, params_specs);
+    let with_typed_params =
+        self::params::rewrite_to_from_raw(&with_params, params_specs, format_breadth.raises_param_missing);
     let with_redirects = rewrite_redirect_to(&with_typed_params, route_id_segments);
     // Rewrite `<Model>.new(<resource>_params)` → `<Model>.from_params(<resource>_params)`
     // BEFORE the assoc-through-parent rewrite, so the build path picks
