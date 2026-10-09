@@ -8501,3 +8501,25 @@ raise article.top_word.inspect unless article.top_word == "b"
         )
         .assert_passes();
 }
+
+/// A class an initializer defines and the app reads only through `[]`
+/// (forem's `ApplicationConfig["KEY"]`) is the app's, as `X.` and `X::` are.
+#[test]
+fn an_initializer_class_read_through_brackets_runs() {
+    emit_and_run::real_blog()
+        .write(
+            "config/initializers/app_settings.rb",
+            "class AppSettings\n  DEFAULTS = { \"BANNER\" => \"Welcome\" }.freeze\n\n  def self.[](key)\n    DEFAULTS.fetch(key, \"\")\n  end\nend\n",
+        )
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            "class Article < ApplicationRecord\n  def banner\n    \"#{AppSettings[\"BANNER\"]}: #{title}\"\n  end\n",
+        )
+        .run_ruby(
+            r#"article = Article.create!(title: "Brackets", body: "Body text here")
+raise article.banner.inspect unless article.banner == "Welcome: Brackets"
+"#,
+        )
+        .assert_passes();
+}
